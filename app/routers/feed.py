@@ -206,7 +206,7 @@ async def get_feed_ids(
 
 @router.post("/scrape")
 async def trigger_scrape(
-    limit: int = Query(200, ge=1, le=500, description="Max posts to fetch per channel"),
+    limit: int = Query(2000, ge=1, le=5000, description="Max posts to fetch per channel"),
     db: AsyncSession = Depends(get_db_session),
 ):
     """

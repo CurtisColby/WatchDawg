@@ -6,7 +6,6 @@ Endpoints:
 - POST   /channel                    — Add a new channel (auto-detects type from URL).
 - DELETE /channel/{id}               — Remove a channel.
 - PATCH  /channel/{id}               — Toggle enabled/disabled.
-- PATCH  /channel/{id}/rename        — Rename a channel (friendly name).
 - POST   /channel/{id}/scrape        — Scrape a single channel on demand.
 - DELETE /channel/{id}/videos        — Clear all videos from a channel.
 """
@@ -40,10 +39,6 @@ class ChannelAddRequest(BaseModel):
 
 class ChannelToggleRequest(BaseModel):
     enabled: bool
-
-
-class ChannelRenameRequest(BaseModel):
-    name: str = Field(..., min_length=1, max_length=200, description="New friendly display name")
 
 
 # --- Auto-Detection Logic ---
@@ -246,7 +241,6 @@ async def add_channel(
     Add a new channel source.
 
     Auto-detects channel type from the URL.
-    If a friendly name is provided it overrides the auto-generated name.
     """
     try:
         detected = detect_channel_type(request.url)
@@ -262,7 +256,7 @@ async def add_channel(
             detail=f"Channel already exists: {detected['name']}"
         )
 
-    display_name = request.name.strip() if request.name and request.name.strip() else detected["name"]
+    display_name = request.name if request.name else detected["name"]
 
     channel = Channel(
         name=display_name,
@@ -286,39 +280,6 @@ async def add_channel(
             "url": channel.url,
             "enabled": channel.enabled,
         },
-    }
-
-
-@router.patch("/{channel_id}/rename")
-async def rename_channel(
-    channel_id: int,
-    request: ChannelRenameRequest,
-    db: AsyncSession = Depends(get_db_session),
-):
-    """
-    Rename a channel's friendly display name.
-
-    This name appears in the Feed/Favorites/Library sidebars and on the
-    Channels tab. It also controls the subfolder name for future downloads
-    (existing downloaded files are not moved).
-    """
-    stmt = select(Channel).where(Channel.id == channel_id)
-    result = await db.execute(stmt)
-    channel = result.scalar_one_or_none()
-
-    if channel is None:
-        raise HTTPException(status_code=404, detail="Channel not found")
-
-    old_name = channel.name
-    channel.name = request.name.strip()
-    await db.commit()
-
-    logger.info(f"Renamed channel {channel_id}: '{old_name}' -> '{channel.name}'")
-    return {
-        "status": "renamed",
-        "channel_id": channel_id,
-        "old_name": old_name,
-        "name": channel.name,
     }
 
 
@@ -437,7 +398,9 @@ async def _clear_channel_videos(db: AsyncSession, channel_id: int) -> int:
 @router.post("/{channel_id}/scrape")
 async def scrape_channel(
     channel_id: int,
-    limit: int = Query(50, ge=1, le=200, description="Max videos to fetch"),
+    # Raised ceiling to 5000 to support large Vimeo channels (some have 2000+ videos).
+    # Default stays at 500 for normal scrapes; pass a higher value to deep-scrape.
+    limit: int = Query(500, ge=1, le=5000, description="Max videos to fetch"),
     db: AsyncSession = Depends(get_db_session),
 ):
     """Scrape a single channel on demand."""

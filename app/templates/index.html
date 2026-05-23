@@ -95,7 +95,7 @@
         .tab-content { display: none; }
         .tab-content.active { display: block; }
 
-        .controls { position: sticky; top: calc(var(--header-height) + var(--tab-height)); z-index: 98; padding: 12px 32px; display: flex; gap: 12px; flex-wrap: wrap; align-items: center; border-bottom: 1px solid var(--border-subtle); background: var(--bg-primary); }
+        .controls { flex-shrink: 0; padding: 12px 32px; display: flex; gap: 12px; flex-wrap: wrap; align-items: center; border-bottom: 1px solid var(--border-subtle); background: var(--bg-primary); }
 
         .btn { padding: 10px 20px; border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); background: var(--bg-surface); color: var(--text-primary); font-family: 'Outfit', sans-serif; font-size: 14px; font-weight: 500; cursor: pointer; transition: all 0.2s ease; display: flex; align-items: center; gap: 8px; }
         .btn:hover { background: var(--bg-card-hover); border-color: var(--accent-orange); box-shadow: var(--shadow-glow); }
@@ -131,10 +131,30 @@
 
         /* =====================================================================
            SHARED SIDEBAR LAYOUT (Feed, Favorites, Library all use this)
+
+           The key to independent sidebar scrolling:
+           - .tab-content.active is a flex column filling the viewport below header+nav
+           - .feed-layout uses flex:1 to fill all remaining space with overflow:hidden
+           - .channel-sidebar and .feed-main each scroll independently inside it
            ===================================================================== */
+
+        .tab-content.active {
+            display: flex;
+            flex-direction: column;
+            /* Fill the viewport below sticky header (65px) + sticky tab nav (49px) */
+            height: calc(100vh - var(--header-height) - var(--tab-height));
+            overflow: hidden;
+        }
+
+        /* Log panel must not shrink either */
+        .log-panel { flex-shrink: 0; }
+
         .feed-layout {
             display: flex;
-            align-items: flex-start;
+            flex-direction: row;
+            flex: 1;          /* fill all remaining height inside the tab flex column */
+            min-height: 0;    /* critical: lets flex children shrink below content size */
+            overflow: hidden;
         }
 
         /* =====================================================================
@@ -143,9 +163,8 @@
         .channel-sidebar {
             width: var(--sidebar-width);
             flex-shrink: 0;
-            position: sticky;
-            top: calc(var(--header-height) + var(--tab-height) + 57px);
-            max-height: calc(100vh - var(--header-height) - var(--tab-height) - 57px);
+            /* Fill the full height of .feed-layout and scroll independently */
+            height: 100%;
             overflow-y: auto;
             border-right: 1px solid var(--border-subtle);
             padding: 16px 0;
@@ -285,12 +304,14 @@
         .feed-main {
             flex: 1;
             min-width: 0;
+            height: 100%;
+            overflow-y: auto;
         }
 
         /* =====================================================================
            CHANNEL MANAGER
            ===================================================================== */
-        .channel-manager { padding: 24px 32px; }
+        .channel-manager { padding: 24px 32px; overflow-y: auto; flex: 1; }
 
         /* Two-row add form: URL row + optional name row */
         .channel-add-form {
@@ -466,17 +487,19 @@
         /* =====================================================================
            FLOATING ACTION BUTTONS
            ===================================================================== */
-        #scrollBtn {
-            position: fixed; bottom: 74px; right: 20px;
-            width: 44px; height: 44px;
+        .scroll-nav-btn {
+            position: fixed; right: 20px;
+            width: 40px; height: 40px;
             background: var(--bg-surface); color: var(--text-secondary);
             border: 1px solid var(--border-subtle); border-radius: 50%;
-            font-size: 18px; cursor: pointer; z-index: 9999;
+            font-size: 16px; cursor: pointer; z-index: 9999;
             display: none; align-items: center; justify-content: center;
             box-shadow: 0 4px 16px rgba(0,0,0,0.4); transition: all 0.2s;
         }
-        #scrollBtn:hover { border-color: var(--accent-orange); color: var(--accent-orange); transform: scale(1.1); }
-        #scrollBtn.visible { display: flex; }
+        .scroll-nav-btn:hover { border-color: var(--accent-orange); color: var(--accent-orange); transform: scale(1.1); }
+        .scroll-nav-btn.visible { display: flex; }
+        #scrollBtnDown { bottom: 120px; }
+        #scrollBtnUp   { bottom: 168px; }
 
         #debugConsole {
             position: fixed; bottom: 20px; right: 20px;
@@ -842,33 +865,53 @@
         }
 
         // =====================================================================
-        //  SCROLL BUTTON
+        //  SCROLL BUTTONS — independent up/down, watch the active .feed-main
         // =====================================================================
-        document.addEventListener('DOMContentLoaded', function initScrollButton() {
-            const btn = document.getElementById('scrollBtn');
-            if (!btn) return;
-            let atBottom = false;
+        document.addEventListener('DOMContentLoaded', function initScrollButtons() {
+            const btnUp   = document.getElementById('scrollBtnUp');
+            const btnDown = document.getElementById('scrollBtnDown');
+            if (!btnUp || !btnDown) return;
+            let _activeScroller = null;
 
-            function updateScrollBtn() {
-                const scrollable = document.documentElement.scrollHeight > window.innerHeight + 100;
-                if (!scrollable) { btn.classList.remove('visible'); return; }
-                btn.classList.add('visible');
-                const nearBottom = window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 200;
-                if (nearBottom !== atBottom) {
-                    atBottom = nearBottom;
-                    btn.textContent = atBottom ? '⬆' : '⬇';
-                    btn.title = atBottom ? 'Scroll to top' : 'Scroll to bottom';
-                }
+            function _getActiveScroller() {
+                const activeTab = document.querySelector('.tab-content.active');
+                if (!activeTab) return null;
+                return activeTab.querySelector('.feed-main') || null;
             }
 
-            btn.addEventListener('click', () => {
-                if (atBottom) window.scrollTo({ top: 0, behavior: 'smooth' });
-                else window.scrollTo({ top: document.documentElement.scrollHeight, behavior: 'smooth' });
+            function updateScrollBtns() {
+                const scroller = _getActiveScroller();
+                if (!scroller || scroller.scrollHeight <= scroller.clientHeight + 20) {
+                    btnUp.classList.remove('visible');
+                    btnDown.classList.remove('visible');
+                    return;
+                }
+                const atTop    = scroller.scrollTop < 50;
+                const atBottom = scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 50;
+                atTop    ? btnUp.classList.remove('visible')   : btnUp.classList.add('visible');
+                atBottom ? btnDown.classList.remove('visible') : btnDown.classList.add('visible');
+            }
+
+            function _attachScrollListener(scroller) {
+                if (_activeScroller === scroller) return;
+                if (_activeScroller) _activeScroller.removeEventListener('scroll', updateScrollBtns);
+                _activeScroller = scroller;
+                if (scroller) scroller.addEventListener('scroll', updateScrollBtns, { passive: true });
+                updateScrollBtns();
+            }
+
+            btnUp.addEventListener('click', () => {
+                const scroller = _getActiveScroller();
+                if (scroller) scroller.scrollTo({ top: 0, behavior: 'smooth' });
+            });
+            btnDown.addEventListener('click', () => {
+                const scroller = _getActiveScroller();
+                if (scroller) scroller.scrollTo({ top: scroller.scrollHeight, behavior: 'smooth' });
             });
 
-            window.addEventListener('scroll', updateScrollBtn, { passive: true });
-            window.addEventListener('resize', updateScrollBtn, { passive: true });
-            window._updateScrollBtn = updateScrollBtn;
+            window.addEventListener('resize', updateScrollBtns, { passive: true });
+            window._updateScrollBtn = updateScrollBtns;
+            window._attachScrollListener = _attachScrollListener;
         });
 
         // =====================================================================
@@ -883,6 +926,12 @@
             if (tabName === 'channels')  loadChannels();
             if (tabName === 'favorites') loadFavorites();
             if (tabName === 'library')   loadLibrary();
+            // Re-attach scroll button to new tab's feed-main
+            if (window._attachScrollListener) {
+                const activeTab = document.getElementById(`tab-${tabName}`);
+                const scroller = activeTab ? activeTab.querySelector('.feed-main') : null;
+                window._attachScrollListener(scroller);
+            }
         }
 
         // =====================================================================
@@ -1241,9 +1290,13 @@
                 folders[key].count++;
             });
 
-            // Initialize state (default all checked) — persist existing
+            // Rebuild state fresh each load — stale keys from old scans corrupt allChecked.
+            // Preserve existing selections only for keys that still exist in this scan.
+            const prevState = Object.assign({}, libSidebarState);
+            libSidebarState = {};
             Object.keys(folders).forEach(key => {
-                if (!(key in libSidebarState)) libSidebarState[key] = true;
+                // Keep prior selection if the folder existed before; default to true (checked)
+                libSidebarState[key] = key in prevState ? prevState[key] : true;
             });
 
             const container = document.getElementById('libSidebarGroups');
@@ -1278,10 +1331,10 @@
                 </div>
                 <div class="provider-channels" id="libFolderChs" style="max-height:${sorted.length * 44}px">
                     ${sorted.map(f => `
-                    <div class="sidebar-channel-row" onclick="toggleLibFolder('${escapeAttr(f.key)}')">
+                    <div class="sidebar-channel-row" data-lib-key="${escapeHtml(f.key)}" onclick="toggleLibFolderByEl(this)">
                         <input type="checkbox" id="libFolder_${escapeAttr(f.key)}"
                             ${libSidebarState[f.key] ? 'checked' : ''}
-                            onclick="event.stopPropagation();toggleLibFolder('${escapeAttr(f.key)}')">
+                            onclick="event.stopPropagation();toggleLibFolderByEl(this.closest('.sidebar-channel-row'))">
                         <span class="sidebar-channel-name" title="${escapeHtml(f.label)}">${escapeHtml(f.label)}</span>
                         <span class="sidebar-channel-count">${f.count}</span>
                     </div>`).join('')}
@@ -1296,12 +1349,20 @@
             if (g) g.classList.toggle('collapsed');
         }
 
-        function toggleLibFolder(key) {
+        function toggleLibFolderByEl(rowEl) {
+            // Read raw key from data attribute — avoids escapeAttr mismatch bug
+            const key = rowEl.dataset.libKey;
+            if (key === undefined) return;
             libSidebarState[key] = !libSidebarState[key];
-            const cb = document.getElementById(`libFolder_${key}`);
+            const cb = document.getElementById(`libFolder_${escapeAttr(key)}`);
             if (cb) cb.checked = libSidebarState[key];
             _updateLibSelectAll();
             renderLibrary(currentLibrary, null);
+        }
+        // Legacy alias kept in case anything still calls toggleLibFolder(key)
+        function toggleLibFolder(key) {
+            const row = document.querySelector(`.sidebar-channel-row[data-lib-key="${CSS.escape(key)}"]`);
+            if (row) toggleLibFolderByEl(row);
         }
 
         function libSidebarSelectAll() {
@@ -1327,7 +1388,7 @@
             if (allChecked) return currentLibrary;
             return currentLibrary.filter(f => {
                 const key = f.subfolder && f.subfolder !== '' ? f.subfolder : '__root__';
-                return libSidebarState[key] !== false;
+                return libSidebarState[key] === true;
             });
         }
 
@@ -1496,7 +1557,7 @@
         async function scrapeChannel(channelId, name) {
             log(`Scraping channel: ${name}...`, 'info');
             try {
-                const res = await fetch(`${API_BASE}/channel/${channelId}/scrape?limit=500`, { method: 'POST' });
+                const res = await fetch(`${API_BASE}/channel/${channelId}/scrape?limit=2000`, { method: 'POST' });
                 if (!res.ok) { const err = await res.json(); throw new Error(err.detail || 'Scrape failed'); }
                 const data = await res.json();
                 const r = data.result;
@@ -1513,7 +1574,7 @@
             btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Scraping...';
             log('Scraping all enabled channels...', 'info');
             try {
-                const res = await fetch(`${API_BASE}/feed/scrape?limit=500`, { method: 'POST' });
+                const res = await fetch(`${API_BASE}/feed/scrape?limit=2000`, { method: 'POST' });
                 const data = await res.json();
                 if (data.results && data.results.length > 0) {
                     for (const r of data.results) {
@@ -1683,11 +1744,13 @@
             if (_scrollObserver) _scrollObserver.disconnect();
             const sentinel = document.getElementById('scrollSentinel');
             if (!sentinel) return;
+            // Root must be the .feed-main scroller, not the viewport, since the page no longer scrolls
+            const feedMain = document.getElementById('tab-feed') ? document.getElementById('tab-feed').querySelector('.feed-main') : null;
             _scrollObserver = new IntersectionObserver((entries) => {
                 if (entries[0].isIntersecting && !feedLoading && feedOffset < feedTotal) {
                     loadMoreFeed();
                 }
-            }, { rootMargin: '300px' });
+            }, { root: feedMain || null, rootMargin: '300px' });
             _scrollObserver.observe(sentinel);
         }
 
@@ -2368,7 +2431,8 @@
     </script>
 
     <!-- FLOATING BUTTONS -->
-    <button id="scrollBtn" title="Scroll to bottom">⬇</button>
+    <button id="scrollBtnUp"   class="scroll-nav-btn" title="Scroll to top">⬆</button>
+    <button id="scrollBtnDown" class="scroll-nav-btn" title="Scroll to bottom">⬇</button>
 
     <div id="debugConsole">
         <div id="debugConsoleHeader">
