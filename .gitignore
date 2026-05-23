@@ -1,0 +1,41 @@
+# === Secrets & Credentials (NEVER COMMIT) ===
+.env
+config/cookies.txt
+
+# === Database files ===
+data/
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# === Downloaded media ===
+music_videos/
+
+# === Logs ===
+*.log
+
+# === Python ===
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# === Docker ===
+docker-compose.override.yml
+
+# === IDE & OS Junk ===
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db

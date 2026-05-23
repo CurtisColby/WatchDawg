@@ -1,0 +1,2399 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WatchDawg — Control Deck</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/hls.js/1.5.7/hls.min.js"></script>
+    <style>
+        :root {
+            --bg-primary: #0a0a0f;
+            --bg-card: #12121a;
+            --bg-card-hover: #1a1a28;
+            --bg-surface: #16161f;
+            --border-subtle: #1e1e2e;
+            --border-focus: #ff6b35;
+            --text-primary: #e8e6e3;
+            --text-secondary: #8a8a9a;
+            --text-muted: #55556a;
+            --accent-orange: #ff6b35;
+            --accent-orange-dim: #ff6b3522;
+            --accent-green: #22c55e;
+            --accent-green-dim: #22c55e22;
+            --accent-red: #ef4444;
+            --accent-red-dim: #ef444422;
+            --accent-blue: #3b82f6;
+            --accent-blue-dim: #3b82f622;
+            --accent-yellow: #eab308;
+            --accent-yellow-dim: #eab30822;
+            --accent-purple: #a855f7;
+            --accent-purple-dim: #a855f722;
+            --radius: 10px;
+            --radius-sm: 6px;
+            --shadow-card: 0 2px 12px rgba(0,0,0,0.4);
+            --shadow-glow: 0 0 20px rgba(255,107,53,0.15);
+            --header-height: 65px;
+            --tab-height: 49px;
+            --sidebar-width: 240px;
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: 'Outfit', sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            min-height: 100vh;
+            line-height: 1.5;
+        }
+
+        .header {
+            position: sticky; top: 0; z-index: 100;
+            background: var(--bg-primary);
+            border-bottom: 1px solid var(--border-subtle);
+            padding: 16px 32px;
+            display: flex; align-items: center; justify-content: space-between;
+            height: var(--header-height);
+        }
+
+        .logo { display: flex; align-items: center; gap: 12px; }
+        .logo-icon { width: 36px; height: 36px; background: var(--accent-orange); border-radius: var(--radius-sm); display: flex; align-items: center; justify-content: center; font-size: 20px; font-weight: 800; color: var(--bg-primary); }
+        .logo-text { font-size: 22px; font-weight: 700; letter-spacing: -0.5px; }
+        .logo-text span { color: var(--accent-orange); }
+
+        .header-right { display: flex; align-items: center; gap: 16px; }
+
+        #globalVideoCount {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 13px; font-weight: 600;
+            color: var(--accent-orange);
+            background: var(--accent-orange-dim);
+            border: 1px solid var(--accent-orange);
+            border-radius: 20px;
+            padding: 4px 14px;
+            letter-spacing: 0.3px;
+            display: none;
+            transition: opacity 0.3s;
+        }
+
+        .status-pill { display: flex; align-items: center; gap: 8px; padding: 6px 14px; border-radius: 20px; font-size: 13px; font-weight: 500; font-family: 'JetBrains Mono', monospace; }
+        .status-dot { width: 8px; height: 8px; border-radius: 50%; animation: pulse-dot 2s ease-in-out infinite; }
+        @keyframes pulse-dot { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+        .status-healthy { background: var(--accent-green-dim); color: var(--accent-green); }
+        .status-healthy .status-dot { background: var(--accent-green); }
+        .status-degraded { background: var(--accent-red-dim); color: var(--accent-red); }
+        .status-degraded .status-dot { background: var(--accent-red); }
+        .status-unknown { background: var(--accent-blue-dim); color: var(--accent-blue); }
+        .status-unknown .status-dot { background: var(--accent-blue); }
+
+        .tab-nav { position: sticky; top: var(--header-height); z-index: 99; display: flex; padding: 0 32px; border-bottom: 1px solid var(--border-subtle); background: var(--bg-primary); height: var(--tab-height); }
+        .tab-btn { padding: 14px 24px; background: none; border: none; color: var(--text-muted); font-family: 'Outfit', sans-serif; font-size: 14px; font-weight: 500; cursor: pointer; border-bottom: 2px solid transparent; transition: all 0.2s ease; }
+        .tab-btn:hover { color: var(--text-secondary); }
+        .tab-btn.active { color: var(--accent-orange); border-bottom-color: var(--accent-orange); }
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+
+        .controls { position: sticky; top: calc(var(--header-height) + var(--tab-height)); z-index: 98; padding: 12px 32px; display: flex; gap: 12px; flex-wrap: wrap; align-items: center; border-bottom: 1px solid var(--border-subtle); background: var(--bg-primary); }
+
+        .btn { padding: 10px 20px; border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); background: var(--bg-surface); color: var(--text-primary); font-family: 'Outfit', sans-serif; font-size: 14px; font-weight: 500; cursor: pointer; transition: all 0.2s ease; display: flex; align-items: center; gap: 8px; }
+        .btn:hover { background: var(--bg-card-hover); border-color: var(--accent-orange); box-shadow: var(--shadow-glow); }
+        .btn:active { transform: scale(0.97); }
+        .btn-primary { background: var(--accent-orange); color: var(--bg-primary); border-color: var(--accent-orange); font-weight: 600; }
+        .btn-primary:hover { background: #ff8555; border-color: #ff8555; }
+        .btn:disabled { opacity: 0.4; cursor: not-allowed; pointer-events: none; }
+        .controls-spacer { flex: 1; }
+        .video-count { font-family: 'JetBrains Mono', monospace; font-size: 13px; color: var(--text-secondary); }
+
+        .log-panel { background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius); margin: 20px 32px; overflow: hidden; }
+        .log-header { padding: 12px 16px; cursor: pointer; user-select: none; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border-subtle); }
+        .log-header h3 { font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-secondary); }
+        .log-header-actions { display: flex; gap: 8px; align-items: center; }
+        .log-body { max-height: 160px; overflow-y: auto; padding: 12px 16px; font-family: 'JetBrains Mono', monospace; font-size: 12px; line-height: 1.8; color: var(--text-muted); }
+        .log-body::-webkit-scrollbar { width: 6px; }
+        .log-body::-webkit-scrollbar-thumb { background: var(--border-subtle); border-radius: 3px; }
+        .log-entry { white-space: pre-wrap; word-break: break-all; }
+        .log-info { color: var(--accent-blue); }
+        .log-success { color: var(--accent-green); }
+        .log-error { color: var(--accent-red); }
+        .log-warn { color: var(--accent-yellow); }
+        .log-body.collapsed { display: none; }
+
+        .card-error { font-size: 11px; color: var(--accent-red); font-family: 'JetBrains Mono', monospace; margin-top: 6px; padding: 6px 8px; background: var(--accent-red-dim); border-radius: 4px; max-height: 48px; overflow-y: auto; word-break: break-all; }
+
+        .badge-complete { background: var(--accent-green-dim); color: var(--accent-green); }
+        .badge-downloading { background: var(--accent-yellow-dim); color: var(--accent-yellow); }
+        .card-btn-retry { color: var(--accent-yellow); }
+        .card-btn-retry:hover { background: var(--accent-yellow-dim); border-color: var(--accent-yellow); }
+        .card-btn-remove { color: var(--accent-red); }
+        .card-btn-remove:hover { background: var(--accent-red-dim); border-color: var(--accent-red); }
+
+        /* =====================================================================
+           SHARED SIDEBAR LAYOUT (Feed, Favorites, Library all use this)
+           ===================================================================== */
+        .feed-layout {
+            display: flex;
+            align-items: flex-start;
+        }
+
+        /* =====================================================================
+           CHANNEL / SUBFOLDER FILTER SIDEBAR
+           ===================================================================== */
+        .channel-sidebar {
+            width: var(--sidebar-width);
+            flex-shrink: 0;
+            position: sticky;
+            top: calc(var(--header-height) + var(--tab-height) + 57px);
+            max-height: calc(100vh - var(--header-height) - var(--tab-height) - 57px);
+            overflow-y: auto;
+            border-right: 1px solid var(--border-subtle);
+            padding: 16px 0;
+            background: var(--bg-primary);
+        }
+
+        .channel-sidebar::-webkit-scrollbar { width: 4px; }
+        .channel-sidebar::-webkit-scrollbar-thumb { background: var(--border-subtle); border-radius: 2px; }
+
+        .sidebar-header {
+            padding: 0 16px 12px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            border-bottom: 1px solid var(--border-subtle);
+            margin-bottom: 8px;
+        }
+
+        .sidebar-title {
+            font-size: 11px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.8px;
+            color: var(--text-muted);
+        }
+
+        .sidebar-clear-btn {
+            font-size: 11px;
+            color: var(--accent-orange);
+            background: none;
+            border: none;
+            cursor: pointer;
+            font-family: 'Outfit', sans-serif;
+            padding: 2px 6px;
+            border-radius: 4px;
+            transition: background 0.2s;
+        }
+        .sidebar-clear-btn:hover { background: var(--accent-orange-dim); }
+
+        /* Provider group (YouTube, Vimeo, Reddit) */
+        .provider-group { margin-bottom: 4px; }
+
+        .provider-group-header {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 16px;
+            cursor: pointer;
+            user-select: none;
+            transition: background 0.15s;
+        }
+        .provider-group-header:hover { background: var(--bg-surface); }
+
+        .provider-group-chevron {
+            font-size: 10px;
+            color: var(--text-muted);
+            transition: transform 0.2s;
+            flex-shrink: 0;
+        }
+        .provider-group.collapsed .provider-group-chevron { transform: rotate(-90deg); }
+
+        .provider-group-label {
+            font-size: 12px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            flex: 1;
+        }
+        .provider-label-youtube { color: #ff0000; }
+        .provider-label-vimeo   { color: var(--accent-blue); }
+        .provider-label-reddit  { color: var(--accent-orange); }
+        .provider-label-other   { color: var(--text-secondary); }
+        /* Library subfolder group — teal/purple to distinguish from Feed */
+        .provider-label-folder  { color: var(--accent-purple); }
+
+        .provider-group-count {
+            font-size: 10px;
+            color: var(--text-muted);
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        /* Select-all checkbox row for each provider group */
+        .provider-select-all {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 4px 16px 4px 32px;
+            cursor: pointer;
+            font-size: 11px;
+            color: var(--text-muted);
+            transition: color 0.15s;
+        }
+        .provider-select-all:hover { color: var(--text-secondary); }
+
+        /* Individual channel / subfolder rows */
+        .provider-channels {
+            overflow: hidden;
+            transition: max-height 0.25s ease;
+        }
+        .provider-group.collapsed .provider-channels { max-height: 0 !important; }
+
+        .sidebar-channel-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 16px 6px 32px;
+            cursor: pointer;
+            transition: background 0.15s;
+        }
+        .sidebar-channel-row:hover { background: var(--bg-surface); }
+
+        .sidebar-channel-row input[type="checkbox"] {
+            width: 14px; height: 14px;
+            accent-color: var(--accent-orange);
+            cursor: pointer;
+            flex-shrink: 0;
+        }
+
+        .sidebar-channel-name {
+            font-size: 12px;
+            color: var(--text-secondary);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            flex: 1;
+            line-height: 1.3;
+        }
+
+        .sidebar-channel-count {
+            font-size: 10px;
+            color: var(--text-muted);
+            font-family: 'JetBrains Mono', monospace;
+            flex-shrink: 0;
+        }
+
+        /* Feed / Favorites / Library main content area */
+        .feed-main {
+            flex: 1;
+            min-width: 0;
+        }
+
+        /* =====================================================================
+           CHANNEL MANAGER
+           ===================================================================== */
+        .channel-manager { padding: 24px 32px; }
+
+        /* Two-row add form: URL row + optional name row */
+        .channel-add-form {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            margin-bottom: 24px;
+        }
+        .channel-add-row {
+            display: flex;
+            gap: 12px;
+            align-items: stretch;
+        }
+        .channel-add-form input {
+            flex: 1;
+            padding: 12px 16px;
+            background: var(--bg-surface);
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius-sm);
+            color: var(--text-primary);
+            font-family: 'Outfit', sans-serif;
+            font-size: 14px;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+        .channel-add-form input:focus { border-color: var(--accent-orange); }
+        .channel-add-form input::placeholder { color: var(--text-muted); }
+
+        /* Inline rename form */
+        .channel-rename-form {
+            display: none;
+            gap: 8px;
+            align-items: center;
+            margin-top: 6px;
+        }
+        .channel-rename-form.active { display: flex; }
+        .channel-rename-form input {
+            flex: 1;
+            padding: 6px 10px;
+            background: var(--bg-surface);
+            border: 1px solid var(--accent-orange);
+            border-radius: var(--radius-sm);
+            color: var(--text-primary);
+            font-family: 'Outfit', sans-serif;
+            font-size: 13px;
+            outline: none;
+        }
+        .channel-rename-form .btn-rename-save {
+            padding: 6px 14px;
+            font-size: 12px;
+            background: var(--accent-orange);
+            color: var(--bg-primary);
+            border: none;
+            border-radius: var(--radius-sm);
+            cursor: pointer;
+            font-family: 'Outfit', sans-serif;
+            font-weight: 600;
+            transition: background 0.2s;
+        }
+        .channel-rename-form .btn-rename-save:hover { background: #ff8555; }
+        .channel-rename-form .btn-rename-cancel {
+            padding: 6px 10px;
+            font-size: 12px;
+            background: none;
+            color: var(--text-muted);
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius-sm);
+            cursor: pointer;
+            font-family: 'Outfit', sans-serif;
+            transition: all 0.2s;
+        }
+        .channel-rename-form .btn-rename-cancel:hover { color: var(--text-secondary); border-color: var(--text-muted); }
+
+        .channel-list { display: flex; flex-direction: column; gap: 8px; }
+        .channel-card { display: flex; align-items: center; gap: 16px; padding: 16px 20px; background: var(--bg-card); border: 1px solid var(--border-subtle); border-radius: var(--radius); transition: all 0.2s ease; flex-wrap: wrap; }
+        .channel-card:hover { border-color: var(--border-focus); }
+        .channel-type-badge { padding: 4px 10px; border-radius: 4px; font-size: 11px; font-weight: 600; font-family: 'JetBrains Mono', monospace; text-transform: uppercase; white-space: nowrap; }
+        .badge-reddit { background: var(--accent-orange-dim); color: var(--accent-orange); }
+        .badge-vimeo { background: var(--accent-blue-dim); color: var(--accent-blue); }
+        .badge-playlist { background: var(--accent-purple-dim); color: var(--accent-purple); }
+        .channel-info { flex: 1; min-width: 0; }
+        .channel-name { font-size: 15px; font-weight: 600; margin-bottom: 2px; }
+        .channel-url { font-size: 12px; color: var(--text-muted); font-family: 'JetBrains Mono', monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .channel-stats { display: flex; gap: 16px; align-items: center; font-size: 12px; color: var(--text-secondary); font-family: 'JetBrains Mono', monospace; white-space: nowrap; }
+        .channel-actions { display: flex; gap: 8px; align-items: center; }
+        .toggle-switch { position: relative; width: 44px; height: 24px; background: var(--border-subtle); border-radius: 12px; cursor: pointer; transition: background 0.2s; border: none; }
+        .toggle-switch.active { background: var(--accent-green); }
+        .toggle-switch::after { content: ''; position: absolute; top: 3px; left: 3px; width: 18px; height: 18px; background: var(--text-primary); border-radius: 50%; transition: transform 0.2s; }
+        .toggle-switch.active::after { transform: translateX(20px); }
+        .btn-icon { width: 32px; height: 32px; border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); background: var(--bg-surface); color: var(--text-secondary); cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 14px; transition: all 0.2s; padding: 0; }
+        .btn-icon:hover { border-color: var(--accent-orange); color: var(--text-primary); }
+        .btn-icon-danger:hover { border-color: var(--accent-red); color: var(--accent-red); background: var(--accent-red-dim); }
+        .btn-icon-warn:hover { border-color: var(--accent-yellow); color: var(--accent-yellow); background: var(--accent-yellow-dim); }
+        .btn-icon-edit:hover { border-color: var(--accent-blue); color: var(--accent-blue); background: var(--accent-blue-dim); }
+        .channel-empty { text-align: center; padding: 60px 20px; color: var(--text-muted); }
+        .channel-empty h3 { font-size: 18px; color: var(--text-secondary); margin-bottom: 8px; }
+        .channel-empty p { font-size: 14px; max-width: 500px; margin: 0 auto 20px; line-height: 1.7; }
+        .channel-empty code { display: inline-block; background: var(--bg-surface); padding: 2px 8px; border-radius: 4px; font-family: 'JetBrains Mono', monospace; font-size: 12px; color: var(--accent-orange); }
+
+        /* --- Video Grid --- */
+        .grid-container { padding: 24px 24px 24px 24px; }
+        .grid-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; }
+        .grid-header h2 { font-size: 18px; font-weight: 600; letter-spacing: -0.3px; }
+        .video-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 16px; }
+
+        .video-card { background: var(--bg-card); border: 1px solid var(--border-subtle); border-radius: var(--radius); overflow: hidden; transition: all 0.25s ease; box-shadow: var(--shadow-card); }
+        .video-card:hover { border-color: var(--accent-orange); transform: translateY(-2px); box-shadow: var(--shadow-card), var(--shadow-glow); }
+        .video-card.now-playing { border-color: var(--accent-green) !important; box-shadow: var(--shadow-card), 0 0 20px rgba(34,197,94,0.25) !important; }
+        .video-card.library-card { border-color: #2a1a3a; }
+        .video-card.library-card:hover { border-color: var(--accent-purple); box-shadow: var(--shadow-card), 0 0 20px rgba(168,85,247,0.15); }
+        .video-card.library-card.now-playing { border-color: var(--accent-green) !important; }
+
+        .card-thumb { position: relative; width: 100%; aspect-ratio: 16 / 9; background: var(--bg-surface); overflow: hidden; }
+        .card-thumb img { width: 100%; height: 100%; object-fit: cover; transition: transform 0.3s ease; }
+        .video-card:hover .card-thumb img { transform: scale(1.05); }
+        .card-thumb-placeholder { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; font-size: 40px; color: var(--text-muted); }
+        .card-status-badge { position: absolute; top: 8px; right: 8px; padding: 3px 10px; border-radius: 4px; font-size: 11px; font-weight: 600; font-family: 'JetBrains Mono', monospace; text-transform: uppercase; }
+        .card-provider-badge { position: absolute; top: 8px; left: 8px; padding: 3px 10px; border-radius: 4px; font-size: 10px; font-weight: 600; font-family: 'JetBrains Mono', monospace; text-transform: uppercase; }
+        .badge-pending { background: var(--accent-blue-dim); color: var(--accent-blue); }
+        .badge-resolved { background: var(--accent-green-dim); color: var(--accent-green); }
+        .badge-failed { background: var(--accent-red-dim); color: var(--accent-red); }
+        .badge-local { background: var(--accent-purple-dim); color: var(--accent-purple); }
+
+        .card-body { padding: 14px 16px; }
+        .card-title { font-size: 14px; font-weight: 600; line-height: 1.4; margin-bottom: 4px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+        .card-artist { font-size: 13px; color: var(--accent-orange); font-weight: 500; margin-bottom: 8px; }
+        .card-subfolder { font-size: 11px; color: var(--accent-purple); font-weight: 500; margin-bottom: 6px; font-family: 'JetBrains Mono', monospace; }
+        .card-meta { display: flex; align-items: center; gap: 12px; font-size: 12px; color: var(--text-muted); font-family: 'JetBrains Mono', monospace; }
+        .card-actions { padding: 10px 16px 14px; display: flex; gap: 8px; }
+        .card-btn { flex: 1; padding: 8px 12px; border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); background: var(--bg-surface); color: var(--text-primary); font-family: 'Outfit', sans-serif; font-size: 12px; font-weight: 500; cursor: pointer; transition: all 0.2s ease; text-align: center; }
+        .card-btn:hover { border-color: var(--accent-orange); }
+        .card-btn-play { background: var(--accent-orange); color: var(--bg-primary); border-color: var(--accent-orange); font-weight: 600; }
+        .card-btn-play:hover { background: #ff8555; }
+        .card-btn-skip { color: var(--accent-red); }
+        .card-btn-skip:hover { background: var(--accent-red-dim); border-color: var(--accent-red); }
+        .card-btn-fav:hover { background: var(--accent-green-dim); border-color: var(--accent-green); color: var(--accent-green); }
+        .card-btn-resolve { color: var(--accent-blue); }
+        .card-btn-resolve:hover { background: var(--accent-blue-dim); border-color: var(--accent-blue); }
+        .card-btn-resolve:disabled { opacity: 0.5; cursor: not-allowed; }
+
+        /* --- Modal --- */
+        .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.85); z-index: 200; align-items: center; justify-content: center; backdrop-filter: blur(4px); }
+        .modal-overlay.active { display: flex; }
+        .modal-content { width: 90vw; max-width: 960px; background: var(--bg-card); border: 1px solid var(--border-subtle); border-radius: var(--radius); overflow: hidden; box-shadow: 0 8px 40px rgba(0,0,0,0.6); }
+        .modal-header { padding: 12px 16px; display: flex; align-items: center; gap: 10px; border-bottom: 1px solid var(--border-subtle); }
+        .modal-title { flex: 1; font-size: 15px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+        .modal-queue-info { font-size: 12px; color: var(--text-muted); font-family: 'JetBrains Mono', monospace; white-space: nowrap; }
+        .modal-btn { width: 32px; height: 32px; border: 1px solid transparent; background: var(--bg-surface); color: var(--text-secondary); border-radius: var(--radius-sm); cursor: pointer; font-size: 16px; display: flex; align-items: center; justify-content: center; transition: all 0.2s; flex-shrink: 0; }
+        .modal-btn:hover { color: var(--text-primary); background: var(--bg-card-hover); border-color: var(--border-subtle); }
+        .modal-btn:disabled { opacity: 0.25; cursor: not-allowed; pointer-events: none; }
+        .modal-btn-close:hover { color: var(--accent-red); background: var(--accent-red-dim); border-color: var(--accent-red-dim); }
+        .modal-btn-next:hover { color: var(--accent-green); background: var(--accent-green-dim); border-color: var(--accent-green-dim); }
+        .modal-btn-fullscreen:hover { color: var(--accent-blue); background: var(--accent-blue-dim); border-color: var(--accent-blue-dim); }
+        .modal-video { width: 100%; aspect-ratio: 16 / 9; background: #000; display: flex; align-items: center; justify-content: center; }
+        .modal-video video { width: 100%; height: 100%; }
+        .modal-error { color: var(--accent-red); font-family: 'JetBrains Mono', monospace; font-size: 13px; padding: 20px; text-align: center; }
+
+        /* --- Empty State --- */
+        .empty-state { text-align: center; padding: 80px 20px; color: var(--text-muted); }
+        .empty-state-icon { font-size: 48px; margin-bottom: 16px; }
+        .empty-state h3 { font-size: 18px; color: var(--text-secondary); margin-bottom: 8px; }
+        .empty-state p { font-size: 14px; max-width: 400px; margin: 0 auto; }
+
+        .spinner { display: inline-block; width: 16px; height: 16px; border: 2px solid var(--text-muted); border-top-color: var(--accent-orange); border-radius: 50%; animation: spin 0.8s linear infinite; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        @keyframes fadeInUp { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: translateY(0); } }
+        .video-card { animation: fadeInUp 0.4s ease both; }
+        .channel-card { animation: fadeInUp 0.3s ease both; }
+
+        /* Infinite scroll sentinel */
+        #scrollSentinel { height: 1px; margin-bottom: 40px; }
+
+        /* =====================================================================
+           FLOATING ACTION BUTTONS
+           ===================================================================== */
+        #scrollBtn {
+            position: fixed; bottom: 74px; right: 20px;
+            width: 44px; height: 44px;
+            background: var(--bg-surface); color: var(--text-secondary);
+            border: 1px solid var(--border-subtle); border-radius: 50%;
+            font-size: 18px; cursor: pointer; z-index: 9999;
+            display: none; align-items: center; justify-content: center;
+            box-shadow: 0 4px 16px rgba(0,0,0,0.4); transition: all 0.2s;
+        }
+        #scrollBtn:hover { border-color: var(--accent-orange); color: var(--accent-orange); transform: scale(1.1); }
+        #scrollBtn.visible { display: flex; }
+
+        #debugConsole {
+            position: fixed; bottom: 20px; right: 20px;
+            width: 640px; max-width: calc(100vw - 40px); max-height: 480px;
+            background: #0d0d14; border: 1px solid var(--accent-orange);
+            border-radius: var(--radius); box-shadow: 0 8px 40px rgba(0,0,0,0.8);
+            z-index: 9999; display: none; flex-direction: column;
+            font-family: 'JetBrains Mono', monospace; font-size: 11px;
+        }
+        #debugConsole.open { display: flex; }
+        #debugConsoleHeader {
+            padding: 8px 12px; border-bottom: 1px solid var(--border-subtle);
+            display: flex; align-items: center; justify-content: space-between;
+            background: var(--bg-surface); border-radius: var(--radius) var(--radius) 0 0;
+        }
+        #debugConsoleHeader span { color: var(--accent-orange); font-weight: 600; }
+        #debugConsoleActions { display: flex; gap: 6px; }
+        .dbg-btn { padding: 3px 10px; border: 1px solid var(--border-subtle); border-radius: 4px; background: var(--bg-card); color: var(--text-secondary); font-family: 'JetBrains Mono', monospace; font-size: 11px; cursor: pointer; }
+        .dbg-btn:hover { border-color: var(--accent-orange); color: var(--accent-orange); }
+        #debugTabs { display: flex; gap: 0; border-bottom: 1px solid var(--border-subtle); background: var(--bg-surface); }
+        .dbg-tab { padding: 6px 14px; cursor: pointer; font-size: 11px; color: var(--text-muted); border-bottom: 2px solid transparent; transition: all 0.15s; }
+        .dbg-tab:hover { color: var(--text-secondary); }
+        .dbg-tab.active { color: var(--accent-orange); border-bottom-color: var(--accent-orange); }
+        #debugBody { flex: 1; overflow-y: auto; padding: 8px 12px; line-height: 1.7; color: var(--text-muted); }
+        #debugBody::-webkit-scrollbar { width: 4px; }
+        #debugBody::-webkit-scrollbar-thumb { background: var(--border-subtle); }
+        .dbg-entry { white-space: pre-wrap; word-break: break-all; margin-bottom: 1px; }
+        .dbg-INFO    { color: #7dd3fc; }
+        .dbg-WARNING { color: var(--accent-yellow); }
+        .dbg-ERROR   { color: var(--accent-red); }
+        .dbg-DEBUG   { color: var(--text-muted); }
+        .dbg-stream  { color: var(--accent-green); }
+        .dbg-proxy   { color: var(--accent-purple); }
+        #debugStatusBar { padding: 4px 12px; border-top: 1px solid var(--border-subtle); font-size: 10px; color: var(--text-muted); display: flex; gap: 16px; }
+        #debugToggleBtn {
+            position: fixed; bottom: 20px; right: 20px;
+            width: 44px; height: 44px;
+            background: var(--accent-orange); color: var(--bg-primary);
+            border: none; border-radius: 50%; font-size: 20px; cursor: pointer;
+            z-index: 10000; display: flex; align-items: center; justify-content: center;
+            box-shadow: 0 4px 16px rgba(255,107,53,0.4); transition: transform 0.2s;
+        }
+        #debugToggleBtn:hover { transform: scale(1.1); }
+    </style>
+</head>
+<body>
+
+    <header class="header">
+        <div class="logo">
+            <div class="logo-icon">W</div>
+            <div class="logo-text">Watch<span>Dawg</span></div>
+        </div>
+        <div class="header-right">
+            <div id="globalVideoCount"></div>
+            <div id="healthStatus" class="status-pill status-unknown">
+                <div class="status-dot"></div><span>Connecting...</span>
+            </div>
+        </div>
+    </header>
+
+    <nav class="tab-nav">
+        <button class="tab-btn active" onclick="switchTab('feed', this)">&#x1F3AC; Feed</button>
+        <button class="tab-btn" onclick="switchTab('channels', this)">&#x1F4E1; Channels</button>
+        <button class="tab-btn" onclick="switchTab('favorites', this)">&#x2B50; Favorites</button>
+        <button class="tab-btn" onclick="switchTab('library', this)">&#x1F4C2; Library</button>
+    </nav>
+
+    <!-- FEED TAB -->
+    <div class="tab-content active" id="tab-feed">
+        <div class="controls">
+            <button class="btn btn-primary" id="btnScrape" onclick="triggerScrape()">&#x1F50D; Scrape All Channels</button>
+            <button class="btn" id="btnResolve" onclick="triggerBatchResolve()">&#x26A1; Resolve All</button>
+            <button class="btn" id="btnStopResolve" onclick="stopResolve()" style="display:none;color:var(--accent-red);border-color:var(--accent-red-dim);" title="Stop the current resolve batch after the current video finishes">&#x23F9; Stop Resolve</button>
+            <button class="btn" id="btnResetFailed" onclick="resetFailed()">&#x1F504; Reset Failed</button>
+            <button class="btn" id="btnPurgeDead" onclick="purgeDead()" style="color:var(--accent-red);border-color:var(--accent-red-dim);" title="Permanently delete all failed/dead videos from the database">&#x1F9F9; Purge Dead</button>
+            <button class="btn" id="btnPurgeDash" onclick="purgeDash()" style="color:var(--accent-yellow);border-color:var(--accent-yellow-dim);" title="Remove DASH-only videos (unplayable in browser)">&#x26A0; Purge DASH</button>
+            <button class="btn" id="btnPurgeDupes" onclick="purgeDuplicates()" style="color:var(--accent-purple);border-color:var(--accent-purple-dim);" title="Remove duplicate Vimeo videos that share the same CDN file — keeps highest-scored copy">&#x1F9F9; Purge Dupes</button>
+            <button class="btn" id="btnClearBlocklist" onclick="clearBlocklist()" style="color:var(--accent-blue);border-color:var(--accent-blue-dim);" title="Clear all blocked videos so they can reappear on next scrape">&#x1F513; Clear Blocklist</button>
+            <button class="btn" id="btnBackfill" onclick="triggerBackfillThumbnails()" title="Fetch missing thumbnails for Vimeo/YouTube videos via yt-dlp metadata pass">&#x1F5BC; Backfill Thumbs</button>
+            <button class="btn" id="btnRefresh" onclick="refreshFeed()">&#x21BB; Refresh</button>
+            <button class="btn" id="btnPlayAll" onclick="startPlayAll('feed', false)">&#x25B6;&#xFE0F; Play All</button>
+            <button class="btn" id="btnShuffle" onclick="startPlayAll('feed', true)">&#x1F500; Shuffle</button>
+            <button class="btn" id="btnShuffleAll" onclick="shuffleAll()" title="Shuffle ALL videos from server — ignores scroll position, uses full library">&#x1F3B2; Shuffle All</button>
+            <div class="controls-spacer"></div>
+            <div class="video-count" id="videoCount">&mdash;</div>
+        </div>
+
+        <div class="log-panel">
+            <div class="log-header" onclick="toggleLog()">
+                <h3>Activity Log</h3>
+                <div class="log-header-actions">
+                    <span id="logToggleIcon" style="color:var(--text-muted);font-size:12px;">&#x25BC;</span>
+                    <button class="btn" style="padding:4px 10px;font-size:11px;" onclick="event.stopPropagation();clearLog()">Clear</button>
+                </div>
+            </div>
+            <div class="log-body" id="logBody">
+                <div class="log-entry log-info">WatchDawg Control Deck initialized. Ready.</div>
+            </div>
+        </div>
+
+        <!-- Sidebar + main feed layout -->
+        <div class="feed-layout">
+            <div class="channel-sidebar" id="feedSidebar">
+                <div class="sidebar-header">
+                    <span class="sidebar-title">Filter Channels</span>
+                    <button class="sidebar-clear-btn" onclick="feedSidebarSelectAll()" title="Select / deselect all">All</button>
+                </div>
+                <div id="feedSidebarGroups">
+                    <div style="padding:16px;font-size:12px;color:var(--text-muted);">Loading...</div>
+                </div>
+            </div>
+            <div class="feed-main">
+                <div class="grid-container">
+                    <div class="grid-header"><h2 id="gridTitle">Video Feed</h2></div>
+                    <div class="video-grid" id="videoGrid">
+                        <div class="empty-state">
+                            <div class="empty-state-icon">&#x1F3AC;</div>
+                            <h3>No videos yet</h3>
+                            <p>Add channels in the Channels tab, then hit "Scrape All Channels".</p>
+                        </div>
+                    </div>
+                    <div id="scrollSentinel"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- CHANNELS TAB -->
+    <div class="tab-content" id="tab-channels">
+        <div class="channel-manager">
+            <div class="channel-add-form">
+                <div class="channel-add-row">
+                    <input type="text" id="channelUrlInput"
+                        placeholder="Paste a URL — Vimeo channel, Reddit subreddit, YouTube playlist..."
+                        onkeydown="if(event.key==='Enter') addChannel()">
+                </div>
+                <div class="channel-add-row">
+                    <input type="text" id="channelNameInput"
+                        placeholder="Friendly name (optional) — e.g. Pop Music Videos, 80s Classics..."
+                        onkeydown="if(event.key==='Enter') addChannel()">
+                    <button class="btn btn-primary" id="btnAddChannel" onclick="addChannel()">&#x2795; Add Channel</button>
+                </div>
+            </div>
+            <div id="channelList"></div>
+        </div>
+    </div>
+
+    <!-- FAVORITES TAB -->
+    <div class="tab-content" id="tab-favorites">
+        <div class="controls">
+            <button class="btn" onclick="loadFavorites()">&#x21BB; Refresh</button>
+            <button class="btn" id="btnFavPlayAll" onclick="favPlayAll(false)">&#x25B6;&#xFE0F; Play All</button>
+            <button class="btn" id="btnFavShuffle" onclick="favPlayAll(true)">&#x1F500; Shuffle</button>
+            <div class="controls-spacer"></div>
+            <div class="video-count" id="favCount">&mdash;</div>
+        </div>
+        <div class="feed-layout">
+            <div class="channel-sidebar" id="favSidebar">
+                <div class="sidebar-header">
+                    <span class="sidebar-title">Filter Channels</span>
+                    <button class="sidebar-clear-btn" onclick="favSidebarSelectAll()" title="Select / deselect all">All</button>
+                </div>
+                <div id="favSidebarGroups">
+                    <div style="padding:16px;font-size:12px;color:var(--text-muted);">Loading...</div>
+                </div>
+            </div>
+            <div class="feed-main">
+                <div class="grid-container">
+                    <div class="grid-header"><h2>Favorites</h2></div>
+                    <div class="video-grid" id="favoritesGrid">
+                        <div class="empty-state">
+                            <div class="empty-state-icon">&#x2B50;</div>
+                            <h3>No favorites yet</h3>
+                            <p>Click the star on a video to save it to your Music Videos directory.</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- LIBRARY TAB -->
+    <div class="tab-content" id="tab-library">
+        <div class="controls">
+            <button class="btn" onclick="loadLibrary()">&#x21BB; Scan Library</button>
+            <button class="btn" id="btnLibPlayAll" onclick="libPlayAll(false)">&#x25B6;&#xFE0F; Play All</button>
+            <button class="btn" id="btnLibShuffle" onclick="libPlayAll(true)">&#x1F500; Shuffle</button>
+            <button class="btn" id="btnGenThumbs" onclick="generateLibraryThumbnails()" title="Generate thumbnails for manually-added videos using ffmpeg">&#x1F3A8; Generate Thumbs</button>
+            <div class="controls-spacer"></div>
+            <div class="video-count" id="libCount">&mdash;</div>
+        </div>
+        <div class="feed-layout">
+            <div class="channel-sidebar" id="libSidebar">
+                <div class="sidebar-header">
+                    <span class="sidebar-title">Filter Folders</span>
+                    <button class="sidebar-clear-btn" onclick="libSidebarSelectAll()" title="Select / deselect all">All</button>
+                </div>
+                <div id="libSidebarGroups">
+                    <div style="padding:16px;font-size:12px;color:var(--text-muted);">Scan library to filter.</div>
+                </div>
+            </div>
+            <div class="feed-main">
+                <div class="grid-container">
+                    <div class="grid-header"><h2>Local Library</h2></div>
+                    <div class="video-grid" id="libraryGrid">
+                        <div class="empty-state">
+                            <div class="empty-state-icon">&#x1F4C2;</div>
+                            <h3>No files found</h3>
+                            <p>Click "Scan Library" to list video files from your NAS.</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Player Modal -->
+    <div class="modal-overlay" id="playerModal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3 class="modal-title" id="playerTitle">Now Playing</h3>
+                <span class="modal-queue-info" id="queueInfo"></span>
+                <button class="modal-btn modal-btn-next" id="btnNext" onclick="playNext()" title="Next (→)" disabled>&#x23ED;</button>
+                <button class="modal-btn modal-btn-fullscreen" id="btnFullscreen" onclick="toggleFullscreen()" title="Fullscreen (F)">&#x26F6;</button>
+                <button class="modal-btn modal-btn-close" onclick="closePlayer()" title="Close (Esc)">&#x2715;</button>
+            </div>
+            <div class="modal-video" id="playerContainer"></div>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE = window.location.origin;
+        let currentVideos = [];
+        let currentChannels = [];
+        let currentFavorites = [];
+        let currentLibrary = [];
+
+        // =====================================================================
+        //  PLAY QUEUE
+        // =====================================================================
+        let playQueue = [];
+        let queueIndex = -1;
+
+        function _buildQueueItems(source) {
+            // Build queue from the currently VISIBLE (filtered) items in each tab
+            if (source === 'feed') {
+                return currentVideos.map(v => ({ id: v.id, title: v.title, streamUrl: null, type: 'resolve' }));
+            } else if (source === 'favorites') {
+                const visible = _getFavVisibleItems();
+                return visible.map(f => f.stream_url
+                    ? { id: f.filename || f.video_id, title: f.title, streamUrl: f.stream_url, type: 'local' }
+                    : { id: f.video_id, title: f.title, streamUrl: null, type: 'resolve' }
+                );
+            } else if (source === 'library') {
+                const visible = _getLibVisibleItems();
+                return visible.map(f => ({ id: f.filename, title: f.title, streamUrl: f.stream_url, type: 'local' }));
+            }
+            return [];
+        }
+
+        function startPlayAll(source, shuffle) {
+            const items = _buildQueueItems(source);
+            if (!items.length) { log(`No visible items to play in ${source}.`, 'warn'); return; }
+            if (shuffle) {
+                for (let i = items.length - 1; i > 0; i--) {
+                    const j = Math.floor(Math.random() * (i + 1));
+                    [items[i], items[j]] = [items[j], items[i]];
+                }
+                log(`Shuffle (${source}): ${items.length} items queued`, 'info');
+            } else {
+                log(`Play All (${source}): ${items.length} items queued`, 'info');
+            }
+            playQueue = items;
+            queueIndex = 0;
+            playFromQueue();
+        }
+
+        function favPlayAll(shuffle) { startPlayAll('favorites', shuffle); }
+        function libPlayAll(shuffle)  { startPlayAll('library', shuffle); }
+
+        // =====================================================================
+        //  SHUFFLE ALL — fetches full ID list from server, true shuffle
+        // =====================================================================
+        async function shuffleAll() {
+            const btn = document.getElementById('btnShuffleAll');
+            btn.disabled = true;
+            btn.innerHTML = '<span class="spinner"></span> Loading...';
+            log('Shuffle All: fetching full video ID list from server...', 'info');
+            try {
+                const channelIds = _getFeedSidebarChannelIds();
+                let url = `${API_BASE}/feed/ids`;
+                if (channelIds !== null) url += `?channel_ids=${encodeURIComponent(channelIds)}`;
+
+                const res = await fetch(url);
+                if (!res.ok) throw new Error(`Server returned ${res.status}`);
+                const data = await res.json();
+
+                if (!data.ids || data.ids.length === 0) {
+                    log('Shuffle All: no videos found for current filter.', 'warn');
+                    return;
+                }
+
+                const items = data.ids.map(v => ({ id: v.id, title: v.title, streamUrl: null, type: 'resolve' }));
+                for (let i = items.length - 1; i > 0; i--) {
+                    const j = Math.floor(Math.random() * (i + 1));
+                    [items[i], items[j]] = [items[j], items[i]];
+                }
+
+                playQueue = items;
+                queueIndex = 0;
+                log(`Shuffle All: ${items.length} videos queued from server.`, 'success');
+                playFromQueue();
+            } catch (e) {
+                log(`Shuffle All failed: ${e.message}`, 'error');
+            } finally {
+                btn.disabled = false;
+                btn.innerHTML = '&#x1F3B2; Shuffle All';
+            }
+        }
+
+        async function playFromQueue() {
+            if (queueIndex < 0 || queueIndex >= playQueue.length) {
+                log('Queue finished.', 'info');
+                playQueue = []; queueIndex = -1; updateQueueUI();
+                return;
+            }
+            const item = playQueue[queueIndex];
+            updateQueueUI();
+            highlightNowPlaying(item.id);
+            if (item.type === 'local') {
+                await playLocalFile(item.streamUrl, item.title, true);
+            } else {
+                await playVideo(item.id, true);
+            }
+        }
+
+        async function playNext() {
+            if (!playQueue.length) return;
+            queueIndex++;
+            if (queueIndex >= playQueue.length) {
+                log('End of queue.', 'info');
+                closePlayer(); return;
+            }
+            await playFromQueue();
+        }
+
+        function updateQueueUI() {
+            const info = document.getElementById('queueInfo');
+            const btn = document.getElementById('btnNext');
+            if (playQueue.length > 0) {
+                info.textContent = `${queueIndex + 1} / ${playQueue.length}`;
+                btn.disabled = (queueIndex >= playQueue.length - 1);
+            } else {
+                info.textContent = '';
+                btn.disabled = true;
+            }
+        }
+
+        function highlightNowPlaying(id) {
+            document.querySelectorAll('.video-card.now-playing').forEach(el => el.classList.remove('now-playing'));
+            const card = document.querySelector(`.video-card[data-id="${id}"]`);
+            if (card) { card.classList.add('now-playing'); card.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }
+        }
+
+        // =====================================================================
+        //  SCROLL BUTTON
+        // =====================================================================
+        document.addEventListener('DOMContentLoaded', function initScrollButton() {
+            const btn = document.getElementById('scrollBtn');
+            if (!btn) return;
+            let atBottom = false;
+
+            function updateScrollBtn() {
+                const scrollable = document.documentElement.scrollHeight > window.innerHeight + 100;
+                if (!scrollable) { btn.classList.remove('visible'); return; }
+                btn.classList.add('visible');
+                const nearBottom = window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 200;
+                if (nearBottom !== atBottom) {
+                    atBottom = nearBottom;
+                    btn.textContent = atBottom ? '⬆' : '⬇';
+                    btn.title = atBottom ? 'Scroll to top' : 'Scroll to bottom';
+                }
+            }
+
+            btn.addEventListener('click', () => {
+                if (atBottom) window.scrollTo({ top: 0, behavior: 'smooth' });
+                else window.scrollTo({ top: document.documentElement.scrollHeight, behavior: 'smooth' });
+            });
+
+            window.addEventListener('scroll', updateScrollBtn, { passive: true });
+            window.addEventListener('resize', updateScrollBtn, { passive: true });
+            window._updateScrollBtn = updateScrollBtn;
+        });
+
+        // =====================================================================
+        //  TABS
+        // =====================================================================
+        function switchTab(tabName, btn) {
+            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+            document.getElementById(`tab-${tabName}`).classList.add('active');
+            btn.classList.add('active');
+            if (tabName === 'feed')      loadFeed();
+            if (tabName === 'channels')  loadChannels();
+            if (tabName === 'favorites') loadFavorites();
+            if (tabName === 'library')   loadLibrary();
+        }
+
+        // =====================================================================
+        //  LOGGING
+        // =====================================================================
+        function log(msg, level = 'info') {
+            const body = document.getElementById('logBody');
+            const entry = document.createElement('div');
+            entry.className = `log-entry log-${level}`;
+            const ts = new Date().toLocaleTimeString();
+            entry.textContent = `[${ts}] ${msg}`;
+            body.appendChild(entry);
+            body.scrollTop = body.scrollHeight;
+        }
+
+        function clearLog() { document.getElementById('logBody').innerHTML = ''; log('Log cleared.', 'info'); }
+
+        function toggleLog() {
+            const body = document.getElementById('logBody');
+            const icon = document.getElementById('logToggleIcon');
+            body.classList.toggle('collapsed');
+            icon.innerHTML = body.classList.contains('collapsed') ? '&#x25B6;' : '&#x25BC;';
+        }
+
+        // =====================================================================
+        //  HEALTH
+        // =====================================================================
+        async function checkHealth() {
+            const el = document.getElementById('healthStatus');
+            try {
+                const res = await fetch(`${API_BASE}/health`);
+                const data = await res.json();
+                if (data.status === 'healthy') {
+                    el.className = 'status-pill status-healthy';
+                    el.innerHTML = '<div class="status-dot"></div><span>Healthy</span>';
+                } else {
+                    el.className = 'status-pill status-degraded';
+                    el.innerHTML = '<div class="status-dot"></div><span>Degraded</span>';
+                }
+            } catch {
+                el.className = 'status-pill status-degraded';
+                el.innerHTML = '<div class="status-dot"></div><span>Offline</span>';
+            }
+        }
+
+        function updateGlobalCount(total) {
+            const el = document.getElementById('globalVideoCount');
+            if (total > 0) {
+                el.textContent = `${total.toLocaleString()} videos`;
+                el.style.display = 'block';
+            } else {
+                el.style.display = 'none';
+            }
+        }
+
+        // =====================================================================
+        //  FEED SIDEBAR — channel filter (server-side, same as before)
+        //
+        //  feedSidebarState: channel_id -> boolean
+        //  Persists across tab switches (never reset until page reload).
+        // =====================================================================
+        let feedSidebarState = {};
+
+        const PROVIDER_CONFIG = {
+            youtube: { label: 'YouTube', cls: 'provider-label-youtube' },
+            vimeo:   { label: 'Vimeo',   cls: 'provider-label-vimeo'   },
+            reddit:  { label: 'Reddit',  cls: 'provider-label-reddit'  },
+        };
+
+        function buildFeedSidebar(channels) {
+            const groups = {};
+            channels.forEach(ch => {
+                let provider = ch.channel_type || 'other';
+                if (provider === 'ytdlp_playlist') provider = 'youtube';
+                if (provider === 'vimeo_channel')  provider = 'vimeo';
+                if (provider === 'reddit_subreddit') provider = 'reddit';
+                if (!groups[provider]) groups[provider] = [];
+                groups[provider].push(ch);
+            });
+
+            channels.forEach(ch => {
+                if (!(ch.id in feedSidebarState)) feedSidebarState[ch.id] = true;
+            });
+
+            const container = document.getElementById('feedSidebarGroups');
+            if (!channels.length) {
+                container.innerHTML = '<div style="padding:16px;font-size:12px;color:var(--text-muted);">No channels yet.</div>';
+                return;
+            }
+
+            const providerOrder = ['youtube', 'vimeo', 'reddit', 'other'];
+            const sortedProviders = Object.keys(groups).sort((a, b) => {
+                const ai = providerOrder.indexOf(a);
+                const bi = providerOrder.indexOf(b);
+                return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
+            });
+
+            container.innerHTML = sortedProviders.map(provider => {
+                const cfg = PROVIDER_CONFIG[provider] || { label: provider.charAt(0).toUpperCase() + provider.slice(1), cls: 'provider-label-other' };
+                const chs = groups[provider];
+                const allChecked = chs.every(ch => feedSidebarState[ch.id]);
+                const someChecked = chs.some(ch => feedSidebarState[ch.id]);
+                return `
+                <div class="provider-group" id="feedGroup_${provider}">
+                    <div class="provider-group-header" onclick="toggleFeedProviderGroup('${provider}')">
+                        <span class="provider-group-chevron">▼</span>
+                        <span class="provider-group-label ${cfg.cls}">${cfg.label}</span>
+                        <span class="provider-group-count">${chs.length}</span>
+                    </div>
+                    <div class="provider-select-all" onclick="toggleFeedProviderAll('${provider}')">
+                        <input type="checkbox" id="feedSelectAll_${provider}"
+                            ${allChecked ? 'checked' : ''}
+                            ${(!allChecked && someChecked) ? 'data-indeterminate="true"' : ''}
+                            onclick="event.stopPropagation();toggleFeedProviderAll('${provider}')">
+                        <span>Select all</span>
+                    </div>
+                    <div class="provider-channels" id="feedProviderChs_${provider}" style="max-height:${chs.length * 44}px">
+                        ${chs.map(ch => `
+                        <div class="sidebar-channel-row" onclick="toggleFeedChannel(${ch.id})">
+                            <input type="checkbox" id="feedCh_${ch.id}"
+                                ${feedSidebarState[ch.id] ? 'checked' : ''}
+                                onclick="event.stopPropagation();toggleFeedChannel(${ch.id})">
+                            <span class="sidebar-channel-name" title="${escapeHtml(ch.name)}">${escapeHtml(ch.name)}</span>
+                            <span class="sidebar-channel-count">${ch.video_count || 0}</span>
+                        </div>`).join('')}
+                    </div>
+                </div>`;
+            }).join('');
+
+            document.querySelectorAll('[data-indeterminate="true"]').forEach(cb => { cb.indeterminate = true; });
+        }
+
+        function toggleFeedProviderGroup(provider) {
+            const g = document.getElementById(`feedGroup_${provider}`);
+            if (g) g.classList.toggle('collapsed');
+        }
+
+        function toggleFeedChannel(channelId) {
+            feedSidebarState[channelId] = !feedSidebarState[channelId];
+            const cb = document.getElementById(`feedCh_${channelId}`);
+            if (cb) cb.checked = feedSidebarState[channelId];
+            _updateFeedProviderSelectAll(channelId);
+            refreshFeed();
+        }
+
+        function toggleFeedProviderAll(provider) {
+            const group = document.getElementById(`feedGroup_${provider}`);
+            if (!group) return;
+            const checkboxes = group.querySelectorAll('.sidebar-channel-row input[type="checkbox"]');
+            const selectAllCb = document.getElementById(`feedSelectAll_${provider}`);
+            const allChecked = Array.from(checkboxes).every(cb => cb.checked);
+            const newState = !allChecked;
+            checkboxes.forEach(cb => {
+                const id = parseInt(cb.id.replace('feedCh_', ''));
+                feedSidebarState[id] = newState;
+                cb.checked = newState;
+            });
+            if (selectAllCb) { selectAllCb.checked = newState; selectAllCb.indeterminate = false; }
+            refreshFeed();
+        }
+
+        function _updateFeedProviderSelectAll(channelId) {
+            const chRow = document.getElementById(`feedCh_${channelId}`);
+            if (!chRow) return;
+            const group = chRow.closest('.provider-group');
+            if (!group) return;
+            const provider = group.id.replace('feedGroup_', '');
+            const checkboxes = group.querySelectorAll('.sidebar-channel-row input[type="checkbox"]');
+            const selectAllCb = document.getElementById(`feedSelectAll_${provider}`);
+            if (!selectAllCb) return;
+            const allChecked = Array.from(checkboxes).every(cb => cb.checked);
+            const someChecked = Array.from(checkboxes).some(cb => cb.checked);
+            selectAllCb.checked = allChecked;
+            selectAllCb.indeterminate = !allChecked && someChecked;
+        }
+
+        function feedSidebarSelectAll() {
+            const allChecked = Object.values(feedSidebarState).every(v => v);
+            const newState = !allChecked;
+            Object.keys(feedSidebarState).forEach(id => feedSidebarState[parseInt(id)] = newState);
+            document.querySelectorAll('#feedSidebarGroups .sidebar-channel-row input[type="checkbox"]').forEach(cb => cb.checked = newState);
+            document.querySelectorAll('#feedSidebarGroups [id^="feedSelectAll_"]').forEach(cb => { cb.checked = newState; cb.indeterminate = false; });
+            refreshFeed();
+        }
+
+        function _getFeedSidebarChannelIds() {
+            const ids = Object.keys(feedSidebarState).map(Number);
+            const checked = ids.filter(id => feedSidebarState[id]);
+            if (checked.length === ids.length) return null;
+            return checked.join(',');
+        }
+
+        // =====================================================================
+        //  FAVORITES SIDEBAR — client-side channel filter
+        //
+        //  favSidebarState: channel_id -> boolean  (keyed by Channel DB id)
+        //  We derive channel membership from the favorite's video channel_id
+        //  returned in the /favorite endpoint response.
+        //  Because filtering is client-side, no server re-fetch is needed.
+        // =====================================================================
+        let favSidebarState = {};
+
+        function buildFavSidebar(favorites) {
+            // Collect unique channels from favorites list
+            // favorites may have channel_id and channel_name fields (added to API response below)
+            // We group by channel_id; fallback to "Uncategorized" when channel_id is null.
+            const groups = {};   // provider -> [ { id, name, count } ]
+
+            favorites.forEach(f => {
+                const chId   = f.channel_id   != null ? f.channel_id   : 0;
+                const chName = f.channel_name ? f.channel_name : 'Uncategorized';
+                let provider = f.source_provider || 'other';
+                if (provider === 'vimeo')   provider = 'vimeo';
+                if (provider === 'youtube' || provider === 'playlist') provider = 'youtube';
+                if (provider === 'reddit')  provider = 'reddit';
+
+                if (!groups[provider]) groups[provider] = {};
+                if (!groups[provider][chId]) groups[provider][chId] = { id: chId, name: chName, count: 0 };
+                groups[provider][chId].count++;
+            });
+
+            // Initialize state (default all checked) — persist existing selections
+            Object.values(groups).forEach(provGroup => {
+                Object.values(provGroup).forEach(ch => {
+                    if (!(ch.id in favSidebarState)) favSidebarState[ch.id] = true;
+                });
+            });
+
+            const container = document.getElementById('favSidebarGroups');
+            if (!favorites.length) {
+                container.innerHTML = '<div style="padding:16px;font-size:12px;color:var(--text-muted);">No favorites yet.</div>';
+                return;
+            }
+
+            const providerOrder = ['youtube', 'vimeo', 'reddit', 'other'];
+            const sortedProviders = Object.keys(groups).sort((a, b) => {
+                const ai = providerOrder.indexOf(a);
+                const bi = providerOrder.indexOf(b);
+                return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
+            });
+
+            container.innerHTML = sortedProviders.map(provider => {
+                const cfg = PROVIDER_CONFIG[provider] || { label: 'Other', cls: 'provider-label-other' };
+                const chs = Object.values(groups[provider]);
+                const allChecked = chs.every(ch => favSidebarState[ch.id]);
+                const someChecked = chs.some(ch => favSidebarState[ch.id]);
+                return `
+                <div class="provider-group" id="favGroup_${provider}">
+                    <div class="provider-group-header" onclick="toggleFavProviderGroup('${provider}')">
+                        <span class="provider-group-chevron">▼</span>
+                        <span class="provider-group-label ${cfg.cls}">${cfg.label}</span>
+                        <span class="provider-group-count">${chs.length}</span>
+                    </div>
+                    <div class="provider-select-all" onclick="toggleFavProviderAll('${provider}')">
+                        <input type="checkbox" id="favSelectAll_${provider}"
+                            ${allChecked ? 'checked' : ''}
+                            ${(!allChecked && someChecked) ? 'data-indeterminate="true"' : ''}
+                            onclick="event.stopPropagation();toggleFavProviderAll('${provider}')">
+                        <span>Select all</span>
+                    </div>
+                    <div class="provider-channels" id="favProviderChs_${provider}" style="max-height:${chs.length * 44}px">
+                        ${chs.map(ch => `
+                        <div class="sidebar-channel-row" onclick="toggleFavChannel(${ch.id})">
+                            <input type="checkbox" id="favCh_${ch.id}"
+                                ${favSidebarState[ch.id] ? 'checked' : ''}
+                                onclick="event.stopPropagation();toggleFavChannel(${ch.id})">
+                            <span class="sidebar-channel-name" title="${escapeHtml(ch.name)}">${escapeHtml(ch.name)}</span>
+                            <span class="sidebar-channel-count">${ch.count}</span>
+                        </div>`).join('')}
+                    </div>
+                </div>`;
+            }).join('');
+
+            document.querySelectorAll('#favSidebarGroups [data-indeterminate="true"]').forEach(cb => { cb.indeterminate = true; });
+        }
+
+        function toggleFavProviderGroup(provider) {
+            const g = document.getElementById(`favGroup_${provider}`);
+            if (g) g.classList.toggle('collapsed');
+        }
+
+        function toggleFavChannel(channelId) {
+            favSidebarState[channelId] = !favSidebarState[channelId];
+            const cb = document.getElementById(`favCh_${channelId}`);
+            if (cb) cb.checked = favSidebarState[channelId];
+            _updateFavProviderSelectAll(channelId);
+            renderFavorites(currentFavorites);
+        }
+
+        function toggleFavProviderAll(provider) {
+            const group = document.getElementById(`favGroup_${provider}`);
+            if (!group) return;
+            const checkboxes = group.querySelectorAll('.sidebar-channel-row input[type="checkbox"]');
+            const selectAllCb = document.getElementById(`favSelectAll_${provider}`);
+            const allChecked = Array.from(checkboxes).every(cb => cb.checked);
+            const newState = !allChecked;
+            checkboxes.forEach(cb => {
+                const id = parseInt(cb.id.replace('favCh_', ''));
+                favSidebarState[id] = newState;
+                cb.checked = newState;
+            });
+            if (selectAllCb) { selectAllCb.checked = newState; selectAllCb.indeterminate = false; }
+            renderFavorites(currentFavorites);
+        }
+
+        function _updateFavProviderSelectAll(channelId) {
+            const chRow = document.getElementById(`favCh_${channelId}`);
+            if (!chRow) return;
+            const group = chRow.closest('.provider-group');
+            if (!group) return;
+            const provider = group.id.replace('favGroup_', '');
+            const checkboxes = group.querySelectorAll('.sidebar-channel-row input[type="checkbox"]');
+            const selectAllCb = document.getElementById(`favSelectAll_${provider}`);
+            if (!selectAllCb) return;
+            const allChecked = Array.from(checkboxes).every(cb => cb.checked);
+            const someChecked = Array.from(checkboxes).some(cb => cb.checked);
+            selectAllCb.checked = allChecked;
+            selectAllCb.indeterminate = !allChecked && someChecked;
+        }
+
+        function favSidebarSelectAll() {
+            const allChecked = Object.values(favSidebarState).every(v => v);
+            const newState = !allChecked;
+            Object.keys(favSidebarState).forEach(id => favSidebarState[parseInt(id)] = newState);
+            document.querySelectorAll('#favSidebarGroups .sidebar-channel-row input[type="checkbox"]').forEach(cb => cb.checked = newState);
+            document.querySelectorAll('#favSidebarGroups [id^="favSelectAll_"]').forEach(cb => { cb.checked = newState; cb.indeterminate = false; });
+            renderFavorites(currentFavorites);
+        }
+
+        function _getFavVisibleItems() {
+            // Returns favorites that pass the current favSidebarState filter
+            const allChecked = Object.values(favSidebarState).every(v => v);
+            if (allChecked) return currentFavorites;
+            return currentFavorites.filter(f => {
+                const chId = f.channel_id != null ? f.channel_id : 0;
+                return favSidebarState[chId] !== false;
+            });
+        }
+
+        // =====================================================================
+        //  LIBRARY SIDEBAR — client-side subfolder filter
+        //
+        //  libSidebarState: subfolder_key -> boolean
+        //  subfolder_key = subfolder string, or "__root__" for root-level files.
+        //  Persists across tab switches.
+        // =====================================================================
+        let libSidebarState = {};
+
+        function buildLibSidebar(files) {
+            // Collect unique subfolders and count files per folder
+            const folders = {};  // key -> { label, count }
+            files.forEach(f => {
+                const key = f.subfolder && f.subfolder !== '' ? f.subfolder : '__root__';
+                const label = key === '__root__' ? 'Root (no folder)' : f.subfolder;
+                if (!folders[key]) folders[key] = { key, label, count: 0 };
+                folders[key].count++;
+            });
+
+            // Initialize state (default all checked) — persist existing
+            Object.keys(folders).forEach(key => {
+                if (!(key in libSidebarState)) libSidebarState[key] = true;
+            });
+
+            const container = document.getElementById('libSidebarGroups');
+            if (!files.length) {
+                container.innerHTML = '<div style="padding:16px;font-size:12px;color:var(--text-muted);">No files found.</div>';
+                return;
+            }
+
+            // Sort: root first, then alphabetical
+            const sorted = Object.values(folders).sort((a, b) => {
+                if (a.key === '__root__') return -1;
+                if (b.key === '__root__') return  1;
+                return a.label.localeCompare(b.label);
+            });
+
+            const allChecked = sorted.every(f => libSidebarState[f.key]);
+            const someChecked = sorted.some(f => libSidebarState[f.key]);
+
+            container.innerHTML = `
+            <div class="provider-group" id="libFolderGroup">
+                <div class="provider-group-header" onclick="toggleLibFolderGroup()">
+                    <span class="provider-group-chevron">▼</span>
+                    <span class="provider-group-label provider-label-folder">&#x1F4C1; Folders</span>
+                    <span class="provider-group-count">${sorted.length}</span>
+                </div>
+                <div class="provider-select-all" onclick="libSidebarSelectAll()">
+                    <input type="checkbox" id="libSelectAll"
+                        ${allChecked ? 'checked' : ''}
+                        ${(!allChecked && someChecked) ? 'data-indeterminate="true"' : ''}
+                        onclick="event.stopPropagation();libSidebarSelectAll()">
+                    <span>Select all</span>
+                </div>
+                <div class="provider-channels" id="libFolderChs" style="max-height:${sorted.length * 44}px">
+                    ${sorted.map(f => `
+                    <div class="sidebar-channel-row" onclick="toggleLibFolder('${escapeAttr(f.key)}')">
+                        <input type="checkbox" id="libFolder_${escapeAttr(f.key)}"
+                            ${libSidebarState[f.key] ? 'checked' : ''}
+                            onclick="event.stopPropagation();toggleLibFolder('${escapeAttr(f.key)}')">
+                        <span class="sidebar-channel-name" title="${escapeHtml(f.label)}">${escapeHtml(f.label)}</span>
+                        <span class="sidebar-channel-count">${f.count}</span>
+                    </div>`).join('')}
+                </div>
+            </div>`;
+
+            document.querySelectorAll('#libSidebarGroups [data-indeterminate="true"]').forEach(cb => { cb.indeterminate = true; });
+        }
+
+        function toggleLibFolderGroup() {
+            const g = document.getElementById('libFolderGroup');
+            if (g) g.classList.toggle('collapsed');
+        }
+
+        function toggleLibFolder(key) {
+            libSidebarState[key] = !libSidebarState[key];
+            const cb = document.getElementById(`libFolder_${key}`);
+            if (cb) cb.checked = libSidebarState[key];
+            _updateLibSelectAll();
+            renderLibrary(currentLibrary, null);
+        }
+
+        function libSidebarSelectAll() {
+            const allChecked = Object.values(libSidebarState).every(v => v);
+            const newState = !allChecked;
+            Object.keys(libSidebarState).forEach(k => libSidebarState[k] = newState);
+            document.querySelectorAll('#libSidebarGroups .sidebar-channel-row input[type="checkbox"]').forEach(cb => cb.checked = newState);
+            const selectAll = document.getElementById('libSelectAll');
+            if (selectAll) { selectAll.checked = newState; selectAll.indeterminate = false; }
+            renderLibrary(currentLibrary, null);
+        }
+
+        function _updateLibSelectAll() {
+            const keys = Object.keys(libSidebarState);
+            const allChecked = keys.every(k => libSidebarState[k]);
+            const someChecked = keys.some(k => libSidebarState[k]);
+            const cb = document.getElementById('libSelectAll');
+            if (cb) { cb.checked = allChecked; cb.indeterminate = !allChecked && someChecked; }
+        }
+
+        function _getLibVisibleItems() {
+            const allChecked = Object.values(libSidebarState).every(v => v);
+            if (allChecked) return currentLibrary;
+            return currentLibrary.filter(f => {
+                const key = f.subfolder && f.subfolder !== '' ? f.subfolder : '__root__';
+                return libSidebarState[key] !== false;
+            });
+        }
+
+        // Small helper for HTML attribute escaping (spaces, special chars in folder names)
+        function escapeAttr(str) {
+            // Replaces chars that would break id= or onclick= attributes
+            return String(str).replace(/[^a-zA-Z0-9_-]/g, c => '_' + c.charCodeAt(0) + '_');
+        }
+
+        // =====================================================================
+        //  CHANNELS
+        // =====================================================================
+        async function loadChannels() {
+            try {
+                const res = await fetch(`${API_BASE}/channel`);
+                const data = await res.json();
+                currentChannels = data.channels || [];
+                renderChannels(currentChannels);
+                buildFeedSidebar(currentChannels.filter(ch => ch.enabled));
+            } catch (e) { log(`Failed to load channels: ${e.message}`, 'error'); }
+        }
+
+        function renderChannels(channels) {
+            const list = document.getElementById('channelList');
+            if (!channels.length) {
+                list.innerHTML = `<div class="channel-empty">
+                    <h3>No channels yet</h3>
+                    <p>Add a Vimeo channel, Reddit subreddit, or YouTube playlist URL above.</p>
+                    <p>Examples: <code>https://vimeo.com/channels/musicvideos</code> &nbsp; <code>r/listentothis</code> &nbsp; <code>https://youtube.com/@channelname</code></p>
+                </div>`;
+                return;
+            }
+            list.innerHTML = channels.map((ch, i) => {
+                const typeLabel = ch.channel_type === 'reddit_subreddit' ? 'Reddit' : ch.channel_type === 'vimeo_channel' ? 'Vimeo' : 'YouTube';
+                const typeBadge = ch.channel_type === 'reddit_subreddit' ? 'badge-reddit' : ch.channel_type === 'vimeo_channel' ? 'badge-vimeo' : 'badge-playlist';
+                const lastScraped = ch.last_scraped_at ? new Date(ch.last_scraped_at).toLocaleString() : 'Never';
+                const safeId = `rename_${ch.id}`;
+                return `
+                <div class="channel-card" style="animation-delay:${i * 0.05}s" id="channelCard_${ch.id}">
+                    <div class="channel-type-badge ${typeBadge}">${typeLabel}</div>
+                    <div class="channel-info">
+                        <div class="channel-name" id="channelName_${ch.id}">${escapeHtml(ch.name)}</div>
+                        <div class="channel-url">${escapeHtml(ch.url)}</div>
+                        <div class="channel-rename-form" id="${safeId}">
+                            <input type="text" id="renameInput_${ch.id}" value="${escapeHtml(ch.name)}"
+                                onkeydown="if(event.key==='Enter') saveRename(${ch.id});if(event.key==='Escape') cancelRename(${ch.id});"
+                                placeholder="Friendly name...">
+                            <button class="btn-rename-save" onclick="saveRename(${ch.id})">Save</button>
+                            <button class="btn-rename-cancel" onclick="cancelRename(${ch.id})">Cancel</button>
+                        </div>
+                    </div>
+                    <div class="channel-stats">
+                        <span>&#x1F3AC; ${ch.video_count || 0} videos</span>
+                        <span>&#x1F551; ${lastScraped}</span>
+                        ${ch.last_scrape_count != null ? `<span>+${ch.last_scrape_count} last</span>` : ''}
+                    </div>
+                    <div class="channel-actions">
+                        <button class="btn-icon btn-icon-edit" onclick="startRename(${ch.id})" title="Rename channel">&#x270F;</button>
+                        <button class="btn-icon btn-icon-warn" onclick="scrapeChannel(${ch.id}, '${escapeHtml(ch.name).replace(/'/g, "\\'")}')" title="Scrape this channel now">&#x1F504;</button>
+                        <button class="btn-icon btn-icon-warn" onclick="clearChannelVideos(${ch.id}, '${escapeHtml(ch.name).replace(/'/g, "\\'")}')" title="Clear all videos from this channel">&#x1F9F9;</button>
+                        <button class="toggle-switch ${ch.enabled ? 'active' : ''}" onclick="toggleChannel(${ch.id}, ${!ch.enabled})" title="${ch.enabled ? 'Disable' : 'Enable'} channel"></button>
+                        <button class="btn-icon btn-icon-danger" onclick="deleteChannel(${ch.id}, '${escapeHtml(ch.name).replace(/'/g, "\\'")}')" title="Delete channel and all its videos">&#x1F5D1;</button>
+                    </div>
+                </div>`;
+            }).join('');
+        }
+
+        function startRename(channelId) {
+            const form = document.getElementById(`rename_${channelId}`);
+            if (form) {
+                form.classList.add('active');
+                const input = document.getElementById(`renameInput_${channelId}`);
+                if (input) { input.focus(); input.select(); }
+            }
+        }
+
+        function cancelRename(channelId) {
+            const form = document.getElementById(`rename_${channelId}`);
+            if (form) form.classList.remove('active');
+        }
+
+        async function saveRename(channelId) {
+            const input = document.getElementById(`renameInput_${channelId}`);
+            if (!input) return;
+            const newName = input.value.trim();
+            if (!newName) { log('Name cannot be empty.', 'warn'); return; }
+            try {
+                const res = await fetch(`${API_BASE}/channel/${channelId}/rename`, {
+                    method: 'PATCH',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name: newName }),
+                });
+                if (!res.ok) { const err = await res.json(); throw new Error(err.detail || 'Rename failed'); }
+                const data = await res.json();
+                log(`Renamed: "${data.old_name}" → "${data.name}"`, 'success');
+                cancelRename(channelId);
+                // Update displayed name without full reload
+                const nameEl = document.getElementById(`channelName_${channelId}`);
+                if (nameEl) nameEl.textContent = data.name;
+                // Rebuild feed sidebar with updated name
+                await loadChannels();
+            } catch (e) { log(`Rename failed: ${e.message}`, 'error'); }
+        }
+
+        async function addChannel() {
+            const urlInput  = document.getElementById('channelUrlInput');
+            const nameInput = document.getElementById('channelNameInput');
+            const url  = urlInput.value.trim();
+            const name = nameInput.value.trim();
+            if (!url) { log('Enter a channel URL or subreddit name.', 'warn'); return; }
+            const btn = document.getElementById('btnAddChannel');
+            btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Adding...';
+            try {
+                const res = await fetch(`${API_BASE}/channel`, {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url, name: name || null }),
+                });
+                if (!res.ok) { const err = await res.json(); throw new Error(err.detail || 'Add failed'); }
+                const data = await res.json();
+                log(`Added channel: ${data.channel.name} (${data.channel.channel_type})`, 'success');
+                urlInput.value = '';
+                nameInput.value = '';
+                await loadChannels();
+            } catch (e) { log(`Failed to add channel: ${e.message}`, 'error'); }
+            finally { btn.disabled = false; btn.innerHTML = '&#x2795; Add Channel'; }
+        }
+
+        async function deleteChannel(channelId, name) {
+            if (!confirm(`Delete channel "${name}" and all its videos?\n\nThis cannot be undone.`)) return;
+            try {
+                const res = await fetch(`${API_BASE}/channel/${channelId}`, { method: 'DELETE' });
+                if (!res.ok) throw new Error('Delete failed');
+                log(`Deleted channel: ${name}`, 'success');
+                delete feedSidebarState[channelId];
+                await loadChannels();
+                await refreshFeed();
+            } catch (e) { log(`Failed to delete channel: ${e.message}`, 'error'); }
+        }
+
+        async function clearChannelVideos(channelId, name) {
+            if (!confirm(`Clear ALL videos from channel "${name}"?\n\nVideos will be re-discovered on the next scrape.\nThis cannot be undone.`)) return;
+            try {
+                const res = await fetch(`${API_BASE}/channel/${channelId}/videos`, { method: 'DELETE' });
+                if (!res.ok) throw new Error('Clear failed');
+                const data = await res.json();
+                log(`Cleared ${data.videos_removed} videos from channel: ${name}`, 'success');
+                await loadChannels();
+                await refreshFeed();
+            } catch (e) { log(`Failed to clear channel: ${e.message}`, 'error'); }
+        }
+
+        async function toggleChannel(channelId, enabled) {
+            try {
+                const res = await fetch(`${API_BASE}/channel/${channelId}`, {
+                    method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ enabled }),
+                });
+                if (!res.ok) throw new Error('Toggle failed');
+                const data = await res.json();
+                log(`Channel "${data.name}": ${data.status}`, 'success');
+                await loadChannels();
+                if (document.getElementById('tab-feed').classList.contains('active')) await refreshFeed();
+            } catch (e) { log(`Failed to toggle channel: ${e.message}`, 'error'); }
+        }
+
+        async function scrapeChannel(channelId, name) {
+            log(`Scraping channel: ${name}...`, 'info');
+            try {
+                const res = await fetch(`${API_BASE}/channel/${channelId}/scrape?limit=500`, { method: 'POST' });
+                if (!res.ok) { const err = await res.json(); throw new Error(err.detail || 'Scrape failed'); }
+                const data = await res.json();
+                const r = data.result;
+                log(`Scraped "${data.channel}": ${r.discovered} discovered, ${r.new} new, ${r.duplicates} dupes`, r.new > 0 ? 'success' : 'warn');
+                await loadChannels();
+            } catch (e) { log(`Scrape failed for ${name}: ${e.message}`, 'error'); }
+        }
+
+        // =====================================================================
+        //  SCRAPE / RESOLVE
+        // =====================================================================
+        async function triggerScrape() {
+            const btn = document.getElementById('btnScrape');
+            btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Scraping...';
+            log('Scraping all enabled channels...', 'info');
+            try {
+                const res = await fetch(`${API_BASE}/feed/scrape?limit=500`, { method: 'POST' });
+                const data = await res.json();
+                if (data.results && data.results.length > 0) {
+                    for (const r of data.results) {
+                        if (r.result.error) { log(`  ${r.channel}: ERROR — ${r.result.error}`, 'error'); }
+                        else { log(`  ${r.channel}: ${r.result.discovered} discovered, ${r.result.new} new, ${r.result.duplicates} dupes`, r.result.new > 0 ? 'success' : 'info'); }
+                    }
+                    log(`Scrape complete: ${data.channels_scraped} channels, ${data.total_new} new videos`, data.total_new > 0 ? 'success' : 'warn');
+                } else { log(data.message || 'No channels to scrape.', 'warn'); }
+                await loadChannels();
+                await refreshFeed();
+            } catch (e) { log(`Scrape failed: ${e.message}`, 'error'); }
+            finally { btn.disabled = false; btn.innerHTML = '&#x1F50D; Scrape All Channels'; }
+        }
+
+        // Flag that lets the user abort the current resolve batch gracefully
+        let _resolveAborted = false;
+
+        async function triggerBatchResolve() {
+            const btn = document.getElementById('btnResolve');
+            const stopBtn = document.getElementById('btnStopResolve');
+            btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Resolving...';
+            stopBtn.style.display = 'flex';
+            _resolveAborted = false;
+            const channelIds = _getFeedSidebarChannelIds();
+            const scopeMsg = channelIds !== null ? ` (${channelIds.split(',').length} channel(s) selected)` : ' (all channels)';
+            log(`Starting batch resolution (up to 500 videos)${scopeMsg}...`, 'info');
+            try {
+                let url = `${API_BASE}/resolve/batch?limit=500`;
+                if (channelIds !== null) url += `&channel_ids=${encodeURIComponent(channelIds)}`;
+                const res = await fetch(url, { method: 'POST' });
+                const data = await res.json();
+                const s = data.summary;
+                if (_resolveAborted) {
+                    log(`Resolve stopped by user. ${s.resolved} resolved before stop.`, 'warn');
+                } else {
+                    log(`Batch resolve: ${s.resolved} resolved, ${s.failed} failed, ${s.deleted} deleted out of ${s.total}${scopeMsg}`, s.resolved > 0 ? 'success' : 'warn');
+                }
+                await refreshFeed();
+            } catch (e) { log(`Batch resolve failed: ${e.message}`, 'error'); }
+            finally {
+                btn.disabled = false; btn.innerHTML = '&#x26A1; Resolve All';
+                stopBtn.style.display = 'none';
+                _resolveAborted = false;
+            }
+        }
+
+        function stopResolve() {
+            const stopBtn = document.getElementById('btnStopResolve');
+            stopBtn.innerHTML = '&#x23F9; Stopping...';
+            stopBtn.disabled = true;
+            log('Stop requested — resolve will stop after the current video finishes (up to 90s).', 'warn');
+            fetch(`${API_BASE}/resolve/stop`, { method: 'POST' })
+                .then(r => r.json())
+                .then(d => log(`Server: ${d.message}`, 'warn'))
+                .catch(e => log(`Stop request failed: ${e.message}`, 'error'));
+        }
+
+        async function resetFailed() {
+            const btn = document.getElementById('btnResetFailed');
+            btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Resetting...';
+            const channelIds = _getFeedSidebarChannelIds();
+            const scopeMsg = channelIds !== null ? ` (${channelIds.split(',').length} channel(s) selected)` : ' (all channels)';
+            log(`Resetting failed videos to pending${scopeMsg}...`, 'info');
+            try {
+                let url = `${API_BASE}/resolve/reset-failed`;
+                if (channelIds !== null) url += `?channel_ids=${encodeURIComponent(channelIds)}`;
+                const res = await fetch(url, { method: 'POST' });
+                if (!res.ok) throw new Error('Reset failed');
+                const data = await res.json();
+                log(`Reset ${data.reset_count} failed videos back to pending${scopeMsg}.`, 'success');
+                await refreshFeed();
+            } catch (e) { log(`Reset failed: ${e.message}`, 'error'); }
+            finally { btn.disabled = false; btn.innerHTML = '&#x1F504; Reset Failed'; }
+        }
+
+        async function purgeDead() {
+            if (!confirm('Permanently delete ALL failed videos from the database?\n\nThis cannot be undone.')) return;
+            const btn = document.getElementById('btnPurgeDead');
+            btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Purging...';
+            log('Purging all dead/failed videos...', 'warn');
+            try {
+                const res = await fetch(`${API_BASE}/resolve/purge-dead`, { method: 'POST' });
+                if (!res.ok) throw new Error('Purge failed');
+                const data = await res.json();
+                log(`Purged ${data.deleted_count} dead videos from database.`, 'success');
+                await refreshFeed();
+            } catch (e) { log(`Purge failed: ${e.message}`, 'error'); }
+            finally { btn.disabled = false; btn.innerHTML = '&#x1F9F9; Purge Dead'; }
+        }
+
+        async function purgeDash() {
+            if (!confirm('Remove all DASH-only videos from the feed?\n\nThese are Vimeo videos that cannot play in any browser. They will be re-discovered on the next scrape if Vimeo ever adds a progressive MP4 version.\n\nThis cannot be undone.')) return;
+            const btn = document.getElementById('btnPurgeDash');
+            btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Purging...';
+            log('Purging DASH-only videos...', 'warn');
+            try {
+                const res = await fetch(`${API_BASE}/resolve/purge-dash`, { method: 'POST' });
+                if (!res.ok) throw new Error('Purge DASH failed');
+                const data = await res.json();
+                log(`Purged ${data.deleted_count} DASH-only videos from feed.`, data.deleted_count > 0 ? 'success' : 'info');
+                await refreshFeed();
+            } catch (e) { log(`Purge DASH failed: ${e.message}`, 'error'); }
+            finally { btn.disabled = false; btn.innerHTML = '&#x26A0; Purge DASH'; }
+        }
+
+        async function purgeDuplicates() {
+            if (!confirm('Scan all resolved videos for duplicate CDN files?\n\nVideos sharing the same physical Vimeo CDN file will be de-duped — the highest-scored copy is kept and lower-scored duplicates are deleted.\n\nThis cannot be undone.')) return;
+            const btn = document.getElementById('btnPurgeDupes');
+            btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Scanning...';
+            log('Scanning for duplicate CDN files...', 'info');
+            try {
+                const res = await fetch(`${API_BASE}/resolve/purge-duplicates`, { method: 'POST' });
+                if (!res.ok) throw new Error('Purge duplicates failed');
+                const data = await res.json();
+                log(`Duplicate purge: ${data.duplicate_groups_found} groups found, ${data.deleted_count} deleted, ${data.kept_count} kept.`, data.deleted_count > 0 ? 'success' : 'info');
+                if (data.deleted_count > 0) await refreshFeed();
+            } catch (e) { log(`Purge duplicates failed: ${e.message}`, 'error'); }
+            finally { btn.disabled = false; btn.innerHTML = '&#x1F9F9; Purge Dupes'; }
+        }
+
+        async function clearBlocklist() {
+            const btn = document.getElementById('btnClearBlocklist');
+            let count = '?';
+            try {
+                const r = await fetch(`${API_BASE}/skip/count`);
+                if (r.ok) { const d = await r.json(); count = d.skip_list_count; }
+            } catch {}
+            if (count === 0) { log('Blocklist is already empty.', 'info'); return; }
+            if (!confirm(`Clear all ${count} blocked videos from the blocklist?\n\nBlocked videos will reappear on the next channel scrape.\nThis does NOT restore deleted files from disk.`)) return;
+            btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Clearing...';
+            log('Clearing blocklist...', 'warn');
+            try {
+                const res = await fetch(`${API_BASE}/skip/clear`, { method: 'POST' });
+                if (!res.ok) throw new Error('Clear failed');
+                const data = await res.json();
+                log(`Blocklist cleared: ${data.cleared_count} entries removed. Videos will return on next scrape.`, 'success');
+            } catch (e) { log(`Clear blocklist failed: ${e.message}`, 'error'); }
+            finally { btn.disabled = false; btn.innerHTML = '&#x1F513; Clear Blocklist'; }
+        }
+
+        async function triggerBackfillThumbnails() {
+            const btn = document.getElementById('btnBackfill');
+            btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Backfilling...';
+            log('Starting thumbnail backfill (up to 50 videos per run)...', 'info');
+            try {
+                const res = await fetch(`${API_BASE}/resolve/backfill-thumbnails?limit=50`, { method: 'POST' });
+                if (!res.ok) throw new Error(`Server error: ${res.status}`);
+                const data = await res.json();
+                const s = data.summary;
+                log(`Thumbnail backfill: ${s.filled} filled, ${s.skipped} skipped, ${s.failed} failed out of ${s.total} checked`, s.filled > 0 ? 'success' : 'info');
+                if (s.filled > 0) await loadFeed();
+            } catch (e) { log(`Backfill failed: ${e.message}`, 'error'); }
+            finally { btn.disabled = false; btn.innerHTML = '&#x1F5BC; Backfill Thumbs'; }
+        }
+
+        // =====================================================================
+        //  FEED — infinite scroll
+        // =====================================================================
+        const FEED_PAGE_SIZE = 100;
+        let feedTotal = 0;
+        let feedOffset = 0;
+        let feedLoaded = false;
+        let feedLoading = false;
+        let _scrollObserver = null;
+
+        function _initScrollObserver() {
+            if (_scrollObserver) _scrollObserver.disconnect();
+            const sentinel = document.getElementById('scrollSentinel');
+            if (!sentinel) return;
+            _scrollObserver = new IntersectionObserver((entries) => {
+                if (entries[0].isIntersecting && !feedLoading && feedOffset < feedTotal) {
+                    loadMoreFeed();
+                }
+            }, { rootMargin: '300px' });
+            _scrollObserver.observe(sentinel);
+        }
+
+        function _buildFeedUrl(offset, limit) {
+            const channelIds = _getFeedSidebarChannelIds();
+            let url = `${API_BASE}/feed?limit=${limit}&offset=${offset}`;
+            if (channelIds !== null) url += `&channel_ids=${encodeURIComponent(channelIds)}`;
+            return url;
+        }
+
+        async function loadFeed(force = false) {
+            if (feedLoaded && !force) { renderGrid(currentVideos); return; }
+            feedLoading = true;
+            feedOffset = 0; currentVideos = []; feedLoaded = false;
+            try {
+                const res = await fetch(_buildFeedUrl(0, FEED_PAGE_SIZE));
+                if (!res.ok) throw new Error(`Server returned ${res.status}`);
+                const data = await res.json();
+                const videos = Array.isArray(data.videos) ? data.videos : [];
+                currentVideos = videos;
+                feedTotal = data.total || 0;
+                feedOffset = videos.length;
+                feedLoaded = true;
+                document.getElementById('videoCount').textContent = `${feedTotal.toLocaleString()} videos`;
+                updateGlobalCount(feedTotal);
+                renderGrid(currentVideos);
+                log(`Feed loaded: ${feedOffset} shown of ${feedTotal} total`, 'success');
+                if (window._updateScrollBtn) window._updateScrollBtn();
+                _initScrollObserver();
+            } catch (e) { log(`Failed to load feed: ${e.message}`, 'error'); }
+            finally { feedLoading = false; }
+        }
+
+        async function loadMoreFeed() {
+            if (feedLoading || feedOffset >= feedTotal) return;
+            feedLoading = true;
+            try {
+                const res = await fetch(_buildFeedUrl(feedOffset, FEED_PAGE_SIZE));
+                if (!res.ok) throw new Error(`Server returned ${res.status}`);
+                const data = await res.json();
+                const newVideos = Array.isArray(data.videos) ? data.videos : [];
+                if (!newVideos.length) { feedLoading = false; return; }
+                currentVideos = currentVideos.concat(newVideos);
+                feedOffset += newVideos.length;
+                feedTotal = data.total || feedTotal;
+                appendToGrid(newVideos, currentVideos.length - newVideos.length);
+                document.getElementById('videoCount').textContent = `${feedOffset.toLocaleString()} / ${feedTotal.toLocaleString()} videos`;
+                if (window._updateScrollBtn) window._updateScrollBtn();
+            } catch (e) { log(`Load more failed: ${e.message}`, 'error'); }
+            finally { feedLoading = false; }
+        }
+
+        async function refreshFeed() {
+            feedLoaded = false;
+            await loadFeed(true);
+        }
+
+        // =====================================================================
+        //  FAVORITES / LIBRARY
+        // =====================================================================
+        let favoritedVideoIds = new Set();
+
+        async function loadFavorites() {
+            try {
+                const res = await fetch(`${API_BASE}/favorite`);
+                const data = await res.json();
+                currentFavorites = data.favorites;
+                favoritedVideoIds = new Set(data.favorites.map(f => f.video_id));
+                document.getElementById('favCount').textContent = `${data.favorites.length} favorites`;
+                buildFavSidebar(currentFavorites);
+                renderFavorites(currentFavorites);
+                if (currentVideos.length > 0) renderGrid(currentVideos);
+            } catch (e) { log(`Failed to load favorites: ${e.message}`, 'error'); }
+        }
+
+        async function generateLibraryThumbnails() {
+            const btn = document.getElementById('btnGenThumbs');
+            btn.disabled = true;
+            let totalGenerated = 0;
+            let round = 1;
+            log('Generating thumbnails for local files (auto-looping until complete)...', 'info');
+            try {
+                while (true) {
+                    btn.innerHTML = `<span class="spinner"></span> Generating... (round ${round})`;
+                    const res = await fetch(`${API_BASE}/library/generate-thumbnails?limit=20`, { method: 'POST' });
+                    if (!res.ok) throw new Error(`Server error: ${res.status}`);
+                    const data = await res.json();
+                    const s = data.summary;
+                    totalGenerated += s.generated;
+                    log(`Round ${round}: ${s.generated} generated, ${s.failed} failed out of ${s.total} checked`, s.generated > 0 ? 'success' : 'info');
+                    if (s.generated === 0) break;
+                    round++;
+                    await new Promise(r => setTimeout(r, 500));
+                }
+                log(`Thumbnail generation complete: ${totalGenerated} total generated in ${round} round${round > 1 ? 's' : ''}.`, totalGenerated > 0 ? 'success' : 'info');
+                if (totalGenerated > 0) await loadLibrary();
+            } catch (e) { log(`Thumbnail generation failed: ${e.message}`, 'error'); }
+            finally { btn.disabled = false; btn.innerHTML = '&#x1F3A8; Generate Thumbs'; }
+        }
+
+        async function loadLibrary() {
+            const countEl = document.getElementById('libCount');
+            countEl.textContent = 'Scanning...';
+            try {
+                const res = await fetch(`${API_BASE}/library`);
+                const data = await res.json();
+                currentLibrary = data.files;
+                countEl.textContent = `${data.total} files`;
+                buildLibSidebar(currentLibrary);
+                renderLibrary(currentLibrary, data.directory);
+                log(`Library scanned: ${data.total} files in ${data.directory}`, 'success');
+                if (window._updateScrollBtn) window._updateScrollBtn();
+            } catch (e) {
+                log(`Failed to scan library: ${e.message}`, 'error');
+                countEl.textContent = 'Error';
+            }
+        }
+
+        // =====================================================================
+        //  RENDER
+        // =====================================================================
+        function getProviderBadge(provider) {
+            const map = {
+                'reddit':   { cls: 'badge-reddit',  label: 'Reddit'   },
+                'vimeo':    { cls: 'badge-vimeo',   label: 'Vimeo'    },
+                'youtube':  { cls: 'badge-failed',  label: 'YouTube'  },
+                'playlist': { cls: 'badge-pending', label: 'YouTube'  },
+            };
+            return map[provider] || { cls: 'badge-pending', label: provider };
+        }
+
+        function _videoCardHtml(v, index) {
+            const statusCls = v.resolution_status === 'resolved' ? 'badge-resolved'
+                : v.resolution_status === 'failed' ? 'badge-failed' : 'badge-pending';
+            const provBadge = getProviderBadge(v.source_provider);
+            const isFav = favoritedVideoIds.has(v.id);
+            return `
+            <div class="video-card" data-id="${v.id}" style="animation-delay:${Math.min(index, 20) * 0.04}s">
+                <div class="card-thumb">
+                    ${v.thumbnail_url
+                        ? `<img src="${v.thumbnail_url}" alt="${escapeHtml(v.title)}" loading="lazy" onerror="this.parentElement.innerHTML='<div class=card-thumb-placeholder>&#x1F3B5;</div>'">`
+                        : '<div class="card-thumb-placeholder">&#x1F3B5;</div>'}
+                    <div class="card-provider-badge ${provBadge.cls}">${provBadge.label}</div>
+                    <div class="card-status-badge ${statusCls}">${v.resolution_status}</div>
+                </div>
+                <div class="card-body">
+                    <div class="card-title">${escapeHtml(decodeHtml(v.title))}</div>
+                    ${v.artist ? `<div class="card-artist">${escapeHtml(decodeHtml(v.artist))}</div>` : ''}
+                    <div class="card-meta">
+                        <span>&#x2665; ${v.reddit_score != null ? v.reddit_score.toLocaleString() : 0}</span>
+                        <span>${v.source_provider}</span>
+                    </div>
+                </div>
+                <div class="card-actions">
+                    <button class="card-btn card-btn-play" onclick="playVideo(${v.id})">&#x25B6; Play</button>
+                    ${(v.resolution_status === 'pending' || v.resolution_status === 'failed')
+                        ? `<button class="card-btn card-btn-resolve" id="resolveBtn_${v.id}" onclick="resolveCard(${v.id})">&#x26A1; Resolve</button>`
+                        : (isFav
+                            ? '<button class="card-btn card-btn-fav" style="color:var(--accent-green);border-color:var(--accent-green)" disabled>&#x2B50; Saved</button>'
+                            : `<button class="card-btn card-btn-fav" onclick="favoriteVideo(${v.id})">&#x2B50; Fav</button>`)
+                    }
+                    ${(v.resolution_status === 'pending' || v.resolution_status === 'failed') && !isFav
+                        ? `<button class="card-btn card-btn-fav" onclick="favoriteVideo(${v.id})">&#x2B50; Fav</button>`
+                        : ''}
+                    <button class="card-btn card-btn-skip" onclick="skipVideo(${v.id})">&#x2715; Skip</button>
+                </div>
+            </div>`;
+        }
+
+        function renderGrid(videos) {
+            const grid = document.getElementById('videoGrid');
+            if (!videos || videos.length === 0) {
+                grid.innerHTML = `<div class="empty-state">
+                    <div class="empty-state-icon">&#x1F3AC;</div>
+                    <h3>No videos</h3>
+                    <p>Try selecting more channels in the sidebar, or scrape new content.</p>
+                </div>`;
+                return;
+            }
+            grid.innerHTML = videos.map((v, i) => _videoCardHtml(v, i)).join('');
+        }
+
+        function appendToGrid(newVideos, startIndex) {
+            const grid = document.getElementById('videoGrid');
+            const empty = grid.querySelector('.empty-state');
+            if (empty) empty.remove();
+            newVideos.forEach((v, i) => {
+                grid.insertAdjacentHTML('beforeend', _videoCardHtml(v, startIndex + i));
+            });
+        }
+
+        function renderFavorites(favorites) {
+            // Apply sidebar filter
+            const visible = _getFavVisibleItems();
+            const grid = document.getElementById('favoritesGrid');
+            if (!visible || visible.length === 0) {
+                const emptyMsg = favorites.length > 0
+                    ? 'No favorites match the current filter. Try checking more channels in the sidebar.'
+                    : 'Click the star on a video to save it to your Music Videos directory.';
+                grid.innerHTML = `<div class="empty-state"><div class="empty-state-icon">&#x2B50;</div><h3>${favorites.length > 0 ? 'No matches' : 'No favorites yet'}</h3><p>${emptyMsg}</p></div>`;
+                return;
+            }
+            grid.innerHTML = visible.map((f, i) => {
+                const statusBadge = f.download_status === 'complete' ? 'complete'
+                    : f.download_status === 'failed' ? 'failed'
+                    : f.download_status === 'downloading' ? 'downloading' : 'pending';
+                const errorHtml = (f.download_status === 'failed' && f.download_error)
+                    ? `<div class="card-error" title="${escapeHtml(f.download_error)}">${escapeHtml(f.download_error.substring(0, 120))}</div>` : '';
+                const showRetry = (f.download_status === 'failed' || f.download_status === 'pending');
+                const channelLabel = f.channel_name ? `<div class="card-subfolder">&#x1F4C1; ${escapeHtml(f.channel_name)}</div>` : '';
+                return `
+                <div class="video-card" data-id="${f.video_id}" style="animation-delay:${i * 0.04}s">
+                    <div class="card-thumb">
+                        ${f.thumbnail_url ? `<img src="${f.thumbnail_url}" alt="${escapeHtml(f.title)}" loading="lazy" onerror="this.parentElement.innerHTML='<div class=card-thumb-placeholder>&#x1F3B5;</div>'">`
+                            : '<div class="card-thumb-placeholder">&#x1F3B5;</div>'}
+                        <div class="card-status-badge badge-${statusBadge}">${f.download_status}</div>
+                    </div>
+                    <div class="card-body">
+                        <div class="card-title">${escapeHtml(decodeHtml(f.title))}</div>
+                        ${f.artist ? `<div class="card-artist">${escapeHtml(decodeHtml(f.artist))}</div>` : ''}
+                        ${channelLabel}
+                        <div class="card-meta">
+                            ${f.download_status === 'complete' ? '<span>&#x1F4BE; Saved</span>' : `<span>${f.download_status}</span>`}
+                            ${f.downloaded_at ? `<span>${new Date(f.downloaded_at).toLocaleDateString()}</span>` : ''}
+                        </div>
+                        ${errorHtml}
+                    </div>
+                    <div class="card-actions">
+                        <button class="card-btn card-btn-play" onclick="${f.stream_url ? `playLocalFile('${escapeHtml(f.stream_url)}', '${escapeHtml(f.title).replace(/'/g, "\\'")}')` : `playVideo(${f.video_id})`}">&#x25B6; Play</button>
+                        ${showRetry ? `<button class="card-btn card-btn-retry" onclick="retryDownload(${f.id})">&#x1F504; Retry</button>` : ''}
+                        <button class="card-btn card-btn-remove" onclick="removeFavorite(${f.id}, '${escapeHtml(f.title).replace(/'/g, "\\'")}')" >&#x1F5D1; Remove</button>
+                    </div>
+                </div>`;
+            }).join('');
+        }
+
+        function renderLibrary(files, directory) {
+            // Apply sidebar filter
+            const visible = _getLibVisibleItems();
+            const grid = document.getElementById('libraryGrid');
+            if (!visible || visible.length === 0) {
+                const emptyMsg = files && files.length > 0
+                    ? 'No files match the current folder filter. Try checking more folders in the sidebar.'
+                    : `No .mp4, .mkv, or .webm files found.${directory ? '<br><code style="font-family:monospace;font-size:12px;color:var(--accent-orange)">' + escapeHtml(directory) + '</code>' : ''}`;
+                grid.innerHTML = `<div class="empty-state"><div class="empty-state-icon">&#x1F4C2;</div><h3>${files && files.length > 0 ? 'No matches' : 'No video files found'}</h3><p>${emptyMsg}</p></div>`;
+                return;
+            }
+            grid.innerHTML = visible.map((f, i) => {
+                const isKnown = !!f.favorite_id;
+                const folderBadge = f.subfolder ? `<div class="card-subfolder">&#x1F4C1; ${escapeHtml(f.subfolder)}</div>` : '';
+                return `
+                <div class="video-card library-card" data-id="${escapeHtml(f.filename)}"
+                     data-stream="${escapeHtml(f.stream_url)}"
+                     data-path="${escapeHtml(f.relative_path || f.filename)}"
+                     data-title="${escapeHtml(f.title)}"
+                     style="animation-delay:${Math.min(i, 20) * 0.04}s">
+                    <div class="card-thumb">
+                        ${f.thumbnail_url ? `<img src="${f.thumbnail_url}" alt="${escapeHtml(f.title)}" loading="lazy" onerror="this.parentElement.innerHTML='<div class=card-thumb-placeholder>&#x1F4BE;</div>'">` : '<div class="card-thumb-placeholder">&#x1F4BE;</div>'}
+                        <div class="card-provider-badge badge-local">LOCAL</div>
+                        ${isKnown ? '<div class="card-status-badge badge-complete">saved</div>' : ''}
+                    </div>
+                    <div class="card-body">
+                        <div class="card-title">${escapeHtml(decodeHtml(f.title))}</div>
+                        ${f.artist ? `<div class="card-artist">${escapeHtml(decodeHtml(f.artist))}</div>` : ''}
+                        ${folderBadge}
+                        <div class="card-meta">
+                            <span>&#x1F4BE; ${f.size_human}</span>
+                            <span>${new Date(f.modified_at * 1000).toLocaleDateString()}</span>
+                        </div>
+                    </div>
+                    <div class="card-actions">
+                        <button class="card-btn card-btn-play" onclick="libPlay(this)">&#x25B6; Play</button>
+                        <button class="card-btn card-btn-remove" onclick="libDelete(this)">&#x1F5D1; Delete</button>
+                    </div>
+                </div>`;
+            }).join('');
+        }
+
+        function libPlay(btn) {
+            const card = btn.closest('.video-card');
+            playLocalFile(card.dataset.stream, card.dataset.title);
+        }
+
+        async function libDelete(btn) {
+            const card = btn.closest('.video-card');
+            const relativePath = card.dataset.path;
+            const title = card.dataset.title || relativePath;
+            if (!confirm('Delete "' + title + '" from NAS?\n\nThis will permanently delete the file and block it from future scrapes.\n\nUse Clear Blocklist to allow it back.')) return;
+            try {
+                const res = await fetch(`${API_BASE}/library/file?relative_path=${encodeURIComponent(relativePath)}`, { method: 'DELETE' });
+                if (!res.ok) { const err = await res.json(); throw new Error(err.detail || 'Delete failed'); }
+                const data = await res.json();
+                const skipNote = data.skip_added ? ' + blocked from future scrapes' : '';
+                log(`Deleted: ${title}${skipNote}`, 'success');
+                card.remove();
+                // Remove from currentLibrary so filter state stays consistent
+                currentLibrary = currentLibrary.filter(f => f.relative_path !== relativePath);
+            } catch (e) { log(`Delete failed: ${e.message}`, 'error'); }
+        }
+
+        // =====================================================================
+        //  PLAYER
+        // =====================================================================
+        function _openPlayer(title) {
+            const container = document.getElementById('playerContainer');
+            const titleEl = document.getElementById('playerTitle');
+            container.innerHTML = '<div class="spinner" style="width:40px;height:40px;border-width:4px;"></div>';
+            titleEl.textContent = title || 'Loading...';
+            document.getElementById('playerModal').classList.add('active');
+            updateQueueUI();
+        }
+
+        function _attachVideo(container, streamUrl, mediaType = 'video/mp4') {
+            const videoEl = document.createElement('video');
+            videoEl.controls = true;
+            videoEl.autoplay = true;
+            videoEl.style.width = '100%';
+            videoEl.style.height = '100%';
+            videoEl.addEventListener('ended', () => { if (playQueue.length > 0) playNext(); });
+            container.innerHTML = '';
+            container.appendChild(videoEl);
+
+            const isHLS  = streamUrl.includes('.m3u8') || streamUrl.includes('m3u8');
+            const isDASH = streamUrl.includes('.mpd')  || streamUrl.includes('playlist.mpd') || streamUrl.includes('/playlist/av/primary');
+
+            if (isDASH) {
+                log(`DASH stream detected — browser cannot play .mpd. Try Resolve All to get a fresh MP4.`, 'error');
+                container.innerHTML = `<div class="modal-error">&#x26A0; This video resolved to a DASH stream which browsers cannot play natively.<br><br>Click <strong>Resolve All</strong> or close and try another video.</div>`;
+                if (playQueue.length > 0) setTimeout(() => playNext(), 3000);
+                return;
+            }
+
+            const isYouTubeCDN = streamUrl.includes('googlevideo.com');
+
+            if (isYouTubeCDN) {
+                const proxiedUrl = `${API_BASE}/proxy/stream?url=${encodeURIComponent(streamUrl)}`;
+                log(`YouTube CDN URL — routing through proxy`, 'info');
+                const source = document.createElement('source');
+                source.src = proxiedUrl;
+                source.type = 'video/mp4';
+                videoEl.appendChild(source);
+                videoEl.addEventListener('error', () => {
+                    log(`YouTube proxy stream failed — forcing re-resolve`, 'warn');
+                    if (container._watchdawgVideoId) {
+                        fetch(`${API_BASE}/resolve/${container._watchdawgVideoId}?force=true`)
+                            .then(r => r.ok ? r.json() : Promise.reject('Re-resolve failed'))
+                            .then(data => {
+                                const newProxied = `${API_BASE}/proxy/stream?url=${encodeURIComponent(data.stream_url)}`;
+                                source.src = newProxied;
+                                videoEl.load(); videoEl.play().catch(() => {});
+                                log(`Re-resolved YouTube video — retrying`, 'success');
+                            })
+                            .catch(e => {
+                                container.innerHTML = `<div class="modal-error">&#x26A0; YouTube stream failed and could not be re-resolved.<br><small>${escapeHtml(String(e))}</small></div>`;
+                                if (playQueue.length > 0) setTimeout(() => playNext(), 3000);
+                            });
+                    }
+                });
+                videoEl.load(); videoEl.play().catch(() => {});
+            } else if (isHLS && typeof Hls !== 'undefined' && Hls.isSupported()) {
+                const proxiedUrl = `${API_BASE}/proxy/stream?url=${encodeURIComponent(streamUrl)}`;
+                log(`HLS stream — routing through proxy`, 'info');
+                const hls = new Hls({ enableWorker: false });
+                hls.loadSource(proxiedUrl);
+                hls.attachMedia(videoEl);
+                hls.on(Hls.Events.MANIFEST_PARSED, () => videoEl.play().catch(() => {}));
+                hls.on(Hls.Events.ERROR, (event, data) => {
+                    if (data.fatal) {
+                        log(`HLS fatal error: ${data.details} (type=${data.type})`, 'error');
+                        container.innerHTML = `<div class="modal-error">&#x26A0; HLS playback failed: ${escapeHtml(data.details)}<br><small>Check the 🐛 Debug Console → Proxy tab for details.</small></div>`;
+                        if (playQueue.length > 0) setTimeout(() => playNext(), 2000);
+                    } else { log(`HLS non-fatal: ${data.details}`, 'warn'); }
+                });
+            } else {
+                log(`Direct MP4 — playing without proxy`, 'info');
+                const source = document.createElement('source');
+                source.src = streamUrl;
+                source.type = mediaType;
+                videoEl.appendChild(source);
+                videoEl.addEventListener('error', async () => {
+                    const err = videoEl.error;
+                    const code = err ? err.code : 0;
+                    if (code === 2 || code === 4 || code === 0) {
+                        log(`MP4 load failed (MediaError code=${code}) — forcing re-resolve`, 'warn');
+                        if (container._watchdawgVideoId) {
+                            const vid = container._watchdawgVideoId;
+                            try {
+                                const res = await fetch(`${API_BASE}/resolve/${vid}?force=true`);
+                                if (!res.ok) throw new Error('Re-resolve failed');
+                                const data = await res.json();
+                                log(`Re-resolved video ${vid} — retrying playback`, 'success');
+                                source.src = data.stream_url; videoEl.load(); videoEl.play().catch(() => {});
+                            } catch (e) {
+                                log(`Re-resolve failed for video ${vid}: ${e.message}`, 'error');
+                                container.innerHTML = `<div class="modal-error">&#x26A0; Video failed to load and could not be re-resolved.<br><br>The CDN token may have expired. Try closing and clicking Play again.</div>`;
+                                if (playQueue.length > 0) setTimeout(() => playNext(), 3000);
+                            }
+                        } else {
+                            container.innerHTML = `<div class="modal-error">&#x26A0; Video failed to load (error code ${code}).<br><br>The CDN link may have expired. Click Play again to get a fresh URL.</div>`;
+                            if (playQueue.length > 0) setTimeout(() => playNext(), 3000);
+                        }
+                    }
+                });
+                videoEl.load(); videoEl.play().catch(() => {});
+            }
+        }
+
+        async function playVideo(videoId, fromQueue = false) {
+            log(`Resolving video ${videoId}...`, 'info');
+            _openPlayer('Resolving...');
+            const container = document.getElementById('playerContainer');
+            const titleEl = document.getElementById('playerTitle');
+            try {
+                const res = await fetch(`${API_BASE}/resolve/${videoId}`);
+                if (!res.ok) {
+                    const err = await res.json();
+                    if (res.status === 404) {
+                        currentVideos = currentVideos.filter(v => v.id !== videoId);
+                        playQueue = playQueue.filter(item => item.id !== videoId);
+                        feedTotal = Math.max(0, feedTotal - 1);
+                        renderGrid(currentVideos);
+                        document.getElementById('videoCount').textContent = `${feedTotal.toLocaleString()} videos`;
+                        updateGlobalCount(feedTotal);
+                    }
+                    throw new Error(err.detail || 'Resolution failed');
+                }
+                const data = await res.json();
+                titleEl.textContent = data.title || 'Now Playing';
+                const streamUrl = data.stream_url;
+                const isHLS  = streamUrl && (streamUrl.includes('.m3u8') || streamUrl.includes('m3u8'));
+                const isDASH = streamUrl && (streamUrl.includes('.mpd')  || streamUrl.includes('playlist.mpd'));
+                const urlType = isDASH ? 'DASH' : isHLS ? 'HLS' : 'MP4';
+                log(`Playing: ${data.title} [${data.format}] (${urlType})`, isDASH ? 'warn' : 'success');
+                _debugLogStream(videoId, streamUrl, data.format);
+                container._watchdawgVideoId = videoId;
+                _attachVideo(container, streamUrl);
+                if (!fromQueue) loadFeed();
+            } catch (e) {
+                titleEl.textContent = 'Unavailable';
+                container.innerHTML = `<div class="modal-error">&#x26A0; ${escapeHtml(e.message)}<br><br>The video may be unavailable, age-restricted, or geo-blocked.</div>`;
+                log(`Playback failed for video ${videoId}: ${e.message}`, 'error');
+                if (playQueue.length > 0) setTimeout(() => playNext(), 2000);
+            }
+        }
+
+        async function playLocalFile(streamUrl, title, fromQueue = false) {
+            log(`Playing local file: ${title}`, 'info');
+            _openPlayer(title);
+            const container = document.getElementById('playerContainer');
+            document.getElementById('playerTitle').textContent = title || 'Now Playing';
+            const ext = streamUrl.split('.').pop().toLowerCase().split('?')[0];
+            const typeMap = { mp4: 'video/mp4', mkv: 'video/x-matroska', webm: 'video/webm', m4v: 'video/mp4' };
+            const mediaType = typeMap[ext] || 'video/mp4';
+            _attachVideo(container, API_BASE + streamUrl, mediaType);
+            log(`Streaming local: ${title}`, 'success');
+        }
+
+        function closePlayer() {
+            document.getElementById('playerModal').classList.remove('active');
+            const container = document.getElementById('playerContainer');
+            const video = container.querySelector('video');
+            if (video) video.pause();
+            container.innerHTML = '';
+            playQueue = []; queueIndex = -1; updateQueueUI();
+            document.querySelectorAll('.video-card.now-playing').forEach(el => el.classList.remove('now-playing'));
+        }
+
+        function toggleFullscreen() {
+            const modal = document.getElementById('playerModal');
+            if (!document.fullscreenElement) {
+                modal.requestFullscreen().catch(() => {});
+            } else {
+                document.exitFullscreen().catch(() => {});
+            }
+        }
+
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') { closePlayer(); return; }
+            if (e.key === 'ArrowRight' && document.getElementById('playerModal').classList.contains('active') && playQueue.length > 0) { playNext(); return; }
+            if ((e.key === 'f' || e.key === 'F') && document.getElementById('playerModal').classList.contains('active')) { toggleFullscreen(); return; }
+        });
+
+        // =====================================================================
+        //  PER-CARD RESOLVE
+        // =====================================================================
+        async function resolveCard(videoId) {
+            const btn = document.getElementById(`resolveBtn_${videoId}`);
+            if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>'; }
+            log(`Resolving video ${videoId}...`, 'info');
+            try {
+                const res = await fetch(`${API_BASE}/resolve/${videoId}?force=true`);
+                if (!res.ok) {
+                    const err = await res.json();
+                    throw new Error(err.detail || 'Resolve failed');
+                }
+                const data = await res.json();
+                log(`Resolved: ${data.title} [${data.format}]`, 'success');
+                // Update the card in currentVideos so the status badge refreshes
+                const idx = currentVideos.findIndex(v => v.id === videoId);
+                if (idx !== -1) {
+                    currentVideos[idx] = {
+                        ...currentVideos[idx],
+                        resolution_status: 'resolved',
+                        resolved_stream_url: data.stream_url,
+                    };
+                }
+                // Re-render just this card by refreshing the whole grid (fast enough)
+                renderGrid(currentVideos);
+            } catch (e) {
+                log(`Resolve failed for video ${videoId}: ${e.message}`, 'error');
+                if (btn) { btn.disabled = false; btn.innerHTML = '&#x26A1; Resolve'; }
+            }
+        }
+
+        // =====================================================================
+        //  SKIP / FAVORITE
+        // =====================================================================
+        async function skipVideo(videoId) {
+            try {
+                const res = await fetch(`${API_BASE}/skip/${videoId}`, { method: 'POST' });
+                if (!res.ok) throw new Error('Skip failed');
+                currentVideos = currentVideos.filter(v => v.id !== videoId);
+                feedTotal = Math.max(0, feedTotal - 1);
+                const card = document.querySelector(`.video-card[data-id="${videoId}"]`);
+                if (card) card.remove();
+                document.getElementById('videoCount').textContent = `${feedOffset.toLocaleString()} / ${feedTotal.toLocaleString()} videos`;
+                updateGlobalCount(feedTotal);
+            } catch (e) { log(`Skip failed: ${e.message}`, 'error'); }
+        }
+
+        async function favoriteVideo(videoId) {
+            try {
+                const res = await fetch(`${API_BASE}/favorite/${videoId}`, { method: 'POST' });
+                if (!res.ok) throw new Error('Favorite failed');
+                const data = await res.json();
+                log(`Queued download: ${data.title}`, 'success');
+                favoritedVideoIds.add(videoId);
+                const btn = document.querySelector(`.video-card[data-id="${videoId}"] .card-btn-fav`);
+                if (btn) { btn.textContent = '⭐ Saved'; btn.style.color = 'var(--accent-green)'; btn.style.borderColor = 'var(--accent-green)'; btn.disabled = true; }
+            } catch (e) { log(`Favorite failed: ${e.message}`, 'error'); }
+        }
+
+        async function retryDownload(favoriteId) {
+            try {
+                const res = await fetch(`${API_BASE}/favorite/${favoriteId}/retry`, { method: 'POST' });
+                if (!res.ok) throw new Error('Retry failed');
+                log(`Retry queued for favorite ${favoriteId}`, 'success');
+                await loadFavorites();
+            } catch (e) { log(`Retry failed: ${e.message}`, 'error'); }
+        }
+
+        async function removeFavorite(favoriteId, title) {
+            if (!confirm(`Remove "${title}" from favorites?\n\nThis will delete the downloaded file from your NAS.`)) return;
+            try {
+                const res = await fetch(`${API_BASE}/favorite/${favoriteId}`, { method: 'DELETE' });
+                if (!res.ok) throw new Error('Remove failed');
+                log(`Removed favorite: ${title}`, 'success');
+                await loadFavorites();
+            } catch (e) { log(`Remove failed: ${e.message}`, 'error'); }
+        }
+
+        // =====================================================================
+        //  HELPERS
+        // =====================================================================
+        function escapeHtml(str) {
+            if (!str) return '';
+            return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+        }
+
+        function decodeHtml(str) {
+            if (!str) return '';
+            const txt = document.createElement('textarea');
+            txt.innerHTML = str;
+            return txt.value;
+        }
+
+        // =====================================================================
+        //  DEBUG CONSOLE
+        // =====================================================================
+        let _debugAllEntries = [];
+        let _debugTab = 'all';
+        let _debugPollTimer = null;
+        let _debugPolling = true;
+
+        function toggleDebugConsole() {
+            const panel = document.getElementById('debugConsole');
+            const btn = document.getElementById('debugToggleBtn');
+            panel.classList.toggle('open');
+            if (panel.classList.contains('open')) {
+                btn.style.bottom = '516px';
+                debugPollNow();
+                if (_debugPolling) _startDebugPoll();
+            } else {
+                btn.style.bottom = '20px';
+                _stopDebugPoll();
+            }
+        }
+
+        function switchDebugTab(tab, el) {
+            _debugTab = tab;
+            document.querySelectorAll('.dbg-tab').forEach(t => t.classList.remove('active'));
+            el.classList.add('active');
+            _renderDebugEntries();
+        }
+
+        function toggleDebugPolling() {
+            _debugPolling = !_debugPolling;
+            document.getElementById('dbgPollToggle').textContent = _debugPolling ? 'Pause' : 'Resume';
+            if (_debugPolling) { _startDebugPoll(); debugPollNow(); }
+            else _stopDebugPoll();
+        }
+
+        function _startDebugPoll() { _stopDebugPoll(); _debugPollTimer = setInterval(debugPollNow, 3000); }
+        function _stopDebugPoll()  { if (_debugPollTimer) { clearInterval(_debugPollTimer); _debugPollTimer = null; } }
+
+        async function debugPollNow() {
+            try {
+                const res = await fetch(`${API_BASE}/debug/logs?n=500`);
+                if (!res.ok) { document.getElementById('dbgStatus').textContent = `Server log fetch failed: ${res.status}`; return; }
+                const data = await res.json();
+                const serverEntries = (data.logs || []).map(e => ({ ...e, _src: 'server' }));
+                const clientEntries = _debugAllEntries.filter(e => e._src === 'client');
+                _debugAllEntries = [...serverEntries, ...clientEntries].sort((a, b) => (a.ts || '').localeCompare(b.ts || ''));
+                _renderDebugEntries();
+                document.getElementById('dbgCount').textContent = `${_debugAllEntries.length} entries`;
+                document.getElementById('dbgLastFetch').textContent = `Updated ${new Date().toLocaleTimeString()}`;
+                document.getElementById('dbgStatus').textContent = 'Polling server logs every 3s...';
+            } catch (e) { document.getElementById('dbgStatus').textContent = `Poll error: ${e.message}`; }
+        }
+
+        function _renderDebugEntries() {
+            const body = document.getElementById('debugBody');
+            let entries = _debugAllEntries;
+            if (_debugTab === 'proxy')  entries = entries.filter(e => e.msg && e.msg.includes('PROXY'));
+            else if (_debugTab === 'stream') entries = entries.filter(e => e.msg && (e.msg.includes('STREAM') || e.msg.includes('Resolv') || e.msg.includes('stream_url') || e.msg.includes('format') || e.msg.includes('PROXY HIT') || e.msg.includes('PROXY UPSTREAM')));
+            else if (_debugTab === 'errors') entries = entries.filter(e => e.level === 'ERROR' || e.level === 'WARNING');
+            const wasAtBottom = body.scrollHeight - body.clientHeight <= body.scrollTop + 5;
+            body.innerHTML = entries.map(e => {
+                let cls = `dbg-${e.level || 'INFO'}`;
+                if (e.msg && e.msg.includes('PROXY')) cls = 'dbg-proxy';
+                if (e.msg && (e.msg.includes('STREAM') || e.msg.includes('Resolv'))) cls = 'dbg-stream';
+                return `<div class="dbg-entry ${cls}">[${e.ts || ''}] ${escapeHtml(e.msg || '')}</div>`;
+            }).join('');
+            if (wasAtBottom) body.scrollTop = body.scrollHeight;
+        }
+
+        function debugClear() { _debugAllEntries = []; _renderDebugEntries(); document.getElementById('dbgCount').textContent = '0 entries'; }
+
+        function downloadDebugLog() {
+            const lines = _debugAllEntries.map(e => `[${e.ts || ''}] [${e.level || 'INFO'}] [${e.name || 'client'}] ${e.msg || ''}`);
+            const header = [`WatchDawg Debug Log`, `Downloaded: ${new Date().toISOString()}`, `Total entries: ${lines.length}`, `${'='.repeat(80)}`, ''];
+            const blob = new Blob([header.concat(lines).join('\n')], { type: 'text/plain' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url; a.download = `watchdawg-debug-${new Date().toISOString().replace(/[:.]/g, '-')}.txt`;
+            document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
+        }
+
+        function _debugLogStream(videoId, streamUrl, format) {
+            if (!streamUrl) return;
+            const isHLS  = streamUrl.includes('.m3u8') || streamUrl.includes('m3u8');
+            const isDASH = streamUrl.includes('.mpd')  || streamUrl.includes('playlist.mpd');
+            const urlType = isDASH ? 'DASH' : isHLS ? 'HLS' : 'MP4';
+            _debugAllEntries.push({ ts: new Date().toLocaleTimeString(), level: isDASH ? 'WARNING' : 'INFO', name: 'client', _src: 'client', msg: `STREAM | video=${videoId} | format=${format} | type=${urlType} | url=${streamUrl}` });
+            _renderDebugEntries();
+        }
+
+        // =====================================================================
+        //  INIT
+        // =====================================================================
+        checkHealth();
+        setInterval(checkHealth, 30000);
+
+        // Load channels first (builds feed sidebar), then load favorites + feed
+        loadChannels().then(() => {
+            loadFavorites().then(() => loadFeed());
+        });
+    </script>
+
+    <!-- FLOATING BUTTONS -->
+    <button id="scrollBtn" title="Scroll to bottom">⬇</button>
+
+    <div id="debugConsole">
+        <div id="debugConsoleHeader">
+            <span>🐛 WatchDawg Debug Console</span>
+            <div id="debugConsoleActions">
+                <button class="dbg-btn" onclick="debugClear()">Clear</button>
+                <button class="dbg-btn" onclick="debugPollNow()">Refresh</button>
+                <button class="dbg-btn" id="dbgPollToggle" onclick="toggleDebugPolling()">Pause</button>
+                <button class="dbg-btn" onclick="downloadDebugLog()">⬇ Download</button>
+                <button class="dbg-btn" onclick="toggleDebugConsole()">✕</button>
+            </div>
+        </div>
+        <div id="debugTabs">
+            <div class="dbg-tab active" onclick="switchDebugTab('all', this)">All</div>
+            <div class="dbg-tab" onclick="switchDebugTab('proxy', this)">Proxy</div>
+            <div class="dbg-tab" onclick="switchDebugTab('stream', this)">Stream</div>
+            <div class="dbg-tab" onclick="switchDebugTab('errors', this)">Errors</div>
+        </div>
+        <div id="debugBody"></div>
+        <div id="debugStatusBar">
+            <span id="dbgStatus">Polling server logs every 3s...</span>
+            <span id="dbgCount">0 entries</span>
+            <span id="dbgLastFetch">—</span>
+        </div>
+    </div>
+    <button id="debugToggleBtn" onclick="toggleDebugConsole()" title="Toggle Debug Console">🐛</button>
+</body>
+</html>

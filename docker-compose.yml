@@ -1,0 +1,30 @@
+version: "3.9"
+
+services:
+  watchdawg:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: watchdawg-backend
+    restart: unless-stopped
+    ports:
+      - "${APP_PORT:-6868}:6868"
+    env_file:
+      - .env
+    volumes:
+      # SOURCE CODE — live-mounted so deploys are just file copy + restart.
+      # The image bakes in a copy of app/ as fallback, but this mount
+      # takes precedence at runtime. Edit files in ~/watchdawg-backend/app/
+      # and restart the container — no docker cp, no rebuild needed.
+      - ./app:/app/app
+
+      # Persistent database storage
+      - ./data:/app/data
+
+      # Browser cookies for yt-dlp (read-only inside container)
+      - ./config/cookies.txt:/config/cookies.txt
+
+      # Local download directory for favorited music videos
+      - /media/colby/NAS1/WatchDawg:/music_videos
+    environment:
+      - TZ=${TIMEZONE:-America/Chicago}
