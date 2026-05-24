@@ -2881,6 +2881,8 @@
             // Reload to hide locked content immediately
             await refreshFeed();
             await loadFavorites();
+            await loadLibrary();
+            await loadChannels();
             log('Session locked. Sensitive channels hidden.', 'warn');
         }
 
