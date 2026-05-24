@@ -626,8 +626,8 @@ class ResolverService:
         )
         return summary
 
-    async def backfill_thumbnails(self, limit: int = 50) -> dict:
-        """Metadata-only yt-dlp pass to fill missing thumbnails."""
+    async def backfill_thumbnails(self, limit: int = 50, channel_ids: Optional[list] = None) -> dict:
+        """Metadata-only yt-dlp pass to fill missing thumbnails, optionally scoped to channels."""
         from sqlalchemy import or_
 
         stmt = (
@@ -636,6 +636,16 @@ class ResolverService:
             .order_by(Video.id.asc())
             .limit(limit)
         )
+        if channel_ids:
+            stmt = (
+                select(Video)
+                .where(
+                    or_(Video.thumbnail_url.is_(None), Video.thumbnail_url == ""),
+                    Video.channel_id.in_(channel_ids),
+                )
+                .order_by(Video.id.asc())
+                .limit(limit)
+            )
         result = await self._db.execute(stmt)
         videos = result.scalars().all()
 
@@ -669,16 +679,19 @@ class ResolverService:
             await asyncio.sleep(0.5)
 
         await self._db.commit()
+        scope = f"channels {channel_ids}" if channel_ids else "all channels"
         logger.info(
-            f"Thumbnail backfill complete: {summary['filled']} filled, "
+            f"Thumbnail backfill complete ({scope}): {summary['filled']} filled, "
             f"{summary['skipped']} skipped, {summary['failed']} failed "
             f"out of {summary['total']}"
         )
         return summary
 
-    async def purge_dash_videos(self) -> int:
-        """Delete all videos whose resolved stream URL is a DASH manifest."""
+    async def purge_dash_videos(self, channel_ids: Optional[list] = None) -> int:
+        """Delete all videos whose resolved stream URL is a DASH manifest, optionally scoped to channels."""
         stmt = select(Video).where(Video.resolution_status == "resolved")
+        if channel_ids:
+            stmt = stmt.where(Video.channel_id.in_(channel_ids))
         result = await self._db.execute(stmt)
         resolved_videos = result.scalars().all()
 
@@ -690,12 +703,15 @@ class ResolverService:
             await self._delete_video(video)
 
         await self._db.commit()
-        logger.info(f"Purged {count} DASH-only videos from database")
+        scope = f"channels {channel_ids}" if channel_ids else "all channels"
+        logger.info(f"Purged {count} DASH-only videos from database ({scope})")
         return count
 
-    async def purge_dead_videos(self) -> int:
-        """Delete all videos currently marked as failed."""
+    async def purge_dead_videos(self, channel_ids: Optional[list] = None) -> int:
+        """Delete all videos currently marked as failed, optionally scoped to channels."""
         stmt = select(Video).where(Video.resolution_status == "failed")
+        if channel_ids:
+            stmt = stmt.where(Video.channel_id.in_(channel_ids))
         result = await self._db.execute(stmt)
         dead_videos = result.scalars().all()
 
@@ -704,7 +720,8 @@ class ResolverService:
             await self._delete_video(video)
 
         await self._db.commit()
-        logger.info(f"Purged {count} dead videos from database")
+        scope = f"channels {channel_ids}" if channel_ids else "all channels"
+        logger.info(f"Purged {count} dead videos from database ({scope})")
         return count
 
     async def _extract_with_ytdlp(

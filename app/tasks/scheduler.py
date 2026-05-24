@@ -17,7 +17,8 @@ Batch size rationale (updated):
   - Scheduled expired resolve: 100 per tick (unchanged).
     Expired re-resolve is lower priority — CDN tokens are still valid for
     a few hours, so we don't need to rush these.
-  - Dedup sweep: every 6 hours, no call limit (reads DB only, no network).
+  - Dedup sweep: every 2 hours, no call limit (reads DB only, no network).
+    Two-pass: source URL dedup (all statuses) + CDN fingerprint (resolved only).
 """
 
 import datetime
@@ -39,7 +40,10 @@ logger = logging.getLogger(__name__)
 scheduler = AsyncIOScheduler()
 
 # How often the dedup sweep runs, in hours.
-DEDUP_INTERVAL_HOURS = 6
+# Reduced from 6h -> 2h: the sweep is pure DB (no network calls), costs
+# milliseconds even at 9k+ videos, and catches source-URL duplicates
+# (pending videos scraped from multiple channels) much faster.
+DEDUP_INTERVAL_HOURS = 2
 
 # Pending resolve batch size per scheduler tick.
 # Raised from 50 → 200 so new channels resolve within 1-2 ticks instead of
@@ -148,21 +152,25 @@ async def scheduled_resolve():
 
 async def scheduled_dedup():
     """
-    Periodic CDN fingerprint dedup sweep. Runs every DEDUP_INTERVAL_HOURS.
+    Periodic CDN fingerprint dedup sweep. Runs every DEDUP_INTERVAL_HOURS (2h).
 
-    Scans all resolved videos for duplicate CDN fingerprints — identical
-    physical files served under different Vimeo video IDs (common when the
-    same video is curated across multiple Vimeo channels).
+    Two-pass sweep:
 
-    Keeps the highest-scored copy per fingerprint group and deletes the rest.
+    Pass 1 — Source URL dedup across ALL video statuses (pending, failed, resolved).
+      Extracts the Vimeo numeric ID from source_url and groups videos by it. This
+      catches the common case where the same Vimeo video was scraped from multiple
+      channels — one copy is pending, another is already resolved. The pending
+      duplicate is deleted without ever needing a yt-dlp resolution call. This is
+      why pending videos were "disappearing" when manually resolved: resolve() was
+      catching them via dedup_after_resolve(), but the scheduled sweep was missing
+      them because it only looked at resolved videos. Now the sweep catches them
+      proactively before anyone tries to play them.
 
-    The domain guard in extract_cdn_fingerprint() ensures only true Vimeo CDN
-    URLs are fingerprinted — YouTube/Reddit URLs are always skipped, so there
-    is no risk of false-positive dedup across different source platforms.
-
-    This complements the per-resolve auto-dedup in ResolverService — that
-    catches duplicates as they're resolved, while this sweep catches any
-    that slipped through (e.g. videos resolved before this feature was added).
+    Pass 2 — CDN fingerprint dedup on resolved videos only.
+      Fingerprints the physical CDN storage path from resolved_stream_url and
+      removes lower-scored copies that physically share the same CDN file
+      (re-uploads, mirrors, same video on multiple Vimeo accounts). Domain-gated
+      to Vimeo CDN URLs only — YouTube/Reddit never fingerprinted.
     """
     logger.info("Scheduled dedup sweep starting...")
     async with async_session_factory() as db:
@@ -170,12 +178,12 @@ async def scheduled_dedup():
             resolver = ResolverService(db)
             summary = await resolver.purge_duplicate_cdn_files()
             logger.info(
-                f"Scheduled dedup complete: "
-                f"{summary['duplicate_groups_found']} groups found, "
-                f"{summary['deleted_count']} deleted, "
-                f"{summary['kept_count']} kept, "
-                f"{summary['no_fingerprint_count']} without fingerprint (skipped)"
-            )
+            f"Scheduled dedup complete: "
+            f"Pass 1 (source URL): {summary.get('source_url_groups', 0)} groups, "
+            f"{summary.get('source_url_deleted', 0)} deleted | "
+            f"Pass 2 (CDN fingerprint): {summary.get('cdn_fingerprint_groups', 0)} groups, "
+            f"{summary.get('cdn_fingerprint_deleted', 0)} deleted"
+        )
         except Exception as e:
             logger.error(f"Scheduled dedup sweep failed: {e}")
 

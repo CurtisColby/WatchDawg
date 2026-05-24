@@ -6,6 +6,7 @@ Endpoints:
 - POST   /channel                    — Add a new channel (auto-detects type from URL).
 - DELETE /channel/{id}               — Remove a channel.
 - PATCH  /channel/{id}               — Toggle enabled/disabled.
+- PATCH  /channel/{id}/lock          — Toggle locked/unlocked (PIN gate).
 - POST   /channel/{id}/scrape        — Scrape a single channel on demand.
 - DELETE /channel/{id}/videos        — Clear all videos from a channel.
 """
@@ -16,7 +17,7 @@ import re
 from typing import Optional
 from urllib.parse import urlparse
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Header
 from pydantic import BaseModel, Field
 from sqlalchemy import select, func, delete
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -24,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db_session
 from app.models import Channel, Video, Favorite
 from app.services.scraper import ScraperService
+from app.routers.auth import is_unlocked
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +41,10 @@ class ChannelAddRequest(BaseModel):
 
 class ChannelToggleRequest(BaseModel):
     enabled: bool
+
+
+class ChannelLockRequest(BaseModel):
+    locked: bool
 
 
 # --- Auto-Detection Logic ---
@@ -201,13 +207,39 @@ def get_provider_for_channel(channel: Channel):
         raise ValueError(f"Unknown channel type: {channel.channel_type}")
 
 
+# --- Shared channel serializer ---
+
+def _serialize_channel(ch: Channel, video_count: int = 0) -> dict:
+    """Serialize a Channel ORM object to a dict for API responses."""
+    return {
+        "id": ch.id,
+        "name": ch.name,
+        "channel_type": ch.channel_type,
+        "url": ch.url,
+        "enabled": ch.enabled,
+        "locked": ch.locked,
+        "last_scraped_at": ch.last_scraped_at.isoformat() if ch.last_scraped_at else None,
+        "last_scrape_count": ch.last_scrape_count,
+        "video_count": video_count,
+        "created_at": ch.created_at.isoformat() if ch.created_at else None,
+    }
+
+
 # --- API Endpoints ---
 
 @router.get("")
 async def list_channels(
+    x_watchdawg_token: Optional[str] = Header(None),
     db: AsyncSession = Depends(get_db_session),
 ):
-    """List all channels with their video counts."""
+    """
+    List all channels with their video counts.
+
+    PIN lock: The channel list itself (names, URLs, lock states) is always
+    returned regardless of lock status — the browser UI needs it to render
+    the lock toggles. However the FEED, FAVORITES, and LIBRARY endpoints
+    gate their content behind the token.
+    """
     stmt = select(Channel).order_by(Channel.created_at.desc())
     result = await db.execute(stmt)
     channels = result.scalars().all()
@@ -216,18 +248,7 @@ async def list_channels(
     for ch in channels:
         count_stmt = select(func.count(Video.id)).where(Video.channel_id == ch.id)
         video_count = (await db.execute(count_stmt)).scalar() or 0
-
-        channel_list.append({
-            "id": ch.id,
-            "name": ch.name,
-            "channel_type": ch.channel_type,
-            "url": ch.url,
-            "enabled": ch.enabled,
-            "last_scraped_at": ch.last_scraped_at.isoformat() if ch.last_scraped_at else None,
-            "last_scrape_count": ch.last_scrape_count,
-            "video_count": video_count,
-            "created_at": ch.created_at.isoformat() if ch.created_at else None,
-        })
+        channel_list.append(_serialize_channel(ch, video_count))
 
     return {"channels": channel_list}
 
@@ -264,6 +285,7 @@ async def add_channel(
         url=detected["url"],
         unique_key=detected["unique_key"],
         enabled=True,
+        locked=False,
     )
     db.add(channel)
     await db.commit()
@@ -273,13 +295,7 @@ async def add_channel(
 
     return {
         "status": "added",
-        "channel": {
-            "id": channel.id,
-            "name": channel.name,
-            "channel_type": channel.channel_type,
-            "url": channel.url,
-            "enabled": channel.enabled,
-        },
+        "channel": _serialize_channel(channel),
     }
 
 
@@ -332,6 +348,49 @@ async def toggle_channel(
     status = "enabled" if request.enabled else "disabled"
     logger.info(f"Channel {channel.name} {status}")
     return {"status": status, "channel_id": channel_id, "name": channel.name}
+
+
+@router.patch("/{channel_id}/lock")
+async def toggle_channel_lock(
+    channel_id: int,
+    request: ChannelLockRequest,
+    x_watchdawg_token: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db_session),
+):
+    """
+    Lock or unlock a channel.
+
+    Locking a channel hides its videos from feed, favorites, and library
+    until POST /auth/unlock is called and the token is supplied.
+
+    Requires an active session token so an unauthenticated user cannot
+    toggle lock states via the API.
+    """
+    from app.routers.auth import pin_lock_enabled
+    if pin_lock_enabled() and not is_unlocked(x_watchdawg_token):
+        raise HTTPException(
+            status_code=403,
+            detail="PIN required to modify channel lock state.",
+        )
+
+    stmt = select(Channel).where(Channel.id == channel_id)
+    result = await db.execute(stmt)
+    channel = result.scalar_one_or_none()
+
+    if channel is None:
+        raise HTTPException(status_code=404, detail="Channel not found")
+
+    channel.locked = request.locked
+    await db.commit()
+
+    action = "locked" if request.locked else "unlocked"
+    logger.info(f"Channel '{channel.name}' {action}")
+    return {
+        "status": action,
+        "channel_id": channel_id,
+        "name": channel.name,
+        "locked": channel.locked,
+    }
 
 
 @router.delete("/{channel_id}/videos")

@@ -300,6 +300,24 @@
             flex-shrink: 0;
         }
 
+        .sidebar-scrape-btn {
+            flex-shrink: 0;
+            background: none;
+            border: none;
+            color: var(--text-muted);
+            cursor: pointer;
+            font-size: 11px;
+            padding: 2px 4px;
+            border-radius: 4px;
+            line-height: 1;
+            opacity: 0;
+            transition: opacity 0.15s, color 0.15s, background 0.15s;
+        }
+        .sidebar-channel-row:hover .sidebar-scrape-btn { opacity: 1; }
+        .sidebar-scrape-btn:hover { color: var(--accent-orange); background: var(--accent-orange-dim); }
+        .sidebar-scrape-btn.spinning { opacity: 1; color: var(--accent-orange); animation: spin 1s linear infinite; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+
         /* Feed / Favorites / Library main content area */
         .feed-main {
             flex: 1;
@@ -543,6 +561,114 @@
             box-shadow: 0 4px 16px rgba(255,107,53,0.4); transition: transform 0.2s;
         }
         #debugToggleBtn:hover { transform: scale(1.1); }
+
+        /* =====================================================================
+           PIN LOCK SYSTEM
+           ===================================================================== */
+
+        /* Padlock icon in the header — always visible on all tabs */
+        #pinLockBtn {
+            background: none;
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius-sm);
+            color: var(--text-muted);
+            font-size: 18px;
+            width: 36px; height: 36px;
+            display: flex; align-items: center; justify-content: center;
+            cursor: pointer;
+            transition: all 0.2s;
+            flex-shrink: 0;
+        }
+        #pinLockBtn:hover { border-color: var(--accent-orange); color: var(--accent-orange); }
+        #pinLockBtn.unlocked { color: var(--accent-green); border-color: var(--accent-green); }
+
+        /* Inline PIN bar — slides in at the top of tab content areas */
+        .pin-bar {
+            display: none;
+            align-items: center;
+            gap: 12px;
+            padding: 10px 24px;
+            background: var(--bg-surface);
+            border-bottom: 1px solid var(--accent-orange);
+            flex-shrink: 0;
+            animation: slideDown 0.2s ease;
+        }
+        @keyframes slideDown { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: translateY(0); } }
+        .pin-bar.visible { display: flex; }
+        .pin-bar-icon { font-size: 16px; color: var(--accent-orange); flex-shrink: 0; }
+        .pin-bar-label { font-size: 13px; color: var(--text-secondary); flex-shrink: 0; }
+        .pin-bar-input {
+            width: 140px;
+            padding: 7px 12px;
+            background: var(--bg-card);
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius-sm);
+            color: var(--text-primary);
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 14px;
+            letter-spacing: 3px;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+        .pin-bar-input:focus { border-color: var(--accent-orange); }
+        .pin-bar-input.shake {
+            animation: shake 0.35s ease;
+            border-color: var(--accent-red) !important;
+        }
+        @keyframes shake {
+            0%, 100% { transform: translateX(0); }
+            20%       { transform: translateX(-6px); }
+            40%       { transform: translateX(6px); }
+            60%       { transform: translateX(-4px); }
+            80%       { transform: translateX(4px); }
+        }
+        .pin-bar-btn {
+            padding: 7px 16px;
+            background: var(--accent-orange);
+            color: var(--bg-primary);
+            border: none;
+            border-radius: var(--radius-sm);
+            font-family: 'Outfit', sans-serif;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        .pin-bar-btn:hover { background: #ff8555; }
+        .pin-bar-error { font-size: 12px; color: var(--accent-red); font-family: 'JetBrains Mono', monospace; }
+
+        /* Locked channel row in Channels tab */
+        .channel-card.locked-channel { border-color: var(--accent-orange); opacity: 0.85; }
+        .lock-toggle-btn {
+            width: 32px; height: 32px;
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius-sm);
+            background: var(--bg-surface);
+            color: var(--text-muted);
+            cursor: pointer;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 15px;
+            transition: all 0.2s;
+            padding: 0;
+        }
+        .lock-toggle-btn.locked { color: var(--accent-orange); border-color: var(--accent-orange); background: var(--accent-orange-dim); }
+        .lock-toggle-btn:hover { border-color: var(--accent-orange); color: var(--accent-orange); }
+
+        /* Channels tab locked overlay — shown when locked and no PIN */
+        #channelsLockedOverlay {
+            display: none;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 80px 20px;
+            color: var(--text-muted);
+            text-align: center;
+            flex: 1;
+        }
+        #channelsLockedOverlay.visible { display: flex; }
+        #channelsLockedOverlay .overlay-icon { font-size: 56px; margin-bottom: 16px; }
+        #channelsLockedOverlay h3 { font-size: 18px; color: var(--text-secondary); margin-bottom: 8px; }
+        #channelsLockedOverlay p { font-size: 14px; max-width: 360px; line-height: 1.7; }
     </style>
 </head>
 <body>
@@ -554,6 +680,7 @@
         </div>
         <div class="header-right">
             <div id="globalVideoCount"></div>
+            <button id="pinLockBtn" onclick="handlePinLockBtnClick()" title="PIN Lock">&#x1F512;</button>
             <div id="healthStatus" class="status-pill status-unknown">
                 <div class="status-dot"></div><span>Connecting...</span>
             </div>
@@ -600,6 +727,17 @@
             </div>
         </div>
 
+<!-- PIN Bar: Feed -->
+        <div class="pin-bar" id="pinBar-feed">
+            <span class="pin-bar-icon">&#x1F512;</span>
+            <span class="pin-bar-label">Some channels are locked.</span>
+            <input type="password" class="pin-bar-input" id="pinInput-feed" maxlength="16"
+                placeholder="PIN"
+                onkeydown="if(event.key==='Enter') submitPin('feed')">
+            <button class="pin-bar-btn" onclick="submitPin('feed')">Unlock</button>
+            <span class="pin-bar-error" id="pinError-feed"></span>
+        </div>
+
         <!-- Sidebar + main feed layout -->
         <div class="feed-layout">
             <div class="channel-sidebar" id="feedSidebar">
@@ -629,7 +767,22 @@
 
     <!-- CHANNELS TAB -->
     <div class="tab-content" id="tab-channels">
-        <div class="channel-manager">
+<!-- PIN Bar: Channels -->
+        <div class="pin-bar" id="pinBar-channels">
+            <span class="pin-bar-icon">&#x1F512;</span>
+            <span class="pin-bar-label">Channel management is locked.</span>
+            <input type="password" class="pin-bar-input" id="pinInput-channels" maxlength="16"
+                placeholder="PIN"
+                onkeydown="if(event.key==='Enter') submitPin('channels')">
+            <button class="pin-bar-btn" onclick="submitPin('channels')">Unlock</button>
+            <span class="pin-bar-error" id="pinError-channels"></span>
+        </div>
+        <div id="channelsLockedOverlay">
+            <div class="overlay-icon">&#x1F512;</div>
+            <h3>Channels Locked</h3>
+            <p>Enter your PIN above to manage channels, lock/unlock sources, and configure settings.</p>
+        </div>
+        <div class="channel-manager" id="channelManager">
             <div class="channel-add-form">
                 <div class="channel-add-row">
                     <input type="text" id="channelUrlInput"
@@ -655,6 +808,16 @@
             <button class="btn" id="btnFavShuffle" onclick="favPlayAll(true)">&#x1F500; Shuffle</button>
             <div class="controls-spacer"></div>
             <div class="video-count" id="favCount">&mdash;</div>
+        </div>
+<!-- PIN Bar: Favorites -->
+        <div class="pin-bar" id="pinBar-favorites">
+            <span class="pin-bar-icon">&#x1F512;</span>
+            <span class="pin-bar-label">Favorites are locked.</span>
+            <input type="password" class="pin-bar-input" id="pinInput-favorites" maxlength="16"
+                placeholder="PIN"
+                onkeydown="if(event.key==='Enter') submitPin('favorites')">
+            <button class="pin-bar-btn" onclick="submitPin('favorites')">Unlock</button>
+            <span class="pin-bar-error" id="pinError-favorites"></span>
         </div>
         <div class="feed-layout">
             <div class="channel-sidebar" id="favSidebar">
@@ -690,6 +853,16 @@
             <button class="btn" id="btnGenThumbs" onclick="generateLibraryThumbnails()" title="Generate thumbnails for manually-added videos using ffmpeg">&#x1F3A8; Generate Thumbs</button>
             <div class="controls-spacer"></div>
             <div class="video-count" id="libCount">&mdash;</div>
+        </div>
+<!-- PIN Bar: Library -->
+        <div class="pin-bar" id="pinBar-library">
+            <span class="pin-bar-icon">&#x1F512;</span>
+            <span class="pin-bar-label">Library is locked.</span>
+            <input type="password" class="pin-bar-input" id="pinInput-library" maxlength="16"
+                placeholder="PIN"
+                onkeydown="if(event.key==='Enter') submitPin('library')">
+            <button class="pin-bar-btn" onclick="submitPin('library')">Unlock</button>
+            <span class="pin-bar-error" id="pinError-library"></span>
         </div>
         <div class="feed-layout">
             <div class="channel-sidebar" id="libSidebar">
@@ -793,7 +966,9 @@
                 let url = `${API_BASE}/feed/ids`;
                 if (channelIds !== null) url += `?channel_ids=${encodeURIComponent(channelIds)}`;
 
-                const res = await fetch(url);
+                const shuffleOpts = {};
+                if (_pinToken) shuffleOpts.headers = { 'X-WatchDawg-Token': _pinToken };
+                const res = await fetch(url, shuffleOpts);
                 if (!res.ok) throw new Error(`Server returned ${res.status}`);
                 const data = await res.json();
 
@@ -1055,7 +1230,10 @@
                                 ${feedSidebarState[ch.id] ? 'checked' : ''}
                                 onclick="event.stopPropagation();toggleFeedChannel(${ch.id})">
                             <span class="sidebar-channel-name" title="${escapeHtml(ch.name)}">${escapeHtml(ch.name)}</span>
-                            <span class="sidebar-channel-count">${ch.video_count || 0}</span>
+                            <span class="sidebar-channel-count" id="sidebarCount_${ch.id}">${ch.video_count || 0}</span>
+                            <button class="sidebar-scrape-btn" id="sidebarScrapeBtn_${ch.id}"
+                                title="Scrape ${escapeHtml(ch.name)}"
+                                onclick="event.stopPropagation();sidebarScrapeChannel(${ch.id})">&#x21BB;</button>
                         </div>`).join('')}
                     </div>
                 </div>`;
@@ -1115,6 +1293,29 @@
             document.querySelectorAll('#feedSidebarGroups .sidebar-channel-row input[type="checkbox"]').forEach(cb => cb.checked = newState);
             document.querySelectorAll('#feedSidebarGroups [id^="feedSelectAll_"]').forEach(cb => { cb.checked = newState; cb.indeterminate = false; });
             refreshFeed();
+        }
+
+        async function sidebarScrapeChannel(channelId) {
+            const btn = document.getElementById(`sidebarScrapeBtn_${channelId}`);
+            if (!btn) return;
+            btn.classList.add('spinning');
+            btn.disabled = true;
+            try {
+                const res = await fetch(`${API_BASE}/channel/${channelId}/scrape?limit=2000`, { method: 'POST' });
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                const data = await res.json();
+                const r = data.result || {};
+                const newCount = r.new ?? 0;
+                const discovered = r.discovered ?? 0;
+                log(`Scraped "${data.channel}": ${newCount} new / ${discovered} discovered`, newCount > 0 ? 'success' : 'info');
+                await loadChannels();
+                if (newCount > 0) await refreshFeed();
+            } catch (e) {
+                log(`Scrape failed for channel ${channelId}: ${e.message}`, 'error');
+            } finally {
+                btn.classList.remove('spinning');
+                btn.disabled = false;
+            }
         }
 
         function _getFeedSidebarChannelIds() {
@@ -1407,7 +1608,7 @@
                 const data = await res.json();
                 currentChannels = data.channels || [];
                 renderChannels(currentChannels);
-                buildFeedSidebar(currentChannels.filter(ch => ch.enabled));
+                buildFeedSidebar(currentChannels.filter(ch => ch.enabled && (_isUnlocked || !ch.locked)));
             } catch (e) { log(`Failed to load channels: ${e.message}`, 'error'); }
         }
 
@@ -1427,7 +1628,7 @@
                 const lastScraped = ch.last_scraped_at ? new Date(ch.last_scraped_at).toLocaleString() : 'Never';
                 const safeId = `rename_${ch.id}`;
                 return `
-                <div class="channel-card" style="animation-delay:${i * 0.05}s" id="channelCard_${ch.id}">
+                <div class="channel-card ${ch.locked ? 'locked-channel' : ''}" style="animation-delay:${i * 0.05}s" id="channelCard_${ch.id}">
                     <div class="channel-type-badge ${typeBadge}">${typeLabel}</div>
                     <div class="channel-info">
                         <div class="channel-name" id="channelName_${ch.id}">${escapeHtml(ch.name)}</div>
@@ -1449,6 +1650,7 @@
                         <button class="btn-icon btn-icon-edit" onclick="startRename(${ch.id})" title="Rename channel">&#x270F;</button>
                         <button class="btn-icon btn-icon-warn" onclick="scrapeChannel(${ch.id}, '${escapeHtml(ch.name).replace(/'/g, "\\'")}')" title="Scrape this channel now">&#x1F504;</button>
                         <button class="btn-icon btn-icon-warn" onclick="clearChannelVideos(${ch.id}, '${escapeHtml(ch.name).replace(/'/g, "\\'")}')" title="Clear all videos from this channel">&#x1F9F9;</button>
+                        <button class="lock-toggle-btn ${ch.locked ? 'locked' : ''}" onclick="toggleChannelLock(${ch.id}, ${ch.locked})" title="${ch.locked ? 'Unlock channel (click to make visible)' : 'Lock channel (requires PIN to view)'}">${ch.locked ? '&#x1F512;' : '&#x1F513;'}</button>
                         <button class="toggle-switch ${ch.enabled ? 'active' : ''}" onclick="toggleChannel(${ch.id}, ${!ch.enabled})" title="${ch.enabled ? 'Disable' : 'Enable'} channel"></button>
                         <button class="btn-icon btn-icon-danger" onclick="deleteChannel(${ch.id}, '${escapeHtml(ch.name).replace(/'/g, "\\'")}')" title="Delete channel and all its videos">&#x1F5D1;</button>
                     </div>
@@ -1571,22 +1773,48 @@
         // =====================================================================
         async function triggerScrape() {
             const btn = document.getElementById('btnScrape');
-            btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Scraping...';
-            log('Scraping all enabled channels...', 'info');
-            try {
-                const res = await fetch(`${API_BASE}/feed/scrape?limit=2000`, { method: 'POST' });
-                const data = await res.json();
-                if (data.results && data.results.length > 0) {
-                    for (const r of data.results) {
-                        if (r.result.error) { log(`  ${r.channel}: ERROR — ${r.result.error}`, 'error'); }
-                        else { log(`  ${r.channel}: ${r.result.discovered} discovered, ${r.result.new} new, ${r.result.duplicates} dupes`, r.result.new > 0 ? 'success' : 'info'); }
-                    }
-                    log(`Scrape complete: ${data.channels_scraped} channels, ${data.total_new} new videos`, data.total_new > 0 ? 'success' : 'warn');
-                } else { log(data.message || 'No channels to scrape.', 'warn'); }
-                await loadChannels();
-                await refreshFeed();
-            } catch (e) { log(`Scrape failed: ${e.message}`, 'error'); }
-            finally { btn.disabled = false; btn.innerHTML = '&#x1F50D; Scrape All Channels'; }
+            btn.disabled = true;
+            const channelIds = _getFeedSidebarChannelIds();
+            const scopeMsg = channelIds !== null ? ` (${channelIds.split(',').length} channel(s) selected)` : ' (all channels)';
+
+            if (channelIds !== null) {
+                // Sidebar filter active — scrape only selected channels one by one
+                const ids = channelIds.split(',').map(Number).filter(Boolean);
+                btn.innerHTML = `<span class="spinner"></span> Scraping ${ids.length} channel(s)...`;
+                log(`Scraping ${ids.length} selected channel(s)...`, 'info');
+                let totalNew = 0, totalDiscovered = 0;
+                for (const id of ids) {
+                    try {
+                        const res = await fetch(`${API_BASE}/channel/${id}/scrape?limit=2000`, { method: 'POST' });
+                        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                        const data = await res.json();
+                        const r = data.result || {};
+                        totalNew += r.new || 0;
+                        totalDiscovered += r.discovered || 0;
+                        if (r.error) { log(`  ${data.channel}: ERROR — ${r.error}`, 'error'); }
+                        else { log(`  ${data.channel}: ${r.discovered} discovered, ${r.new} new, ${r.duplicates || 0} dupes`, r.new > 0 ? 'success' : 'info'); }
+                    } catch (e) { log(`  Channel ${id}: scrape failed — ${e.message}`, 'error'); }
+                }
+                log(`Scrape complete${scopeMsg}: ${totalDiscovered} discovered, ${totalNew} new videos`, totalNew > 0 ? 'success' : 'warn');
+            } else {
+                // No filter — global scrape all enabled channels
+                btn.innerHTML = '<span class="spinner"></span> Scraping...';
+                log('Scraping all enabled channels...', 'info');
+                try {
+                    const res = await fetch(`${API_BASE}/feed/scrape?limit=2000`, { method: 'POST' });
+                    const data = await res.json();
+                    if (data.results && data.results.length > 0) {
+                        for (const r of data.results) {
+                            if (r.result.error) { log(`  ${r.channel}: ERROR — ${r.result.error}`, 'error'); }
+                            else { log(`  ${r.channel}: ${r.result.discovered} discovered, ${r.result.new} new, ${r.result.duplicates} dupes`, r.result.new > 0 ? 'success' : 'info'); }
+                        }
+                        log(`Scrape complete: ${data.channels_scraped} channels, ${data.total_new} new videos`, data.total_new > 0 ? 'success' : 'warn');
+                    } else { log(data.message || 'No channels to scrape.', 'warn'); }
+                } catch (e) { log(`Scrape failed: ${e.message}`, 'error'); }
+            }
+
+            try { await loadChannels(); await refreshFeed(); } catch (_) {}
+            btn.disabled = false; btn.innerHTML = '&#x1F50D; Scrape All Channels';
         }
 
         // Flag that lets the user abort the current resolve batch gracefully
@@ -1651,30 +1879,38 @@
         }
 
         async function purgeDead() {
-            if (!confirm('Permanently delete ALL failed videos from the database?\n\nThis cannot be undone.')) return;
+            const channelIds = _getFeedSidebarChannelIds();
+            const scopeMsg = channelIds !== null ? ` (${channelIds.split(',').length} channel(s) selected)` : ' (all channels)';
+            if (!confirm(`Permanently delete ALL failed videos from the database${scopeMsg}?\n\nThis cannot be undone.`)) return;
             const btn = document.getElementById('btnPurgeDead');
             btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Purging...';
-            log('Purging all dead/failed videos...', 'warn');
+            log(`Purging all dead/failed videos${scopeMsg}...`, 'warn');
             try {
-                const res = await fetch(`${API_BASE}/resolve/purge-dead`, { method: 'POST' });
+                let url = `${API_BASE}/resolve/purge-dead`;
+                if (channelIds !== null) url += `?channel_ids=${encodeURIComponent(channelIds)}`;
+                const res = await fetch(url, { method: 'POST' });
                 if (!res.ok) throw new Error('Purge failed');
                 const data = await res.json();
-                log(`Purged ${data.deleted_count} dead videos from database.`, 'success');
+                log(`Purged ${data.deleted_count} dead videos from database${scopeMsg}.`, 'success');
                 await refreshFeed();
             } catch (e) { log(`Purge failed: ${e.message}`, 'error'); }
             finally { btn.disabled = false; btn.innerHTML = '&#x1F9F9; Purge Dead'; }
         }
 
         async function purgeDash() {
-            if (!confirm('Remove all DASH-only videos from the feed?\n\nThese are Vimeo videos that cannot play in any browser. They will be re-discovered on the next scrape if Vimeo ever adds a progressive MP4 version.\n\nThis cannot be undone.')) return;
+            const channelIds = _getFeedSidebarChannelIds();
+            const scopeMsg = channelIds !== null ? ` (${channelIds.split(',').length} channel(s) selected)` : ' (all channels)';
+            if (!confirm(`Remove all DASH-only videos from the feed${scopeMsg}?\n\nThese are Vimeo videos that cannot play in any browser. They will be re-discovered on the next scrape if Vimeo ever adds a progressive MP4 version.\n\nThis cannot be undone.`)) return;
             const btn = document.getElementById('btnPurgeDash');
             btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Purging...';
-            log('Purging DASH-only videos...', 'warn');
+            log(`Purging DASH-only videos${scopeMsg}...`, 'warn');
             try {
-                const res = await fetch(`${API_BASE}/resolve/purge-dash`, { method: 'POST' });
+                let url = `${API_BASE}/resolve/purge-dash`;
+                if (channelIds !== null) url += `?channel_ids=${encodeURIComponent(channelIds)}`;
+                const res = await fetch(url, { method: 'POST' });
                 if (!res.ok) throw new Error('Purge DASH failed');
                 const data = await res.json();
-                log(`Purged ${data.deleted_count} DASH-only videos from feed.`, data.deleted_count > 0 ? 'success' : 'info');
+                log(`Purged ${data.deleted_count} DASH-only videos${scopeMsg}.`, data.deleted_count > 0 ? 'success' : 'info');
                 await refreshFeed();
             } catch (e) { log(`Purge DASH failed: ${e.message}`, 'error'); }
             finally { btn.disabled = false; btn.innerHTML = '&#x26A0; Purge DASH'; }
@@ -1690,7 +1926,7 @@
                 if (!res.ok) throw new Error('Purge duplicates failed');
                 const data = await res.json();
                 log(`Duplicate purge: ${data.duplicate_groups_found} groups found, ${data.deleted_count} deleted, ${data.kept_count} kept.`, data.deleted_count > 0 ? 'success' : 'info');
-                if (data.deleted_count > 0) await refreshFeed();
+                if (data.deleted_count > 0) await sweepStaleCards();
             } catch (e) { log(`Purge duplicates failed: ${e.message}`, 'error'); }
             finally { btn.disabled = false; btn.innerHTML = '&#x1F9F9; Purge Dupes'; }
         }
@@ -1718,13 +1954,17 @@
         async function triggerBackfillThumbnails() {
             const btn = document.getElementById('btnBackfill');
             btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Backfilling...';
-            log('Starting thumbnail backfill (up to 50 videos per run)...', 'info');
+            const channelIds = _getFeedSidebarChannelIds();
+            const scopeMsg = channelIds !== null ? ` (${channelIds.split(',').length} channel(s) selected)` : ' (all channels)';
+            log(`Starting thumbnail backfill (up to 50 videos)${scopeMsg}...`, 'info');
             try {
-                const res = await fetch(`${API_BASE}/resolve/backfill-thumbnails?limit=50`, { method: 'POST' });
+                let url = `${API_BASE}/resolve/backfill-thumbnails?limit=50`;
+                if (channelIds !== null) url += `&channel_ids=${encodeURIComponent(channelIds)}`;
+                const res = await fetch(url, { method: 'POST' });
                 if (!res.ok) throw new Error(`Server error: ${res.status}`);
                 const data = await res.json();
                 const s = data.summary;
-                log(`Thumbnail backfill: ${s.filled} filled, ${s.skipped} skipped, ${s.failed} failed out of ${s.total} checked`, s.filled > 0 ? 'success' : 'info');
+                log(`Thumbnail backfill${scopeMsg}: ${s.filled} filled, ${s.skipped} skipped, ${s.failed} failed out of ${s.total} checked`, s.filled > 0 ? 'success' : 'info');
                 if (s.filled > 0) await loadFeed();
             } catch (e) { log(`Backfill failed: ${e.message}`, 'error'); }
             finally { btn.disabled = false; btn.innerHTML = '&#x1F5BC; Backfill Thumbs'; }
@@ -1766,7 +2006,9 @@
             feedLoading = true;
             feedOffset = 0; currentVideos = []; feedLoaded = false;
             try {
-                const res = await fetch(_buildFeedUrl(0, FEED_PAGE_SIZE));
+                const feedFetchOpts = {};
+                if (_pinToken) feedFetchOpts.headers = { 'X-WatchDawg-Token': _pinToken };
+                const res = await fetch(_buildFeedUrl(0, FEED_PAGE_SIZE), feedFetchOpts);
                 if (!res.ok) throw new Error(`Server returned ${res.status}`);
                 const data = await res.json();
                 const videos = Array.isArray(data.videos) ? data.videos : [];
@@ -1774,6 +2016,11 @@
                 feedTotal = data.total || 0;
                 feedOffset = videos.length;
                 feedLoaded = true;
+                // Show PIN bar if server reports locked channels are hidden
+                if (data.locked_channels_hidden) {
+                    const bar = document.getElementById('pinBar-feed');
+                    if (bar && !bar.classList.contains('visible')) bar.classList.add('visible');
+                }
                 document.getElementById('videoCount').textContent = `${feedTotal.toLocaleString()} videos`;
                 updateGlobalCount(feedTotal);
                 renderGrid(currentVideos);
@@ -1788,7 +2035,9 @@
             if (feedLoading || feedOffset >= feedTotal) return;
             feedLoading = true;
             try {
-                const res = await fetch(_buildFeedUrl(feedOffset, FEED_PAGE_SIZE));
+                const moreFeedOpts = {};
+                if (_pinToken) moreFeedOpts.headers = { 'X-WatchDawg-Token': _pinToken };
+                const res = await fetch(_buildFeedUrl(feedOffset, FEED_PAGE_SIZE), moreFeedOpts);
                 if (!res.ok) throw new Error(`Server returned ${res.status}`);
                 const data = await res.json();
                 const newVideos = Array.isArray(data.videos) ? data.videos : [];
@@ -1815,8 +2064,20 @@
 
         async function loadFavorites() {
             try {
-                const res = await fetch(`${API_BASE}/favorite`);
+                const favOpts = {};
+                if (_pinToken) favOpts.headers = { 'X-WatchDawg-Token': _pinToken };
+                const res = await fetch(`${API_BASE}/favorite`, favOpts);
                 const data = await res.json();
+                // Show PIN bar if locked
+                const favPinBar = document.getElementById('pinBar-favorites');
+                if (data.locked_hidden) {
+                    if (favPinBar) favPinBar.classList.add('visible');
+                    currentFavorites = [];
+                    document.getElementById('favCount').textContent = '— locked';
+                    document.getElementById('favoritesGrid').innerHTML = '<div class="empty-state"><div class="empty-state-icon">&#x1F512;</div><h3>Locked</h3><p>Enter your PIN to view Favorites.</p></div>';
+                    return;
+                }
+                if (favPinBar) favPinBar.classList.remove('visible');
                 currentFavorites = data.favorites;
                 favoritedVideoIds = new Set(data.favorites.map(f => f.video_id));
                 document.getElementById('favCount').textContent = `${data.favorites.length} favorites`;
@@ -1855,8 +2116,19 @@
             const countEl = document.getElementById('libCount');
             countEl.textContent = 'Scanning...';
             try {
-                const res = await fetch(`${API_BASE}/library`);
+                const libOpts = {};
+                if (_pinToken) libOpts.headers = { 'X-WatchDawg-Token': _pinToken };
+                const res = await fetch(`${API_BASE}/library`, libOpts);
                 const data = await res.json();
+                const libPinBar = document.getElementById('pinBar-library');
+                if (data.locked_hidden) {
+                    if (libPinBar) libPinBar.classList.add('visible');
+                    countEl.textContent = '— locked';
+                    currentLibrary = [];
+                    document.getElementById('libraryGrid').innerHTML = '<div class="empty-state"><div class="empty-state-icon">&#x1F512;</div><h3>Locked</h3><p>Enter your PIN to view Library.</p></div>';
+                    return;
+                }
+                if (libPinBar) libPinBar.classList.remove('visible');
                 currentLibrary = data.files;
                 countEl.textContent = `${data.total} files`;
                 buildLibSidebar(currentLibrary);
@@ -2270,8 +2542,15 @@
         // =====================================================================
         async function skipVideo(videoId) {
             try {
-                const res = await fetch(`${API_BASE}/skip/${videoId}`, { method: 'POST' });
-                if (!res.ok) throw new Error('Skip failed');
+                const res = await fetch(`${API_BASE}/skip`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ video_id: videoId }),
+                });
+                if (!res.ok) {
+                    const err = await res.json().catch(() => ({}));
+                    throw new Error(err.detail || `HTTP ${res.status}`);
+                }
                 currentVideos = currentVideos.filter(v => v.id !== videoId);
                 feedTotal = Math.max(0, feedTotal - 1);
                 const card = document.querySelector(`.video-card[data-id="${videoId}"]`);
@@ -2279,6 +2558,46 @@
                 document.getElementById('videoCount').textContent = `${feedOffset.toLocaleString()} / ${feedTotal.toLocaleString()} videos`;
                 updateGlobalCount(feedTotal);
             } catch (e) { log(`Skip failed: ${e.message}`, 'error'); }
+        }
+
+        // =====================================================================
+        //  STALE CARD SWEEP
+        //  Called after background dedup runs or on a 5-minute timer.
+        //  Fetches the current live video ID list from the server and surgically
+        //  removes any rendered cards whose DB record no longer exists.
+        //  Does NOT do a full feed reload — keeps scroll position intact.
+        // =====================================================================
+        async function sweepStaleCards() {
+            try {
+                const channelIds = _getFeedSidebarChannelIds();
+                let url = `${API_BASE}/feed/ids`;
+                if (channelIds !== null) url += `?channel_ids=${encodeURIComponent(channelIds)}`;
+                const res = await fetch(url);
+                if (!res.ok) return;
+                const data = await res.json();
+                const liveIds = new Set(data.ids.map ? data.ids.map(i => typeof i === 'object' ? i.id : i) : data.ids);
+
+                const renderedCards = document.querySelectorAll('#feedGrid .video-card[data-id]');
+                let removed = 0;
+                renderedCards.forEach(card => {
+                    const id = parseInt(card.dataset.id, 10);
+                    if (!liveIds.has(id)) {
+                        card.remove();
+                        removed++;
+                    }
+                });
+
+                if (removed > 0) {
+                    currentVideos = currentVideos.filter(v => liveIds.has(v.id));
+                    feedTotal = Math.max(0, feedTotal - removed);
+                    document.getElementById('videoCount').textContent =
+                        `${feedOffset.toLocaleString()} / ${feedTotal.toLocaleString()} videos`;
+                    updateGlobalCount(feedTotal);
+                    log(`Swept ${removed} stale card(s) from feed grid.`, 'info');
+                }
+            } catch (_) {
+                // Background sweep — swallow errors silently
+            }
         }
 
         async function favoriteVideo(videoId) {
@@ -2418,15 +2737,207 @@
             _renderDebugEntries();
         }
 
+
+        // =====================================================================
+        //  PIN LOCK SYSTEM
+        // =====================================================================
+
+        // Session token — lives in memory only. Never written to localStorage/disk.
+        // Cleared when the page/tab closes. Shared across all tab renders.
+        let _pinToken = null;
+        let _pinLockEnabled = false;   // set by checkAuthStatus() on load
+        let _isUnlocked = false;       // set by checkAuthStatus() and submitPin()
+
+        function _getAuthHeaders() {
+            const headers = { 'Content-Type': 'application/json' };
+            if (_pinToken) headers['X-WatchDawg-Token'] = _pinToken;
+            return headers;
+        }
+
+        function _getFetchOptions(method = 'GET') {
+            const opts = { method };
+            if (_pinToken) opts.headers = { 'X-WatchDawg-Token': _pinToken };
+            return opts;
+        }
+
+        // Check auth status on page load to know if PIN lock is configured
+        async function checkAuthStatus() {
+            try {
+                const opts = _pinToken ? { headers: { 'X-WatchDawg-Token': _pinToken } } : {};
+                const res = await fetch(`${API_BASE}/auth/status`, opts);
+                if (!res.ok) return;
+                const data = await res.json();
+                _pinLockEnabled = data.pin_lock_enabled;
+                _isUnlocked = data.is_unlocked;
+                _updatePadlockIcon();
+                // Show PIN bars on all tabs if locked
+                _updateAllPinBars();
+            } catch (e) {
+                // Non-fatal — auth endpoint may not exist on very old deploys
+                console.warn('Auth status check failed:', e.message);
+            }
+        }
+
+        function _updatePadlockIcon() {
+            const btn = document.getElementById('pinLockBtn');
+            if (!btn) return;
+            if (!_pinLockEnabled) {
+                btn.style.display = 'none'; // No PIN configured — hide the button entirely
+                return;
+            }
+            btn.style.display = 'flex';
+            if (_isUnlocked) {
+                btn.innerHTML = '&#x1F513;'; // open lock
+                btn.classList.add('unlocked');
+                btn.title = 'Unlocked — click to lock';
+            } else {
+                btn.innerHTML = '&#x1F512;'; // closed lock
+                btn.classList.remove('unlocked');
+                btn.title = 'Locked — click to enter PIN';
+            }
+        }
+
+        function _updateAllPinBars() {
+            const tabs = ['feed', 'channels', 'favorites', 'library'];
+            tabs.forEach(tab => {
+                const bar = document.getElementById(`pinBar-${tab}`);
+                if (!bar) return;
+                if (_pinLockEnabled && !_isUnlocked) {
+                    bar.classList.add('visible');
+                } else {
+                    bar.classList.remove('visible');
+                    // Clear any lingering errors
+                    const errEl = document.getElementById(`pinError-${tab}`);
+                    if (errEl) errEl.textContent = '';
+                }
+            });
+            // Channels tab overlay
+            const overlay = document.getElementById('channelsLockedOverlay');
+            const manager = document.getElementById('channelManager');
+            if (overlay && manager) {
+                if (_pinLockEnabled && !_isUnlocked) {
+                    overlay.classList.add('visible');
+                    manager.style.display = 'none';
+                } else {
+                    overlay.classList.remove('visible');
+                    manager.style.display = '';
+                }
+            }
+        }
+
+        async function submitPin(tabContext) {
+            const input = document.getElementById(`pinInput-${tabContext}`);
+            const errEl = document.getElementById(`pinError-${tabContext}`);
+            if (!input) return;
+            const pin = input.value.trim();
+            if (!pin) { errEl.textContent = 'Enter your PIN.'; return; }
+
+            try {
+                const res = await fetch(`${API_BASE}/auth/unlock?pin=${encodeURIComponent(pin)}`, {
+                    method: 'POST'
+                });
+                const data = await res.json();
+                if (!res.ok) {
+                    // Wrong PIN — shake the input
+                    errEl.textContent = data.detail || 'Incorrect PIN.';
+                    input.classList.add('shake');
+                    input.value = '';
+                    setTimeout(() => input.classList.remove('shake'), 400);
+                    return;
+                }
+                // Success
+                _pinToken = data.token || null;
+                _isUnlocked = true;
+                _updatePadlockIcon();
+                _updateAllPinBars();
+                errEl.textContent = '';
+                input.value = '';
+
+                // Reload content for the tab that was just unlocked
+                if (tabContext === 'feed' || tabContext === 'channels') {
+                    await loadChannels();
+                    await refreshFeed();
+                }
+                if (tabContext === 'favorites') await loadFavorites();
+                if (tabContext === 'library')   await loadLibrary();
+                if (tabContext === 'channels')  await loadChannels();
+
+                log(`Session unlocked. Locked channels are now visible.`, 'success');
+            } catch (e) {
+                errEl.textContent = `Error: ${e.message}`;
+            }
+        }
+
+        async function lockSession() {
+            try {
+                const headers = {};
+                if (_pinToken) headers['X-WatchDawg-Token'] = _pinToken;
+                await fetch(`${API_BASE}/auth/lock`, { method: 'POST', headers });
+            } catch (_) {}
+            _pinToken = null;
+            _isUnlocked = false;
+            _updatePadlockIcon();
+            _updateAllPinBars();
+            // Reload to hide locked content immediately
+            await refreshFeed();
+            await loadFavorites();
+            log('Session locked. Sensitive channels hidden.', 'warn');
+        }
+
+        function handlePinLockBtnClick() {
+            if (_isUnlocked) {
+                lockSession();
+            } else {
+                // Focus the PIN input on whichever tab is currently active
+                const activeTab = document.querySelector('.tab-content.active');
+                if (activeTab) {
+                    const input = activeTab.querySelector('.pin-bar-input');
+                    if (input) { input.focus(); return; }
+                }
+                // Fallback: focus feed PIN bar
+                const feedInput = document.getElementById('pinInput-feed');
+                if (feedInput) feedInput.focus();
+            }
+        }
+
+        // =====================================================================
+        //  CHANNEL LOCK TOGGLE
+        // =====================================================================
+        async function toggleChannelLock(channelId, currentlyLocked) {
+            const newLocked = !currentlyLocked;
+            try {
+                const headers = { 'Content-Type': 'application/json' };
+                if (_pinToken) headers['X-WatchDawg-Token'] = _pinToken;
+                const res = await fetch(`${API_BASE}/channel/${channelId}/lock`, {
+                    method: 'PATCH',
+                    headers,
+                    body: JSON.stringify({ locked: newLocked }),
+                });
+                if (!res.ok) {
+                    const err = await res.json();
+                    throw new Error(err.detail || 'Lock toggle failed');
+                }
+                const data = await res.json();
+                log(`Channel "${data.name}": ${data.status}`, 'success');
+                await loadChannels();
+                await refreshFeed();
+            } catch (e) { log(`Lock toggle failed: ${e.message}`, 'error'); }
+        }
+
         // =====================================================================
         //  INIT
         // =====================================================================
         checkHealth();
         setInterval(checkHealth, 30000);
+        // Background stale-card sweep — cleans up cards deleted by the server-side
+        // dedup scheduler without requiring a full page reload.
+        setInterval(sweepStaleCards, 5 * 60 * 1000);
 
-        // Load channels first (builds feed sidebar), then load favorites + feed
-        loadChannels().then(() => {
-            loadFavorites().then(() => loadFeed());
+        // Check PIN lock status first, then load content
+        checkAuthStatus().then(() => {
+            loadChannels().then(() => {
+                loadFavorites().then(() => loadFeed());
+            });
         });
     </script>
 

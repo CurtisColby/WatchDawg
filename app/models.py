@@ -43,6 +43,13 @@ class Channel(Base):
       - vimeo_channel     (e.g., url="https://vimeo.com/channels/eroticas/videos")
       - ytdlp_playlist    (e.g., url="https://www.youtube.com/playlist?list=...")
                           Generic catch-all for any yt-dlp-compatible playlist URL.
+
+    PIN Lock:
+      - locked=True means this channel's videos are hidden from feed, favorites,
+        and library responses until a valid session token is provided in the
+        X-WatchDawg-Token request header.
+      - The lock is enforced exclusively server-side — the client never makes
+        gating decisions.
     """
 
     __tablename__ = "channels"
@@ -66,6 +73,12 @@ class Channel(Base):
     unique_key = Column(String(500), nullable=False, unique=True)
 
     enabled = Column(Boolean, nullable=False, default=True)
+
+    # PIN Lock — when True, this channel's videos are hidden unless the
+    # caller supplies a valid X-WatchDawg-Token header issued by POST /auth/unlock.
+    # Migration: ALTER TABLE channels ADD COLUMN locked INTEGER DEFAULT 0
+    locked = Column(Boolean, nullable=False, default=False)
+
     last_scraped_at = Column(DateTime, nullable=True)
     last_scrape_count = Column(Integer, nullable=True)  # Videos found last scrape
 
@@ -74,7 +87,10 @@ class Channel(Base):
     )
 
     def __repr__(self) -> str:
-        return f"<Channel id={self.id} name='{self.name}' type={self.channel_type} enabled={self.enabled}>"
+        return (
+            f"<Channel id={self.id} name='{self.name}' "
+            f"type={self.channel_type} enabled={self.enabled} locked={self.locked}>"
+        )
 
 
 class Video(Base):

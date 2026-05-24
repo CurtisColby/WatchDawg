@@ -8,7 +8,7 @@ Secrets have no defaults — the app will refuse to start without them.
 
 from pydantic_settings import BaseSettings
 from pydantic import Field
-from typing import List
+from typing import List, Optional
 
 
 class Settings(BaseSettings):
@@ -45,6 +45,17 @@ class Settings(BaseSettings):
 
     # --- Timezone ---
     timezone: str = Field(default="America/Chicago")
+
+    # --- PIN Lock ---
+    # Optional. When set, channels marked locked=True are hidden from all API
+    # responses until POST /auth/unlock is called with this PIN and the returned
+    # token is passed as X-WatchDawg-Token on subsequent requests.
+    # If not set, locking is disabled and all content is always visible.
+    # A startup warning is logged when this is absent.
+    watchdawg_pin: Optional[str] = Field(
+        default=None,
+        description="PIN code for locking sensitive channels. Optional — if unset, locking is disabled.",
+    )
 
     @property
     def subreddit_list(self) -> List[str]:

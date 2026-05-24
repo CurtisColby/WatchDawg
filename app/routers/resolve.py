@@ -256,32 +256,53 @@ async def reset_failed_videos(
 @router.post("/backfill-thumbnails")
 async def backfill_thumbnails(
     limit: int = Query(50, ge=1, le=500),
+    channel_ids: Optional[str] = Query(
+        None,
+        description="Comma-separated channel IDs to restrict backfill to. If omitted, runs across all channels."
+    ),
     db: AsyncSession = Depends(get_db_session),
 ):
-    """Fetch missing thumbnails via yt-dlp metadata pass (no stream resolution)."""
+    """Fetch missing thumbnails via yt-dlp metadata pass (no stream resolution), optionally scoped to channels."""
+    parsed_ids = _parse_channel_ids(channel_ids)
     resolver = ResolverService(db)
-    summary = await resolver.backfill_thumbnails(limit=limit)
+    summary = await resolver.backfill_thumbnails(limit=limit, channel_ids=parsed_ids)
     return {"status": "complete", "summary": summary}
 
 
 @router.post("/purge-dash")
-async def purge_dash_videos(db: AsyncSession = Depends(get_db_session)):
-    """Delete all videos that resolved to a DASH stream (unplayable in browser)."""
+async def purge_dash_videos(
+    channel_ids: Optional[str] = Query(
+        None,
+        description="Comma-separated channel IDs to restrict purge to. If omitted, purges across all channels."
+    ),
+    db: AsyncSession = Depends(get_db_session),
+):
+    """Delete all videos that resolved to a DASH stream (unplayable in browser), optionally scoped to channels."""
+    parsed_ids = _parse_channel_ids(channel_ids)
     resolver = ResolverService(db)
-    deleted_count = await resolver.purge_dash_videos()
-    logger.info(f"Purged {deleted_count} DASH-only videos")
+    deleted_count = await resolver.purge_dash_videos(channel_ids=parsed_ids)
+    scope = f"channels {parsed_ids}" if parsed_ids else "all channels"
+    logger.info(f"Purged {deleted_count} DASH-only videos ({scope})")
     return {"status": "purged", "deleted_count": deleted_count,
-            "message": f"Deleted {deleted_count} DASH-only videos from the database."}
+            "message": f"Deleted {deleted_count} DASH-only videos from the database ({scope})."}
 
 
 @router.post("/purge-dead")
-async def purge_dead_videos(db: AsyncSession = Depends(get_db_session)):
-    """Delete all failed videos from the database."""
+async def purge_dead_videos(
+    channel_ids: Optional[str] = Query(
+        None,
+        description="Comma-separated channel IDs to restrict purge to. If omitted, purges across all channels."
+    ),
+    db: AsyncSession = Depends(get_db_session),
+):
+    """Delete failed videos from the database, optionally scoped to channels."""
+    parsed_ids = _parse_channel_ids(channel_ids)
     resolver = ResolverService(db)
-    deleted_count = await resolver.purge_dead_videos()
-    logger.info(f"Purged {deleted_count} dead videos")
+    deleted_count = await resolver.purge_dead_videos(channel_ids=parsed_ids)
+    scope = f"channels {parsed_ids}" if parsed_ids else "all channels"
+    logger.info(f"Purged {deleted_count} dead videos ({scope})")
     return {"status": "purged", "deleted_count": deleted_count,
-            "message": f"Deleted {deleted_count} failed videos from the database."}
+            "message": f"Deleted {deleted_count} failed videos from the database ({scope})."}
 
 
 @router.post("/purge-duplicates")
