@@ -687,6 +687,131 @@ class ResolverService:
         )
         return summary
 
+    async def upgrade_low_quality(
+        self,
+        min_height: int = 720,
+        chunk_size: int = 25,
+        chunk_offset: int = 0,
+        channel_ids: Optional[list] = None,
+    ) -> dict:
+        """
+        Quality upgrade pass — re-resolves videos that are confirmed low-quality
+        and replaces their stream URL only if yt-dlp returns a higher resolution.
+
+        Strategy:
+        - Selects `chunk_size` resolved videos whose stored resolved_format
+          indicates a height below `min_height` (e.g. 480p, 360p, 240p).
+        - `chunk_offset` allows the scheduler to walk through the full set
+          across multiple ticks without repeating the same videos every time.
+        - Re-runs yt-dlp with the existing FORMAT_SELECTOR (prefers 1080p MP4).
+        - Compares returned height against stored height:
+            - Higher → replace stream URL and format note, log upgrade.
+            - Same or lower → leave untouched, log skip.
+        - Never deletes a video. On any error, skips to the next one.
+        - Commits after each successful upgrade so partial progress is saved.
+
+        Returns a summary dict for logging.
+        """
+        import re as _re
+
+        def _parse_height(format_note: Optional[str]) -> Optional[int]:
+            """Extract numeric height from format_note like 'mp4/480p' or '480p'."""
+            if not format_note:
+                return None
+            m = _re.search(r'(\d+)p', format_note)
+            return int(m.group(1)) if m else None
+
+        # Select resolved videos whose format note suggests below min_height.
+        # We filter in Python after the DB fetch since format parsing needs regex.
+        stmt = (
+            select(Video)
+            .where(
+                Video.resolution_status == "resolved",
+                Video.resolved_format.isnot(None),
+            )
+            .order_by(Video.reddit_score.desc().nullslast())
+            .offset(chunk_offset)
+            .limit(chunk_size * 4)  # over-fetch so we have enough after height filter
+        )
+        if channel_ids:
+            stmt = stmt.where(Video.channel_id.in_(channel_ids))
+        result = await self._db.execute(stmt)
+        candidates = result.scalars().all()
+
+        # Filter to those actually below the quality threshold
+        low_quality = [
+            v for v in candidates
+            if (_parse_height(v.resolved_format) or 9999) < min_height
+        ][:chunk_size]
+
+        summary = {
+            "checked": len(low_quality),
+            "upgraded": 0,
+            "same_or_lower": 0,
+            "errored": 0,
+            "skipped_permanent": 0,
+        }
+
+        for video in low_quality:
+            old_height = _parse_height(video.resolved_format)
+            try:
+                logger.info(
+                    f"Quality upgrade check: video {video.id} "
+                    f"'{(video.title or '')[:50]}' current={video.resolved_format}"
+                )
+                stream_info, error_msg, is_permanent = await self._extract_with_ytdlp(
+                    video.source_url
+                )
+
+                if stream_info is None:
+                    if is_permanent:
+                        logger.info(
+                            f"Quality upgrade: video {video.id} is permanently gone — skipping."
+                        )
+                        summary["skipped_permanent"] += 1
+                    else:
+                        logger.warning(
+                            f"Quality upgrade: transient error for video {video.id}: {error_msg}"
+                        )
+                        summary["errored"] += 1
+                    await asyncio.sleep(1.0)
+                    continue
+
+                new_height = stream_info.height or _parse_height(stream_info.format_note)
+
+                if new_height and old_height and new_height > old_height:
+                    logger.info(
+                        f"Quality upgrade: video {video.id} "
+                        f"{old_height}p → {new_height}p ({stream_info.format_note})"
+                    )
+                    video.resolved_stream_url = stream_info.stream_url
+                    video.resolved_format = stream_info.format_note
+                    video.resolved_at = datetime.datetime.utcnow()
+                    await self._db.commit()
+                    summary["upgraded"] += 1
+                else:
+                    logger.info(
+                        f"Quality upgrade: video {video.id} no improvement "
+                        f"(current={old_height}p new={new_height}p) — leaving unchanged."
+                    )
+                    summary["same_or_lower"] += 1
+
+            except Exception as e:
+                logger.warning(
+                    f"Quality upgrade: unexpected error for video {video.id}: {e} — skipping."
+                )
+                summary["errored"] += 1
+
+            await asyncio.sleep(1.0)
+
+        logger.info(
+            f"Quality upgrade complete: {summary['upgraded']} upgraded, "
+            f"{summary['same_or_lower']} unchanged, {summary['errored']} errored, "
+            f"{summary['skipped_permanent']} permanent-gone "
+            f"out of {summary['checked']} checked"
+        )
+        return summary
+
     async def purge_dash_videos(self, channel_ids: Optional[list] = None) -> int:
         """Delete all videos whose resolved stream URL is a DASH manifest, optionally scoped to channels."""
         stmt = select(Video).where(Video.resolution_status == "resolved")

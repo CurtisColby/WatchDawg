@@ -206,6 +206,7 @@
         .btn-primary { background: var(--accent-orange); color: var(--bg-primary); border-color: var(--accent-orange); font-weight: 600; }
         .btn-primary:hover { background: #ff8555; border-color: #ff8555; }
         .btn:disabled { opacity: 0.4; cursor: not-allowed; pointer-events: none; }
+        .controls { display: flex; align-items: center; gap: 10px; padding: 10px 24px; border-bottom: 1px solid var(--border-subtle); background: var(--bg-primary); flex-shrink: 0; flex-wrap: wrap; }
         .controls-spacer { flex: 1; }
         .video-count { font-family: 'JetBrains Mono', monospace; font-size: 13px; color: var(--text-secondary); }
 
@@ -526,6 +527,9 @@
         .btn-icon-danger:hover { border-color: var(--accent-red); color: var(--accent-red); background: var(--accent-red-dim); }
         .btn-icon-warn:hover { border-color: var(--accent-yellow); color: var(--accent-yellow); background: var(--accent-yellow-dim); }
         .btn-icon-edit:hover { border-color: var(--accent-blue); color: var(--accent-blue); background: var(--accent-blue-dim); }
+        .btn-icon-blue { color: var(--accent-blue); }
+        .btn-icon-blue:hover { border-color: var(--accent-blue); color: var(--accent-blue); background: var(--accent-blue-dim); }
+        .btn-icon-blue.spinning { color: var(--accent-blue); animation: spin 1s linear infinite; }
         .channel-empty { text-align: center; padding: 60px 20px; color: var(--text-muted); }
         .channel-empty h3 { font-size: 18px; color: var(--text-secondary); margin-bottom: 8px; }
         .channel-empty p { font-size: 14px; max-width: 500px; margin: 0 auto 20px; line-height: 1.7; }
@@ -908,7 +912,7 @@
 
     <!-- FAVORITES TAB -->
     <div class="tab-content" id="tab-favorites">
-        <div class="controls">
+        <div class="controls" id="favControlsBar">
             <button class="btn" onclick="loadFavorites()">&#x21BB; Refresh</button>
             <button class="btn" id="btnFavPlayAll" onclick="favPlayAll(false)">&#x25B6;&#xFE0F; Play All</button>
             <button class="btn" id="btnFavShuffle" onclick="favPlayAll(true)">&#x1F500; Shuffle</button>
@@ -942,7 +946,7 @@
 
     <!-- LIBRARY TAB -->
     <div class="tab-content" id="tab-library">
-        <div class="controls">
+        <div class="controls" id="libControlsBar">
             <button class="btn" onclick="loadLibrary()">&#x21BB; Scan Library</button>
             <button class="btn" id="btnLibPlayAll" onclick="libPlayAll(false)">&#x25B6;&#xFE0F; Play All</button>
             <button class="btn" id="btnLibShuffle" onclick="libPlayAll(true)">&#x1F500; Shuffle</button>
@@ -1735,6 +1739,7 @@
                     <div class="channel-actions">
                         <button class="btn-icon btn-icon-edit" onclick="startRename(${ch.id})" title="Rename channel">&#x270F;</button>
                         <button class="btn-icon btn-icon-warn" onclick="scrapeChannel(${ch.id}, '${escapeHtml(ch.name).replace(/'/g, "\\'")}')" title="Scrape this channel now">&#x1F504;</button>
+                        <button class="btn-icon btn-icon-blue" id="upgradeBtn_${ch.id}" onclick="upgradeChannel(${ch.id}, '${escapeHtml(ch.name).replace(/'/g, "\\'")}')" title="Upgrade low-quality videos to higher resolution">&#x2B06;</button>
                         <button class="btn-icon btn-icon-warn" onclick="clearChannelVideos(${ch.id}, '${escapeHtml(ch.name).replace(/'/g, "\\'")}')" title="Clear all videos from this channel">&#x1F9F9;</button>
                         <button class="lock-toggle-btn ${ch.locked ? 'locked' : ''}" onclick="toggleChannelLock(${ch.id}, ${ch.locked})" title="${ch.locked ? 'Unlock channel (click to make visible)' : 'Lock channel (requires PIN to view)'}">${ch.locked ? '&#x1F512;' : '&#x1F513;'}</button>
                         <button class="toggle-switch ${ch.enabled ? 'active' : ''}" onclick="toggleChannel(${ch.id}, ${!ch.enabled})" title="${ch.enabled ? 'Disable' : 'Enable'} channel"></button>
@@ -1840,6 +1845,23 @@
                 await loadChannels();
                 if (document.getElementById('tab-feed').classList.contains('active')) await refreshFeed();
             } catch (e) { log(`Failed to toggle channel: ${e.message}`, 'error'); }
+        }
+
+        async function upgradeChannel(channelId, name) {
+            const btn = document.getElementById(`upgradeBtn_${channelId}`);
+            if (btn) { btn.classList.add('spinning'); btn.disabled = true; }
+            try {
+                const opts = {};
+                if (_pinToken) opts.headers = { 'X-WatchDawg-Token': _pinToken };
+                const res = await fetch(`${API_BASE}/resolve/upgrade?channel_ids=${channelId}&chunk_size=25`, { method: 'POST', ...opts });
+                const data = await res.json();
+                const msg = data.message || data.status || 'Upgrade complete';
+                log(`Upgrade '${name}': ${msg}`, 'success');
+            } catch (e) {
+                log(`Upgrade '${name}' failed: ${e.message}`, 'error');
+            } finally {
+                if (btn) { btn.classList.remove('spinning'); btn.disabled = false; }
+            }
         }
 
         async function scrapeChannel(channelId, name) {
@@ -2154,9 +2176,11 @@
                 if (data.locked_hidden) {
                     currentFavorites = [];
                     document.getElementById('favCount').textContent = '— locked';
+                    document.getElementById('favControlsBar').style.display = 'none';
                     document.getElementById('favoritesGrid').innerHTML = '<div class="empty-state"><div class="empty-state-icon">&#x1F512;</div><h3>Locked</h3><p>Enter your PIN in the header to view Favorites.</p></div>';
                     return;
                 }
+                document.getElementById('favControlsBar').style.display = '';
                 currentFavorites = data.favorites;
                 favoritedVideoIds = new Set(data.favorites.map(f => f.video_id));
                 document.getElementById('favCount').textContent = `${data.favorites.length} favorites`;
@@ -2202,9 +2226,11 @@
                 if (data.locked_hidden) {
                     countEl.textContent = '— locked';
                     currentLibrary = [];
+                    document.getElementById('libControlsBar').style.display = 'none';
                     document.getElementById('libraryGrid').innerHTML = '<div class="empty-state"><div class="empty-state-icon">&#x1F512;</div><h3>Locked</h3><p>Enter your PIN in the header to view Library.</p></div>';
                     return;
                 }
+                document.getElementById('libControlsBar').style.display = '';
                 currentLibrary = data.files;
                 countEl.textContent = `${data.total} files`;
                 buildLibSidebar(currentLibrary);

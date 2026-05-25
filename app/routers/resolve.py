@@ -329,3 +329,48 @@ async def purge_duplicate_cdn_files(db: AsyncSession = Depends(get_db_session)):
             f"kept {summary['kept_count']} best copies."
         ),
     }
+
+
+@router.post("/upgrade")
+async def upgrade_quality(
+    channel_ids: Optional[str] = Query(
+        None,
+        description="Comma-separated channel IDs to restrict upgrade to. If omitted, upgrades across all channels.",
+    ),
+    chunk_size: int = Query(25, ge=1, le=200, description="Max videos to check per call"),
+    db: AsyncSession = Depends(get_db_session),
+):
+    """
+    Re-resolve low-quality videos (below 720p) and replace their stream URL
+    if yt-dlp finds a better resolution. Only upgrades — never downgrades.
+    Skips on error and continues to the next video.
+
+    Scoped to specific channels when channel_ids is provided, otherwise
+    operates across all channels.
+    """
+    parsed_ids = _parse_channel_ids(channel_ids)
+    resolver = ResolverService(db)
+    summary = await resolver.upgrade_low_quality(
+        min_height=720,
+        chunk_size=chunk_size,
+        chunk_offset=0,
+        channel_ids=parsed_ids,
+    )
+    scope = f"channels {parsed_ids}" if parsed_ids else "all channels"
+    logger.info(
+        f"Manual quality upgrade ({scope}): "
+        f"{summary['upgraded']} upgraded, {summary['checked']} checked"
+    )
+    return {
+        "status": "complete",
+        "scope": scope,
+        "checked": summary["checked"],
+        "upgraded": summary["upgraded"],
+        "same_or_lower": summary["same_or_lower"],
+        "errored": summary["errored"],
+        "message": (
+            f"Checked {summary['checked']} low-quality videos — "
+            f"{summary['upgraded']} upgraded, "
+            f"{summary['same_or_lower']} already at best available quality."
+        ),
+    }

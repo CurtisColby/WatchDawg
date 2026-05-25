@@ -45,6 +45,18 @@ scheduler = AsyncIOScheduler()
 # (pending videos scraped from multiple channels) much faster.
 DEDUP_INTERVAL_HOURS = 2
 
+# Quality upgrade job — interval and chunk config.
+# Runs every 6 hours. Each pass re-resolves up to 25 low-quality videos.
+# chunk_offset rotates by QUALITY_CHUNK_SIZE each tick so different videos
+# are checked each run without repeating the same top-N every time.
+QUALITY_UPGRADE_INTERVAL_HOURS = 6
+QUALITY_UPGRADE_CHUNK_SIZE = 25
+QUALITY_UPGRADE_MIN_HEIGHT = 720  # upgrade anything below 720p
+
+# Rotating offset — incremented each tick so we walk through the full DB
+# set across multiple runs without always re-checking the same top rows.
+_quality_upgrade_offset = 0
+
 # Pending resolve batch size per scheduler tick.
 # Raised from 50 → 200 so new channels resolve within 1-2 ticks instead of
 # potentially sitting for hours behind a large backlog.
@@ -188,6 +200,43 @@ async def scheduled_dedup():
             logger.error(f"Scheduled dedup sweep failed: {e}")
 
 
+async def scheduled_quality_upgrade():
+    """
+    Quality upgrade job. Runs every QUALITY_UPGRADE_INTERVAL_HOURS.
+
+    Re-resolves a chunk of low-quality videos (below QUALITY_UPGRADE_MIN_HEIGHT)
+    and replaces their stream URL only if yt-dlp finds a better resolution.
+    Never deletes videos. Skips on error and moves to the next one.
+
+    Uses a rotating chunk_offset so successive ticks check different rows
+    rather than always hammering the same top-scored low-quality videos.
+    """
+    global _quality_upgrade_offset
+
+    logger.info(
+        f"Scheduled quality upgrade starting "
+        f"(chunk_size={QUALITY_UPGRADE_CHUNK_SIZE}, "
+        f"min_height={QUALITY_UPGRADE_MIN_HEIGHT}p, "
+        f"offset={_quality_upgrade_offset})..."
+    )
+    async with async_session_factory() as db:
+        try:
+            resolver = ResolverService(db)
+            summary = await resolver.upgrade_low_quality(
+                min_height=QUALITY_UPGRADE_MIN_HEIGHT,
+                chunk_size=QUALITY_UPGRADE_CHUNK_SIZE,
+                chunk_offset=_quality_upgrade_offset,
+            )
+            logger.info(f"Scheduled quality upgrade complete: {summary}")
+            # Advance offset for next tick. If we've walked past a reasonable
+            # ceiling (10k rows), reset to 0 to start the cycle again.
+            _quality_upgrade_offset += QUALITY_UPGRADE_CHUNK_SIZE
+            if _quality_upgrade_offset > 10_000:
+                _quality_upgrade_offset = 0
+        except Exception as e:
+            logger.error(f"Scheduled quality upgrade failed: {e}")
+
+
 def start_scheduler():
     """
     Start the background scheduler with configured intervals.
@@ -215,12 +264,22 @@ def start_scheduler():
         next_run_time=None,
     )
 
-    # Dedup sweep — runs every 6 hours, independently of scrape/resolve
+    # Dedup sweep — runs every DEDUP_INTERVAL_HOURS, independently of scrape/resolve
     scheduler.add_job(
         scheduled_dedup,
         trigger=IntervalTrigger(hours=DEDUP_INTERVAL_HOURS),
         id="dedup_job",
         name="CDN Duplicate Sweep",
+        replace_existing=True,
+        next_run_time=None,
+    )
+
+    # Quality upgrade job — re-resolves low-quality videos in chunks across the day
+    scheduler.add_job(
+        scheduled_quality_upgrade,
+        trigger=IntervalTrigger(hours=QUALITY_UPGRADE_INTERVAL_HOURS),
+        id="quality_upgrade_job",
+        name="Quality Upgrade (Low-Res Re-resolve)",
         replace_existing=True,
         next_run_time=None,
     )
@@ -232,6 +291,8 @@ def start_scheduler():
         f"Pending resolve limit: {SCHEDULED_PENDING_LIMIT}/tick. "
         f"Expired resolve limit: {SCHEDULED_EXPIRED_LIMIT}/tick. "
         f"Dedup sweep interval: {DEDUP_INTERVAL_HOURS} hours. "
+        f"Quality upgrade interval: {QUALITY_UPGRADE_INTERVAL_HOURS} hours "
+        f"(chunk={QUALITY_UPGRADE_CHUNK_SIZE}, min={QUALITY_UPGRADE_MIN_HEIGHT}p). "
         f"Jobs will run on the next interval tick (trigger manually for the first run)."
     )
 
