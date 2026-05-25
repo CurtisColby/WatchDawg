@@ -2,10 +2,7 @@
 Resolution API Router.
 
 Endpoints:
-- GET  /resolve/{video_id}               — Resolve a single video, return its stream URL.
-- GET  /resolve/{video_id}/manifest.mpd  — Generate a DASH MPD manifest for TV playback
-                                           (merges split video+audio into one ExoPlayer URI).
-- GET  /resolve/{video_id}/playlist.m3u8 — Legacy M3U8 playlist (kept but not used).
+- GET  /resolve/{video_id}          — Resolve a single video, return its stream URL.
 - POST /resolve/batch               — Resolve a batch of pending videos.
 - POST /resolve/stop                — Signal the running batch to stop after current video.
 - POST /resolve/reset-failed        — Reset failed videos back to pending for retry.
@@ -23,29 +20,13 @@ Stop mechanism:
   POST /resolve/stop sets a server-side flag. The running batch checks this
   flag between each video and exits early if set. The flag resets automatically
   when a new batch starts or when the current batch finishes.
-
-TV Audio Architecture (DASH MPD):
-  The Android TV app cannot merge split video+audio streams via MergingMediaSource
-  (a known Media3 limitation for progressive HTTP sources). Instead, the backend
-  generates a lightweight DASH MPD manifest on-the-fly that describes both the
-  video and audio URLs. ExoPlayer's native DASH engine handles synchronised
-  playback of these two tracks — exactly how YouTube itself serves content.
-
-  Flow:
-    1. Android calls GET /resolve/{id}/manifest.mpd
-    2. Backend calls resolve_video_for_tv() to get split URLs
-    3. Both URLs are proxied through /proxy/stream (so YouTube CDN headers work)
-    4. Backend returns DASH XML with two AdaptationSets (video + audio)
-    5. Android feeds the manifest URL directly to ExoPlayer as a DashMediaSource
-    6. ExoPlayer fetches the manifest, discovers both tracks, plays in sync
 """
 
 import asyncio
 import logging
-import urllib.parse
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Query, HTTPException, Request
+from fastapi import APIRouter, Depends, Query, HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -72,141 +53,20 @@ def _parse_channel_ids(channel_ids: Optional[str]) -> Optional[list[int]]:
     return result
 
 
-def _build_dash_manifest(
-    video_url: str,
-    audio_url: str,
-    title: str = "WatchDawg",
-    duration_seconds: Optional[float] = None,
-) -> str:
-    """
-    Generate a minimal MPEG-DASH MPD manifest that points ExoPlayer at two
-    separate HTTP streams — one video-only and one audio-only.
-
-    ExoPlayer's DashMediaSource reads this manifest and synchronises playback
-    of both tracks natively, which is the correct solution for split streams
-    returned by yt-dlp (e.g. YouTube 1080p video-only + m4a audio-only).
-
-    Design notes:
-    - type="static"  — both URLs are single-file progressive MP4/m4a, not
-                        live/segmented. ExoPlayer handles this correctly.
-    - mediaPresentationDuration — set from actual yt-dlp duration when available.
-                                  Defaults to PT5H (5 hours) which is a safe
-                                  upper bound; ExoPlayer stops when streams end.
-    - AdaptationSet 0 — video track (H.264 / avc1). mimeType video/mp4.
-    - AdaptationSet 1 — audio track (AAC / mp4a.40.2). mimeType audio/mp4.
-    - Codecs are declared explicitly so ExoPlayer does not need to probe them.
-    - Bandwidth values are approximate placeholders; ExoPlayer ignores them for
-      single-representation sets but the field is required by the DASH spec.
-    - BaseURL contains the full proxied URL for each track. ExoPlayer fetches
-      the entire file from that URL — no segmenting needed.
-    """
-    if duration_seconds and duration_seconds > 0:
-        # Format as ISO 8601 duration: PTxHxMx.xS
-        total = int(duration_seconds)
-        hours = total // 3600
-        minutes = (total % 3600) // 60
-        seconds = duration_seconds - (hours * 3600) - (minutes * 60)
-        if hours > 0:
-            iso_duration = f"PT{hours}H{minutes}M{seconds:.3f}S"
-        elif minutes > 0:
-            iso_duration = f"PT{minutes}M{seconds:.3f}S"
-        else:
-            iso_duration = f"PT{seconds:.3f}S"
-    else:
-        # Safe upper bound — ExoPlayer stops when the stream EOF is reached
-        iso_duration = "PT5H"
-
-    # Escape title for XML attribute safety
-    safe_title = title.replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;").replace(">", "&gt;")
-
-    manifest = f"""<?xml version="1.0" encoding="UTF-8"?>
-<MPD
-  xmlns="urn:mpeg:DASH:schema:MPD:2011"
-  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-  xsi:schemaLocation="urn:mpeg:DASH:schema:MPD:2011 DASH-MPD.xsd"
-  type="static"
-  mediaPresentationDuration="{iso_duration}"
-  minBufferTime="PT4S"
-  profiles="urn:mpeg:dash:profile:isoff-on-demand:2011">
-  <ProgramInformation>
-    <Title>{safe_title}</Title>
-  </ProgramInformation>
-  <Period id="0" start="PT0S" duration="{iso_duration}">
-    <AdaptationSet
-      id="0"
-      contentType="video"
-      mimeType="video/mp4"
-      codecs="avc1.640028"
-      frameRate="30"
-      segmentAlignment="true"
-      startWithSAP="1">
-      <Representation
-        id="video"
-        bandwidth="5000000"
-        width="1920"
-        height="1080">
-        <BaseURL>{video_url}</BaseURL>
-      </Representation>
-    </AdaptationSet>
-    <AdaptationSet
-      id="1"
-      contentType="audio"
-      mimeType="audio/mp4"
-      codecs="mp4a.40.2"
-      lang="en"
-      segmentAlignment="true"
-      startWithSAP="1">
-      <AudioChannelConfiguration
-        schemeIdUri="urn:mpeg:dash:23003:3:audio_channel_configuration:2011"
-        value="2"/>
-      <Representation
-        id="audio"
-        bandwidth="128000">
-        <BaseURL>{audio_url}</BaseURL>
-      </Representation>
-    </AdaptationSet>
-  </Period>
-</MPD>"""
-
-    return manifest
-
-
 @router.get("/{video_id}")
 async def resolve_video(
     video_id: int,
     force: bool = Query(False, description="Force re-resolution, bypass cache"),
-    client: str = Query(
-        "browser",
-        description=(
-            "Client hint. 'tv' returns split video_url + audio_url for external player. "
-            "'browser' (default) returns a single combined stream URL."
-        ),
-    ),
     db: AsyncSession = Depends(get_db_session),
 ):
     """
     Resolve a single video and return its direct stream URL.
 
-    TV clients (client=tv):
-      Returns both stream_url (video) and audio_url (audio) as separate fields.
-      NOTE: Prefer GET /resolve/{id}/manifest.mpd for TV playback — it packages
-      the split streams into a DASH manifest that ExoPlayer handles natively
-      with full audio+video sync.
-
-    Browser clients (client=browser, default):
-      Returns a single combined stream URL via the standard yt-dlp resolver.
+    Cache check → yt-dlp (hard 90s timeout) → dedup → result.
+    If this video is a lower-scored CDN duplicate, playback is transparently
+    redirected to the keeper so the user never sees an error.
     """
     resolver = ResolverService(db)
-
-    if client == "tv":
-        result = await resolver.resolve_video_for_tv(video_id)
-        if result is None:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Video {video_id} could not be resolved for TV playback.",
-            )
-        return result
-
     result = await resolver.resolve_video(video_id, force=force)
 
     if result is None:
@@ -217,165 +77,6 @@ async def resolve_video(
         )
 
     return result
-
-
-@router.get("/{video_id}/manifest.mpd")
-async def resolve_video_dash_manifest(
-    video_id: int,
-    request: Request,
-    db: AsyncSession = Depends(get_db_session),
-):
-    """
-    Generate a DASH MPD manifest for TV playback that combines split video and
-    audio streams into a single URI ExoPlayer can play with full audio+video sync.
-
-    This is the correct solution for playing YouTube 1080p+ content (which yt-dlp
-    returns as separate video-only and audio-only URLs) on the Android TV app.
-
-    ExoPlayer's DashMediaSource natively handles the manifest and synchronises
-    both tracks — no MergingMediaSource, no VLC, no server-side muxing needed.
-
-    Flow:
-      1. Calls resolve_video_for_tv() to extract split URLs via yt-dlp
-      2. Proxies both URLs through /proxy/stream (required for YouTube CDN auth)
-      3. Generates DASH XML with separate AdaptationSets for video and audio
-      4. Returns the manifest with Content-Type: application/dash+xml
-
-    If only a combined stream is available (no split), the manifest contains
-    only a video AdaptationSet pointing to the combined URL — ExoPlayer plays it
-    normally with embedded audio.
-
-    Android TV usage:
-      val mediaItem = MediaItem.Builder()
-          .setUri("http://backend/resolve/{id}/manifest.mpd")
-          .setMimeType(MimeTypes.APPLICATION_MPD)
-          .build()
-      val source = DashMediaSource.Factory(dataSourceFactory).createMediaSource(mediaItem)
-      player.setMediaSource(source)
-      player.prepare()
-    """
-    from fastapi.responses import Response
-
-    resolver = ResolverService(db)
-    result = await resolver.resolve_video_for_tv(video_id)
-
-    if result is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Video {video_id} could not be resolved for TV playback.",
-        )
-
-    video_url = result.get("stream_url", "")
-    audio_url = result.get("audio_url")
-    title = result.get("title") or "WatchDawg"
-    duration_seconds = result.get("duration_seconds")
-
-    if not video_url:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Video {video_id} resolved but returned no stream URL.",
-        )
-
-    # Proxy both URLs through the backend so YouTube CDN auth headers are injected
-    # correctly by /proxy/stream. ExoPlayer cannot send the required headers to
-    # googlevideo.com directly — it would get a 403.
-    base_url = str(request.base_url).rstrip("/")
-    proxied_video = f"{base_url}/proxy/stream?url={urllib.parse.quote(video_url, safe='')}"
-
-    if audio_url:
-        proxied_audio = f"{base_url}/proxy/stream?url={urllib.parse.quote(audio_url, safe='')}"
-        logger.info(
-            f"DASH manifest: video {video_id} | split=yes | "
-            f"duration={duration_seconds}s | title='{title[:50]}'"
-        )
-        manifest = _build_dash_manifest(
-            video_url=proxied_video,
-            audio_url=proxied_audio,
-            title=title,
-            duration_seconds=duration_seconds,
-        )
-    else:
-        # Combined stream — wrap in a minimal single-track manifest so the
-        # Android app can always use the same DashMediaSource code path.
-        logger.info(
-            f"DASH manifest: video {video_id} | split=no (combined stream) | "
-            f"duration={duration_seconds}s"
-        )
-        manifest = _build_dash_manifest(
-            video_url=proxied_video,
-            audio_url=None,
-            title=title,
-            duration_seconds=duration_seconds,
-        )
-
-    return Response(
-        content=manifest,
-        media_type="application/dash+xml",
-        headers={
-            "Cache-Control": "no-cache, no-store, must-revalidate",
-            "Content-Disposition": f'inline; filename="video_{video_id}.mpd"',
-        },
-    )
-
-
-@router.get("/{video_id}/playlist.m3u8")
-async def resolve_video_playlist(
-    video_id: int,
-    request: Request,
-    db: AsyncSession = Depends(get_db_session),
-):
-    """
-    Legacy M3U8 playlist endpoint (kept for reference, not used by TV app).
-
-    VLC plays M3U8 entries sequentially, not simultaneously — so this approach
-    does not solve the split audio+video problem. Use /manifest.mpd instead.
-
-    Returns an M3U8 playlist with both video and audio URLs proxied through
-    the backend. URLs are proxied via /proxy/stream so YouTube CDN headers
-    are handled correctly.
-    """
-    from fastapi.responses import PlainTextResponse
-
-    resolver = ResolverService(db)
-    result = await resolver.resolve_video_for_tv(video_id)
-
-    if result is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Video {video_id} could not be resolved.",
-        )
-
-    video_url = result.get("stream_url", "")
-    audio_url = result.get("audio_url", "")
-    title = result.get("title") or "WatchDawg"
-
-    base_url = str(request.base_url).rstrip("/")
-    proxied_video = f"{base_url}/proxy/stream?url={urllib.parse.quote(video_url, safe='')}"
-    proxied_audio = (
-        f"{base_url}/proxy/stream?url={urllib.parse.quote(audio_url, safe='')}"
-        if audio_url else None
-    )
-
-    if proxied_audio:
-        playlist = (
-            f"#EXTM3U\n"
-            f"#EXTINF:-1,{title}\n"
-            f"{proxied_video}\n"
-            f"#EXTINF:-1,Audio\n"
-            f"{proxied_audio}\n"
-        )
-    else:
-        playlist = (
-            f"#EXTM3U\n"
-            f"#EXTINF:-1,{title}\n"
-            f"{proxied_video}\n"
-        )
-
-    return PlainTextResponse(
-        content=playlist,
-        media_type="audio/x-mpegurl",
-        headers={"Cache-Control": "no-cache"},
-    )
 
 
 @router.post("/batch")
@@ -437,8 +138,8 @@ async def resolve_batch(
         expired_result = await db.execute(expired_stmt)
         expired_videos = expired_result.scalars().all()
         all_videos = list(pending_videos) + list(expired_videos)
-
     else:
+        # Global batch via service method — still interleaves abort check
         import datetime
         pending_stmt = (
             select(Video)
@@ -466,6 +167,7 @@ async def resolve_batch(
     summary = {"total": len(all_videos), "resolved": 0, "failed": 0, "deleted": 0, "stopped": False}
 
     for video in all_videos:
+        # Check abort flag before each video
         if _batch_abort_requested:
             logger.info("Batch resolve: stop requested — exiting early.")
             summary["stopped"] = True
@@ -491,7 +193,7 @@ async def resolve_batch(
         f"{summary['deleted']} deleted out of {summary['total']}"
     )
 
-    _batch_abort_requested = False
+    _batch_abort_requested = False  # Reset flag after batch completes
     return {"status": "complete", "summary": summary}
 
 
@@ -581,11 +283,8 @@ async def purge_dash_videos(
     deleted_count = await resolver.purge_dash_videos(channel_ids=parsed_ids)
     scope = f"channels {parsed_ids}" if parsed_ids else "all channels"
     logger.info(f"Purged {deleted_count} DASH-only videos ({scope})")
-    return {
-        "status": "purged",
-        "deleted_count": deleted_count,
-        "message": f"Deleted {deleted_count} DASH-only videos from the database ({scope}).",
-    }
+    return {"status": "purged", "deleted_count": deleted_count,
+            "message": f"Deleted {deleted_count} DASH-only videos from the database ({scope})."}
 
 
 @router.post("/purge-dead")
@@ -602,11 +301,8 @@ async def purge_dead_videos(
     deleted_count = await resolver.purge_dead_videos(channel_ids=parsed_ids)
     scope = f"channels {parsed_ids}" if parsed_ids else "all channels"
     logger.info(f"Purged {deleted_count} dead videos ({scope})")
-    return {
-        "status": "purged",
-        "deleted_count": deleted_count,
-        "message": f"Deleted {deleted_count} failed videos from the database ({scope}).",
-    }
+    return {"status": "purged", "deleted_count": deleted_count,
+            "message": f"Deleted {deleted_count} failed videos from the database ({scope})."}
 
 
 @router.post("/purge-duplicates")

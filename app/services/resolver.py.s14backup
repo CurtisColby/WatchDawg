@@ -64,16 +64,11 @@ YTDLP_TIMEOUT_SECONDS = 90
 _process_pool = concurrent.futures.ProcessPoolExecutor(max_workers=4)
 
 FORMAT_SELECTOR = (
-    # Prefer combined mp4 streams (video+audio) up to 1080p
-    "best[height<=1080][ext=mp4][vcodec!*=none][acodec!*=none]/"
-    "best[ext=mp4][vcodec!*=none][acodec!*=none]/"
+    "best[height<=1080][ext=mp4][vcodec!*=none][acodec!*=none][protocol^=http]/"
+    "best[ext=mp4][vcodec!*=none][acodec!*=none][protocol^=http]/"
+    "best[vcodec!*=none][acodec!*=none][protocol^=http]/"
     "best[vcodec!*=none][acodec!*=none][protocol!=http_dash_segments]/"
     "best[vcodec!*=none][acodec!*=none]/"
-    # HLS combined streams — YouTube serves these with video+audio merged (e.g. 1080p m3u8).
-    "best[protocol=m3u8_native][vcodec!*=none][acodec!*=none]/"
-    "best[protocol^=m3u8][vcodec!*=none][acodec!*=none]/"
-    # Format 18 fallback — 360p combined mp4
-    "18/"
     "best[protocol!=http_dash_segments]/"
     "best"
 )
@@ -198,9 +193,6 @@ def _extract_sync_worker(url: str, cookies_path: Optional[str]) -> Tuple[Optiona
         "socket_timeout": 30,
         "retries": 3,
         "fragment_retries": 3,
-        # Use Node.js for YouTube JS challenge solving. The Python API requires a
-        # dict format: {runtime_name: {options}}. Empty dict means use defaults.
-        "js_runtimes": {"node": {}},
     }
 
     if cookies_path and os.path.isfile(cookies_path):
@@ -263,113 +255,6 @@ def _extract_sync_worker(url: str, cookies_path: Optional[str]) -> Tuple[Optiona
         return None, f"Transient: {error_msg[:300]}", False
 
 
-def _extract_tv_sync_worker(url: str, cookies_path: Optional[str]) -> Tuple[Optional[dict], Optional[str], bool]:
-    """
-    TV-specific yt-dlp extraction. Returns both video_url and audio_url separately
-    so the client can pass them to VLC or another external player that can merge
-    split streams natively — something ExoPlayer cannot do without a manifest.
-
-    Format selector targets the best split stream (bestvideo+bestaudio) with no
-    height cap. For YouTube this gets 1080p/1440p/4K video + separate audio.
-    For sources that only have combined streams, audio_url will be None and
-    stream_url covers both tracks.
-
-    Returns (stream_info_dict | None, error_msg | None, is_permanent: bool).
-    """
-    import yt_dlp
-
-    TV_FORMAT_SELECTOR = (
-        "bestvideo[vcodec^=avc1]+bestaudio[ext=m4a]/"
-        "bestvideo[vcodec^=avc1]+bestaudio/"
-        "bestvideo+bestaudio[ext=m4a]/"
-        "bestvideo+bestaudio/"
-        "best"
-    )
-
-    ydl_opts = {
-        "format": TV_FORMAT_SELECTOR,
-        "quiet": True,
-        "no_warnings": True,
-        "extract_flat": False,
-        "skip_download": True,
-        "simulate": True,
-        "socket_timeout": 30,
-        "retries": 3,
-        "fragment_retries": 3,
-        # Use Node.js for YouTube JS challenge solving.
-        "js_runtimes": {"node": {}},
-    }
-
-    if cookies_path and os.path.isfile(cookies_path):
-        ydl_opts["cookiefile"] = cookies_path
-
-    permanent_keywords = [
-        "http error 404", "not found", "video unavailable", "private video",
-        "removed by the uploader", "account terminated", "copyright claim",
-        "violates youtube", "content warning", "sign in to confirm your age",
-        "join this channel to get access", "members-only content",
-        "this video has been removed", "video is no longer available",
-        "this video does not exist", "page not found",
-    ]
-
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-
-        if info is None:
-            return None, "yt-dlp returned no info", False
-
-        requested = info.get("requested_formats", [])
-        video_url = None
-        audio_url = None
-        height = info.get("height")
-
-        if len(requested) >= 2:
-            # Split stream — video and audio are separate URLs
-            video_fmt = requested[0]
-            audio_fmt = requested[1]
-            video_url = video_fmt.get("url")
-            audio_url = audio_fmt.get("url")
-            height = video_fmt.get("height") or height
-        elif len(requested) == 1:
-            video_url = requested[0].get("url")
-        else:
-            video_url = info.get("url")
-
-        if not video_url:
-            all_formats = info.get("formats", [])
-            if all_formats:
-                video_url = all_formats[-1].get("url")
-
-        if not video_url:
-            return None, "No video URL found in yt-dlp output", False
-
-        ext = info.get("ext", "unknown")
-        format_note = f"{ext}/{height}p" if height else ext
-
-        return {
-            "stream_url": video_url,
-            "audio_url": audio_url,
-            "format_note": format_note,
-            "width": info.get("width"),
-            "height": height,
-            "duration": info.get("duration"),
-            "thumbnail": info.get("thumbnail"),
-            "title": info.get("title"),
-            "uploader": info.get("uploader"),
-            "protocol": info.get("protocol", "unknown"),
-            "ext": ext,
-        }, None, False
-
-    except Exception as e:
-        error_msg = str(e)
-        error_lower = error_msg.lower()
-        for keyword in permanent_keywords:
-            if keyword in error_lower:
-                return None, f"Permanent: {error_msg[:300]}", True
-        return None, f"Transient: {error_msg[:300]}", False
-
-
 def _fetch_thumbnail_sync_worker(url: str, cookies_path: Optional[str]) -> Optional[str]:
     """Module-level thumbnail fetch — picklable for ProcessPoolExecutor."""
     import yt_dlp
@@ -405,10 +290,8 @@ class StreamInfo:
     """Result of a successful resolution."""
 
     def __init__(self, stream_url, format_note="", width=None, height=None,
-                 duration=None, thumbnail=None, title=None, uploader=None,
-                 audio_url=None):
+                 duration=None, thumbnail=None, title=None, uploader=None):
         self.stream_url = stream_url
-        self.audio_url = audio_url  # Separate audio URL for split streams (TV/VLC path)
         self.format_note = format_note
         self.width = width
         self.height = height
@@ -421,7 +304,6 @@ class StreamInfo:
     def from_dict(cls, d: dict) -> "StreamInfo":
         return cls(
             stream_url=d["stream_url"],
-            audio_url=d.get("audio_url"),
             format_note=d.get("format_note", ""),
             width=d.get("width"),
             height=d.get("height"),
@@ -648,113 +530,6 @@ class ResolverService:
             "stream_url": video.resolved_stream_url,
             "format": video.resolved_format,
             "resolved_at": video.resolved_at.isoformat() if video.resolved_at else None,
-            "source_url": video.source_url,
-            "thumbnail_url": video.thumbnail_url,
-        }
-
-    async def resolve_video_for_tv(self, video_id: int) -> Optional[dict]:
-        """
-        TV-specific resolution that returns both video_url and audio_url separately.
-
-        This allows the Android TV client to pass split stream URLs directly to
-        VLC (or another external player) which can merge them natively — giving
-        full quality (1080p/1440p/4K) without any server-side transcoding.
-
-        Does NOT cache the result — TV URLs are fetched fresh each time since
-        we need both URLs and the DB only stores one stream_url. The TTL on
-        YouTube URLs is ~6 hours so repeated plays within that window are fast.
-
-        Returns a dict with stream_url (video), audio_url (audio, may be None
-        for combined streams), and the usual metadata fields.
-        """
-        stmt = select(Video).where(Video.id == video_id)
-        result = await self._db.execute(stmt)
-        video = result.scalar_one_or_none()
-
-        if video is None:
-            logger.warning(f"TV resolve: Video ID {video_id} not found")
-            return None
-
-        if video.resolution_status == "failed":
-            logger.debug(f"TV resolve: skipping permanently failed video {video_id}")
-            return None
-
-        # Only YouTube uses the split extractor (bestvideo+bestaudio → DASH manifest).
-        # Vimeo and Reddit serve combined streams and must use the standard resolver
-        # so their CDN URLs are proxied correctly through /proxy/stream.
-        is_youtube = (
-            "youtube.com" in (video.source_url or "") or
-            "youtu.be" in (video.source_url or "") or
-            video.source_provider == "youtube"
-        )
-
-        if not is_youtube:
-            logger.info(
-                f"TV resolve: non-YouTube source ({video.source_provider}) for video {video_id} "
-                f"— using standard resolver"
-            )
-            stream_info, error_msg, is_permanent = await self._extract_with_ytdlp(video.source_url)
-            if stream_info is None:
-                if is_permanent:
-                    logger.warning(f"TV resolve: video {video_id} permanently gone — {error_msg}")
-                    await self._delete_video(video)
-                    await self._db.commit()
-                else:
-                    logger.warning(f"TV resolve: transient error for video {video_id}: {error_msg}")
-                return None
-            return {
-                "id": video.id,
-                "title": video.title,
-                "artist": video.artist,
-                "stream_url": stream_info.stream_url,
-                "audio_url": None,
-                "format": stream_info.format_note,
-                "source_url": video.source_url,
-                "thumbnail_url": video.thumbnail_url,
-            }
-
-        logger.info(f"TV resolve: YouTube — extracting split URLs for video {video_id} '{(video.title or '')[:60]}'")
-
-        loop = asyncio.get_event_loop()
-        try:
-            result_dict, error_msg, is_permanent = await asyncio.wait_for(
-                loop.run_in_executor(
-                    _process_pool,
-                    _extract_tv_sync_worker,
-                    video.source_url,
-                    self._cookies_path,
-                ),
-                timeout=float(YTDLP_TIMEOUT_SECONDS),
-            )
-        except asyncio.TimeoutError:
-            logger.error(f"TV resolve: yt-dlp timed out for video {video_id}")
-            return None
-        except Exception as e:
-            logger.error(f"TV resolve: extraction error for video {video_id}: {e}")
-            return None
-
-        if result_dict is None:
-            if is_permanent:
-                logger.warning(f"TV resolve: video {video_id} permanently gone — {error_msg}")
-                await self._delete_video(video)
-                await self._db.commit()
-            else:
-                logger.warning(f"TV resolve: transient error for video {video_id}: {error_msg}")
-            return None
-
-        audio_url = result_dict.get("audio_url")
-        logger.info(
-            f"TV resolve: video {video_id} | height={result_dict.get('height')} | "
-            f"split={'yes' if audio_url else 'no'}"
-        )
-
-        return {
-            "id": video.id,
-            "title": video.title,
-            "artist": video.artist,
-            "stream_url": result_dict["stream_url"],
-            "audio_url": audio_url,
-            "format": result_dict.get("format_note"),
             "source_url": video.source_url,
             "thumbnail_url": video.thumbnail_url,
         }

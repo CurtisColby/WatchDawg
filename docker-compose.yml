@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   watchdawg:
     build:
@@ -11,6 +9,12 @@ services:
       - "${APP_PORT:-6868}:6868"
     env_file:
       - .env
+    devices:
+      # Pass Intel GPU into container for QuickSync hardware transcoding
+      - /dev/dri:/dev/dri
+    group_add:
+      # Give container permission to use the GPU render device
+      - video
     volumes:
       # SOURCE CODE — live-mounted so deploys are just file copy + restart.
       # The image bakes in a copy of app/ as fallback, but this mount
@@ -28,3 +32,6 @@ services:
       - /media/colby/NAS1/WatchDawg:/music_videos
     environment:
       - TZ=${TIMEZONE:-America/Chicago}
+      # Tell FFmpeg and VA-API where the Intel iHD driver lives inside the container
+      - LIBVA_DRIVER_NAME=iHD
+      - LIBVA_DRIVERS_PATH=/usr/lib/x86_64-linux-gnu/dri

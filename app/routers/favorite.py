@@ -2,22 +2,10 @@
 Favorite / Download API Router.
 
 Endpoints:
-- POST   /favorite/{video_id}         -- Mark a video as favorite and start download.
-- GET    /favorite                     -- List all favorited videos.
-- DELETE /favorite/{favorite_id}       -- Remove a favorite (optionally delete downloaded file).
-- POST   /favorite/{favorite_id}/retry -- Retry a failed/pending download.
-
-Downloads are organised into channel-named subfolders under /music_videos so
-content from different channels stays separate (e.g. /music_videos/Exymodels/).
-Videos with no channel go to /music_videos/Uncategorized/.
-
-PIN Lock:
-- GET /favorite returns an empty list (with locked_hidden=True) if PIN lock
-  is configured and no valid token is supplied.
-- POST /favorite/{video_id} and DELETE work regardless of lock state so that
-  the Android TV client can still favorite while unlocked without needing
-  to replay the token on every action — but on the browser UI these actions
-  are only reachable when unlocked anyway.
+- POST   /favorite/{video_id}         — Mark a video as favorite and start download.
+- GET    /favorite                     — List all favorited videos.
+- DELETE /favorite/{favorite_id}       — Remove a favorite (optionally delete downloaded file).
+- POST   /favorite/{favorite_id}/retry — Retry a failed/pending download.
 """
 
 import asyncio
@@ -26,16 +14,14 @@ import logging
 import os
 import re
 from typing import Optional
-from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query, Header
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db_session, async_session_factory
 from app.models import Video, Favorite, Channel
 from app.config import settings
-from app.routers.auth import is_unlocked
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +58,6 @@ async def favorite_video(
         source_url=video.source_url,
         title=video.title,
         artist=video.artist,
-        channel_id=video.channel_id,
     )
 
     logger.info(f"Favorited video {video_id}: {video.title}")
@@ -85,62 +70,55 @@ async def favorite_video(
 
 
 @router.get("")
-async def list_favorites(
-    x_watchdawg_token: Optional[str] = Header(None),
-    db: AsyncSession = Depends(get_db_session),
-):
+async def list_favorites(db: AsyncSession = Depends(get_db_session)):
     """
     List all favorited videos with their download status.
 
-    PIN lock: Returns an empty list with locked_hidden=True when PIN lock
-    is configured and no valid session token is supplied.
+    Includes channel_id, channel_name, and source_provider so the web UI
+    can build the Favorites sidebar filter grouped by channel.
+    Also returns stream_url for completed local downloads so the player
+    can stream directly without resolving.
     """
-    unlocked = is_unlocked(x_watchdawg_token)
-
-    if not unlocked:
-        # Return graceful empty response — UI will show PIN bar
-        return {
-            "favorites": [],
-            "locked_hidden": True,
-        }
-
-    stmt = select(Favorite, Video).join(Video, Favorite.video_id == Video.id)
+    # Left-join Channel so we get the friendly channel name even when
+    # a video's channel has been deleted (channel_id becomes null).
+    stmt = (
+        select(Favorite, Video, Channel)
+        .join(Video, Favorite.video_id == Video.id)
+        .outerjoin(Channel, Video.channel_id == Channel.id)
+    )
     result = await db.execute(stmt)
     rows = result.all()
 
-    def _derive_stream_url(local_file_path: Optional[str]) -> Optional[str]:
-        """
-        Derive a /library/stream/ URL from the local file path so the
-        Favorites tab can play downloaded files directly without re-resolving.
-        The filename is percent-encoded to handle spaces and unicode chars.
-        """
-        if not local_file_path:
-            return None
-        filename = os.path.basename(local_file_path)
-        if not filename:
-            return None
-        return f"/library/stream/{quote(filename, safe='')}"
+    music_dir = settings.music_videos_path
 
-    return {
-        "favorites": [
-            {
-                "id": fav.id,
-                "video_id": fav.video_id,
-                "title": video.title,
-                "artist": video.artist,
-                "source_url": video.source_url,
-                "thumbnail_url": video.thumbnail_url,
-                "download_status": fav.download_status,
-                "download_error": fav.download_error,
-                "local_file_path": fav.local_file_path,
-                "stream_url": _derive_stream_url(fav.local_file_path),
-                "downloaded_at": fav.downloaded_at.isoformat() if fav.downloaded_at else None,
-                "created_at": fav.created_at.isoformat() if fav.created_at else None,
-            }
-            for fav, video in rows
-        ],
-        "locked_hidden": False,
-    }
+    favorites = []
+    for fav, video, channel in rows:
+        # Build stream_url for files that are confirmed on disk
+        stream_url = None
+        if fav.local_file_path and os.path.isfile(fav.local_file_path):
+            rel = os.path.relpath(fav.local_file_path, music_dir)
+            import urllib.parse
+            stream_url = f"/library/stream/{urllib.parse.quote(rel, safe='/')}"
+
+        favorites.append({
+            "id": fav.id,
+            "video_id": fav.video_id,
+            "title": video.title,
+            "artist": video.artist,
+            "source_url": video.source_url,
+            "source_provider": video.source_provider,
+            "thumbnail_url": video.thumbnail_url,
+            "channel_id": video.channel_id,
+            "channel_name": channel.name if channel else None,
+            "download_status": fav.download_status,
+            "download_error": fav.download_error,
+            "local_file_path": fav.local_file_path,
+            "stream_url": stream_url,
+            "downloaded_at": fav.downloaded_at.isoformat() if fav.downloaded_at else None,
+            "created_at": fav.created_at.isoformat() if fav.created_at else None,
+        })
+
+    return {"favorites": favorites}
 
 
 @router.delete("/{favorite_id}")
@@ -210,7 +188,6 @@ async def retry_download(
         source_url=video.source_url,
         title=video.title,
         artist=video.artist,
-        channel_id=video.channel_id,
     )
 
     logger.info(f"Retrying download for favorite {favorite_id}: {video.title}")
@@ -222,14 +199,13 @@ async def _download_video_task(
     source_url: str,
     title: str,
     artist: Optional[str],
-    channel_id: Optional[int] = None,
 ):
     """
     Background task that downloads a video using yt-dlp.
 
-    Downloads into a channel-named subfolder under music_videos so content
-    from different channels stays organised (e.g. /music_videos/Exymodels/).
-    Falls back to /music_videos/Uncategorized/ for videos with no channel.
+    Uses asyncio.to_thread() to run the synchronous yt-dlp call — this is
+    the correct approach for FastAPI background tasks (avoids the deprecated
+    asyncio.get_event_loop() pattern which can fail in background task context).
     """
     logger.info(f"Download task started: video_id={video_id} url={source_url}")
 
@@ -244,39 +220,47 @@ async def _download_video_task(
                 logger.error(f"Download task: no Favorite record for video_id={video_id}")
                 return
 
+            # Look up channel name for subfolder
+            video_stmt = select(Video).where(Video.id == video_id)
+            video_result = await db.execute(video_stmt)
+            video_rec = video_result.scalar_one_or_none()
+
+            channel_name = None
+            if video_rec and video_rec.channel_id:
+                ch_stmt = select(Channel).where(Channel.id == video_rec.channel_id)
+                ch_result = await db.execute(ch_stmt)
+                ch = ch_result.scalar_one_or_none()
+                if ch:
+                    channel_name = ch.name
+
             favorite.download_status = "downloading"
             favorite.download_error = None
             await db.commit()
             logger.info(f"Download task: status -> downloading (video_id={video_id})")
 
-            # Resolve channel subfolder
+            # Determine output directory: channel subfolder or Uncategorized
             base_dir = settings.music_videos_path
-            subfolder_name = None
-            if channel_id:
-                ch_result = await db.execute(
-                    select(Channel).where(Channel.id == channel_id)
-                )
-                ch = ch_result.scalar_one_or_none()
-                if ch:
-                    subfolder_name = _safe_folder_name(ch.name)
-
-            if subfolder_name:
-                output_dir = os.path.join(base_dir, subfolder_name)
+            if channel_name:
+                # Sanitize channel name for filesystem use
+                safe_channel = re.sub(r'[<>:"/\\|?*]', '', channel_name).strip()
+                safe_channel = re.sub(r'\s+', ' ', safe_channel)
+                output_dir = os.path.join(base_dir, safe_channel) if safe_channel else base_dir
             else:
                 output_dir = os.path.join(base_dir, "Uncategorized")
 
-            logger.info(f"Download task: output_dir={output_dir} (channel={subfolder_name or 'none'})")
+            logger.info(f"Download task: output_dir={output_dir}")
 
-            if not os.path.exists(base_dir):
-                error = f"Base output directory does not exist: {base_dir}"
-                logger.error(f"Download task: {error}")
-                favorite.download_status = "failed"
-                favorite.download_error = error
-                await db.commit()
-                return
-
-            # Create channel subfolder if needed
-            os.makedirs(output_dir, exist_ok=True)
+            if not os.path.exists(output_dir):
+                try:
+                    os.makedirs(output_dir, exist_ok=True)
+                    logger.info(f"Download task: created directory {output_dir}")
+                except Exception as e:
+                    error = f"Cannot create output directory: {output_dir}: {e}"
+                    logger.error(f"Download task: {error}")
+                    favorite.download_status = "failed"
+                    favorite.download_error = error
+                    await db.commit()
+                    return
 
             if not os.access(output_dir, os.W_OK):
                 error = f"Output directory not writable: {output_dir}"
@@ -290,11 +274,11 @@ async def _download_video_task(
             output_path = os.path.join(output_dir, filename)
             logger.info(f"Download task: target={output_path}")
 
-            # Duplicate file check
+            # Duplicate file check — if the file already exists on disk, skip yt-dlp
             existing_path = _find_downloaded_file(output_path)
             if existing_path:
                 logger.info(
-                    f"Download task: file already exists at {existing_path} -- "
+                    f"Download task: file already exists at {existing_path} — "
                     "marking complete without re-downloading"
                 )
                 favorite.download_status = "complete"
@@ -304,6 +288,7 @@ async def _download_video_task(
                 await db.commit()
                 return
 
+            # Use asyncio.to_thread() — correct for FastAPI background tasks
             success, error_msg = await asyncio.to_thread(
                 _download_sync, source_url, output_path
             )
@@ -337,18 +322,8 @@ async def _download_video_task(
                 pass
 
 
-def _safe_folder_name(name: str) -> str:
-    """Convert a channel name into a safe directory name."""
-    safe = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", name)
-    safe = re.sub(r"\s+", " ", safe).strip()
-    safe = safe.strip(". ")
-    if len(safe) > 50:
-        safe = safe[:50].strip()
-    return safe or "Uncategorized"
-
-
 def _find_downloaded_file(expected_path: str) -> Optional[str]:
-    """Find the actual downloaded file -- yt-dlp may change the extension."""
+    """Find the actual downloaded file — yt-dlp may change the extension."""
     if os.path.isfile(expected_path):
         return expected_path
     base = os.path.splitext(expected_path)[0]

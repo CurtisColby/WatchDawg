@@ -130,6 +130,14 @@ class RedditProvider(BaseProvider):
         Parse a single Reddit post into a DiscoveredVideo.
 
         Returns None if the post isn't a video or can't be parsed.
+
+        Source URL strategy:
+        - For Reddit-hosted video (v.redd.it / is_video=True): store the Reddit
+          post permalink (https://www.reddit.com/r/sub/comments/id/slug/). yt-dlp
+          extracts the full muxed stream from the post page — the fallback_url is
+          video-only and produces a gray box with no audio.
+        - For external links (YouTube, Vimeo, etc.): store the external URL
+          directly so yt-dlp resolves it natively.
         """
         # Skip self-posts (text only), stickied mod posts, and removed posts
         if post_data.get("is_self", False):
@@ -144,18 +152,36 @@ class RedditProvider(BaseProvider):
         url = post_data.get("url", "")
         score = post_data.get("score", 0)
         thumbnail = post_data.get("thumbnail", "")
+        permalink = post_data.get("permalink", "")
 
         if not url or not post_id:
             return None
 
-        # Extract the actual video URL
-        video_url = self._extract_video_url(post_data, url)
-        if video_url is None:
-            return None
+        # Determine the source URL to store
+        parsed_url = urlparse(url)
+        domain = parsed_url.netloc.lower()
+        is_reddit_video = (
+            post_data.get("is_video", False) or
+            domain == "v.redd.it"
+        )
+
+        if is_reddit_video:
+            # Use the Reddit post permalink — yt-dlp extracts the full
+            # muxed stream from the post page (video + audio).
+            # The v.redd.it fallback_url is video-only and plays as gray box.
+            if permalink:
+                source_url = f"https://www.reddit.com{permalink.rstrip('/')}"
+            else:
+                source_url = f"https://www.reddit.com/r/{subreddit}/comments/{post_id}/"
+        else:
+            # External link (YouTube, Vimeo, direct mp4, etc.) — validate it
+            video_url = self._extract_video_url(post_data, url)
+            if video_url is None:
+                return None
+            source_url = video_url
 
         # Clean up the thumbnail — Reddit sometimes returns "default", "self", etc.
         if thumbnail in ("default", "self", "nsfw", "spoiler", "image", ""):
-            # Try to get a better thumbnail from preview data
             thumbnail = self._extract_thumbnail(post_data)
 
         # Try to parse artist from title (common format: "Artist - Song Title")
@@ -164,7 +190,7 @@ class RedditProvider(BaseProvider):
         return DiscoveredVideo(
             source_provider="reddit",
             source_post_id=f"reddit_{post_id}",
-            source_url=video_url,
+            source_url=source_url,
             title=title.strip(),
             artist=artist,
             thumbnail_url=thumbnail if thumbnail else None,
