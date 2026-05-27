@@ -6,11 +6,6 @@ Endpoints:
 - GET    /favorite                     — List all favorited videos.
 - DELETE /favorite/{favorite_id}       — Remove a favorite (optionally delete downloaded file).
 - POST   /favorite/{favorite_id}/retry — Retry a failed/pending download.
-
-Internal helpers exported for use by scraper.py:
-- _download_sync()       — synchronous yt-dlp download (runs in thread)
-- _build_filename()      — build a safe filesystem filename from title/artist
-- _find_downloaded_file() — locate the actual file yt-dlp wrote (ext may differ)
 """
 
 import asyncio
@@ -84,6 +79,8 @@ async def list_favorites(db: AsyncSession = Depends(get_db_session)):
     Also returns stream_url for completed local downloads so the player
     can stream directly without resolving.
     """
+    # Left-join Channel so we get the friendly channel name even when
+    # a video's channel has been deleted (channel_id becomes null).
     stmt = (
         select(Favorite, Video, Channel)
         .join(Video, Favorite.video_id == Video.id)
@@ -244,6 +241,7 @@ async def _download_video_task(
             # Determine output directory: channel subfolder or Uncategorized
             base_dir = settings.music_videos_path
             if channel_name:
+                # Sanitize channel name for filesystem use
                 safe_channel = re.sub(r'[<>:"/\\|?*]', '', channel_name).strip()
                 safe_channel = re.sub(r'\s+', ' ', safe_channel)
                 output_dir = os.path.join(base_dir, safe_channel) if safe_channel else base_dir
@@ -290,6 +288,7 @@ async def _download_video_task(
                 await db.commit()
                 return
 
+            # Use asyncio.to_thread() — correct for FastAPI background tasks
             success, error_msg = await asyncio.to_thread(
                 _download_sync, source_url, output_path
             )
@@ -324,10 +323,7 @@ async def _download_video_task(
 
 
 def _find_downloaded_file(expected_path: str) -> Optional[str]:
-    """
-    Find the actual downloaded file — yt-dlp may change the extension.
-    Checks the exact path first, then common video extensions.
-    """
+    """Find the actual downloaded file — yt-dlp may change the extension."""
     if os.path.isfile(expected_path):
         return expected_path
     base = os.path.splitext(expected_path)[0]
@@ -341,9 +337,6 @@ def _find_downloaded_file(expected_path: str) -> Optional[str]:
 def _download_sync(source_url: str, output_path: str) -> tuple:
     """
     Synchronous yt-dlp download. Runs in a thread via asyncio.to_thread().
-
-    Exported for use by scraper.py Reddit auto-download logic.
-
     Returns: (success: bool, error_message: str or None)
     """
     import yt_dlp
@@ -390,10 +383,7 @@ def _download_sync(source_url: str, output_path: str) -> tuple:
 
 
 def _build_filename(title: str, artist: Optional[str]) -> str:
-    """
-    Build a safe filename from title and artist.
-    Exported for use by scraper.py Reddit auto-download logic.
-    """
+    """Build a safe filename from title and artist."""
     if artist and artist.lower() not in title.lower():
         name = f"{artist} - {title}"
     else:
