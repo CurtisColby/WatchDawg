@@ -318,6 +318,74 @@ async def resolve_video_dash_manifest(
     )
 
 
+@router.get("/{video_id}/seek")
+async def resolve_video_seek(
+    video_id: int,
+    t: int = Query(0, ge=0, description="Start position in seconds"),
+    request: Request = None,
+    db: AsyncSession = Depends(get_db_session),
+):
+    """
+    Re-resolve a video and return a fresh manifest URL with a start offset.
+
+    Called by the Android TV app when the user scrubs to a new position.
+    YouTube CDN ignores HTTP Range headers, so the only reliable way to
+    seek is to restart the player from a fresh resolution with the position
+    baked in via the YouTube &range= or by returning a new manifest URL
+    that ExoPlayer loads from the beginning (which plays from second 0 of
+    the stream, but we set startPositionMs so ExoPlayer fast-forwards).
+
+    Returns:
+      {
+        "manifest_url": "http://backend/resolve/{id}/manifest.mpd",
+        "stream_url":   "...",   // fallback for non-DASH
+        "audio_url":    "...",   // null for non-split streams
+        "start_ms":     90000,   // t param converted to ms, echoed back
+        "title":        "...",
+        "thumbnail_url": "..."
+      }
+
+    The app calls playerManager.restartAtPosition() with the returned
+    manifest_url and start_ms — ExoPlayer reloads from the top of the
+    stream but seeks immediately to start_ms before playing.
+    """
+    resolver = ResolverService(db)
+    result = await resolver.resolve_video_for_tv(video_id)
+
+    if result is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Video {video_id} could not be resolved.",
+        )
+
+    video_url = result.get("stream_url", "")
+    audio_url = result.get("audio_url")
+
+    if not video_url:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Video {video_id} resolved but returned no stream URL.",
+        )
+
+    base_url = str(request.base_url).rstrip("/")
+    manifest_url = f"{base_url}/resolve/{video_id}/manifest.mpd"
+    start_ms = t * 1000
+
+    logger.info(
+        f"SEEK RESOLVE | video={video_id} | t={t}s | "
+        f"split={'yes' if audio_url else 'no'}"
+    )
+
+    return {
+        "manifest_url": manifest_url if audio_url else None,
+        "stream_url": video_url,
+        "audio_url": audio_url,
+        "start_ms": start_ms,
+        "title": result.get("title") or "",
+        "thumbnail_url": result.get("thumbnail_url"),
+    }
+
+
 @router.get("/{video_id}/playlist.m3u8")
 async def resolve_video_playlist(
     video_id: int,
