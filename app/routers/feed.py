@@ -13,9 +13,14 @@ live in the Library only — they are permanently excluded from the feed and
 the shuffle ID list so they never appear as unresolvable pending items.
 
 Filtering:
-- provider: filter by source provider name (e.g. 'vimeo', 'youtube', 'reddit')
+- provider:    filter by source provider name (e.g. 'vimeo', 'youtube', 'reddit')
 - channel_ids: comma-separated list of channel IDs to include (sidebar filter)
-- status: filter by resolution status
+- category:    filter by channel category (e.g. 'movies', 'music', 'adult')
+               Omitting returns all categories — fully backward compatible.
+- status:      filter by resolution status
+
+Milestone B: added optional category filter param to GET /feed and GET /feed/ids.
+Android app continues working unchanged — category param is optional and additive.
 """
 
 import datetime
@@ -41,6 +46,7 @@ async def get_feed(
     provider: Optional[str] = Query(None, description="Filter by provider name"),
     channel_id: Optional[int] = Query(None, description="Filter by single channel ID"),
     channel_ids: Optional[str] = Query(None, description="Comma-separated channel IDs to include (sidebar filter)"),
+    category: Optional[str] = Query(None, description="Filter by channel category (movies/tv/music/nature/adult/vimeo/general/live_tv)"),
     status: Optional[str] = Query(None, description="Filter by resolution status"),
     limit: int = Query(100, ge=1, le=1000, description="Max results to return"),
     offset: int = Query(0, ge=0, description="Pagination offset"),
@@ -59,11 +65,20 @@ async def get_feed(
     Used by the sidebar filter. If channel_ids is provided, legacy videos
     with no channel_id are NOT included — only the explicitly selected channels.
     If channel_ids is empty string or results in no valid IDs, returns empty feed.
+
+    The category param filters by channel category (e.g. ?category=movies).
+    Omitting the param returns all categories — fully backward compatible.
     """
-    # Get IDs of all enabled channels
+    # Build enabled channel query — apply category filter at this level if provided
     enabled_stmt = select(Channel.id).where(Channel.enabled == True)
+    if category:
+        enabled_stmt = enabled_stmt.where(Channel.category == category)
     enabled_result = await db.execute(enabled_stmt)
     enabled_channel_ids = [row[0] for row in enabled_result.fetchall()]
+
+    # If category filter applied and no channels match, return empty
+    if category and not enabled_channel_ids:
+        return {"total": 0, "offset": offset, "limit": limit, "videos": []}
 
     # Parse sidebar channel_ids filter if provided
     selected_ids: Optional[List[int]] = None
@@ -84,10 +99,15 @@ async def get_feed(
             return {"total": 0, "offset": offset, "limit": limit, "videos": []}
         base_filter = Video.channel_id.in_(effective_ids)
     else:
-        base_filter = or_(
-            Video.channel_id.in_(enabled_channel_ids),
-            Video.channel_id.is_(None),
-        )
+        if category:
+            # Category filter active — only show videos from matched channels,
+            # not legacy orphan videos (those have no category context)
+            base_filter = Video.channel_id.in_(enabled_channel_ids)
+        else:
+            base_filter = or_(
+                Video.channel_id.in_(enabled_channel_ids),
+                Video.channel_id.is_(None),
+            )
 
     stmt = (
         select(Video)
@@ -140,6 +160,9 @@ async def get_feed(
                 "resolution_status": v.resolution_status,
                 "resolution_error": v.resolution_error,
                 "resolved_stream_url": v.resolved_stream_url,
+                "tmdb_poster_url": v.tmdb_poster_url,
+                "tmdb_year": v.tmdb_year,
+                "tmdb_rating": v.tmdb_rating,
                 "created_at": v.created_at.isoformat() if v.created_at else None,
             }
             for v in videos
@@ -150,6 +173,7 @@ async def get_feed(
 @router.get("/ids")
 async def get_feed_ids(
     channel_ids: Optional[str] = Query(None, description="Comma-separated channel IDs to include (sidebar filter)"),
+    category: Optional[str] = Query(None, description="Filter by channel category"),
     provider: Optional[str] = Query(None, description="Filter by provider name"),
     db: AsyncSession = Depends(get_db_session),
 ):
@@ -159,9 +183,7 @@ async def get_feed_ids(
     Used by the Shuffle All button to instantly build a complete play queue across
     all videos in the database without loading card thumbnails into the DOM first.
 
-    Respects the same channel_ids filter as GET /feed so the sidebar selection is
-    honored — if the user has only Vimeo checked, only Vimeo IDs are returned.
-
+    Respects the same channel_ids and category filters as GET /feed.
     Excludes resolution_status="downloaded" — Library-only Reddit auto-downloads
     are not playable from the feed and must not appear in the shuffle queue.
 
@@ -169,10 +191,15 @@ async def get_feed_ids(
     Returns all matching IDs in a single call — no pagination needed since IDs
     are tiny (4-8 bytes each) and 10,000 IDs is still only ~80KB of JSON.
     """
-    # Get IDs of all enabled channels
+    # Build enabled channel query — apply category filter if provided
     enabled_stmt = select(Channel.id).where(Channel.enabled == True)
+    if category:
+        enabled_stmt = enabled_stmt.where(Channel.category == category)
     enabled_result = await db.execute(enabled_stmt)
     enabled_channel_ids = [row[0] for row in enabled_result.fetchall()]
+
+    if category and not enabled_channel_ids:
+        return {"ids": [], "total": 0}
 
     # Parse sidebar channel_ids filter
     selected_ids: Optional[List[int]] = None
@@ -193,10 +220,13 @@ async def get_feed_ids(
             return {"ids": [], "total": 0}
         base_filter = Video.channel_id.in_(effective_ids)
     else:
-        base_filter = or_(
-            Video.channel_id.in_(enabled_channel_ids),
-            Video.channel_id.is_(None),
-        )
+        if category:
+            base_filter = Video.channel_id.in_(enabled_channel_ids)
+        else:
+            base_filter = or_(
+                Video.channel_id.in_(enabled_channel_ids),
+                Video.channel_id.is_(None),
+            )
 
     stmt = (
         select(Video.id, Video.title)

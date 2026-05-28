@@ -7,8 +7,12 @@ Endpoints:
 - DELETE /channel/{id}               — Remove a channel.
 - PATCH  /channel/{id}               — Toggle enabled/disabled.
 - PATCH  /channel/{id}/lock          — Toggle locked/unlocked (PIN gate).
+- PATCH  /channel/{id}/category      — Set channel category.
 - POST   /channel/{id}/scrape        — Scrape a single channel on demand.
 - DELETE /channel/{id}/videos        — Clear all videos from a channel.
+
+Milestone B: added category field to channel serializer and new
+PATCH /channel/{id}/category endpoint.
 """
 
 import datetime
@@ -23,7 +27,7 @@ from sqlalchemy import select, func, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db_session
-from app.models import Channel, Video, Favorite
+from app.models import Channel, Video, Favorite, VALID_CATEGORIES
 from app.services.scraper import ScraperService
 from app.routers.auth import is_unlocked
 
@@ -37,6 +41,7 @@ router = APIRouter(prefix="/channel", tags=["channel"])
 class ChannelAddRequest(BaseModel):
     url: str = Field(..., description="URL or identifier for the channel")
     name: Optional[str] = Field(None, description="Display name (auto-generated if omitted)")
+    category: Optional[str] = Field("general", description="Content category")
 
 
 class ChannelToggleRequest(BaseModel):
@@ -45,6 +50,10 @@ class ChannelToggleRequest(BaseModel):
 
 class ChannelLockRequest(BaseModel):
     locked: bool
+
+
+class ChannelCategoryRequest(BaseModel):
+    category: str = Field(..., description=f"One of: {', '.join(VALID_CATEGORIES)}")
 
 
 # --- Auto-Detection Logic ---
@@ -218,6 +227,7 @@ def _serialize_channel(ch: Channel, video_count: int = 0) -> dict:
         "url": ch.url,
         "enabled": ch.enabled,
         "locked": ch.locked,
+        "category": ch.category,
         "last_scraped_at": ch.last_scraped_at.isoformat() if ch.last_scraped_at else None,
         "last_scrape_count": ch.last_scrape_count,
         "video_count": video_count,
@@ -246,8 +256,10 @@ async def list_channels(
 
     channel_list = []
     for ch in channels:
-        count_stmt = select(func.count(Video.id)).where(Video.channel_id == ch.id)
-        video_count = (await db.execute(count_stmt)).scalar() or 0
+        count_result = await db.execute(
+            select(func.count(Video.id)).where(Video.channel_id == ch.id)
+        )
+        video_count = count_result.scalar() or 0
         channel_list.append(_serialize_channel(ch, video_count))
 
     return {"channels": channel_list}
@@ -262,11 +274,20 @@ async def add_channel(
     Add a new channel source.
 
     Auto-detects channel type from the URL.
+    Accepts an optional category (defaults to 'general').
     """
     try:
         detected = detect_channel_type(request.url)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+    # Validate category
+    category = (request.category or "general").lower()
+    if category not in VALID_CATEGORIES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid category '{category}'. Must be one of: {', '.join(VALID_CATEGORIES)}"
+        )
 
     existing = await db.execute(
         select(Channel).where(Channel.unique_key == detected["unique_key"])
@@ -286,12 +307,13 @@ async def add_channel(
         unique_key=detected["unique_key"],
         enabled=True,
         locked=False,
+        category=category,
     )
     db.add(channel)
     await db.commit()
     await db.refresh(channel)
 
-    logger.info(f"Added channel: {channel.name} ({channel.channel_type})")
+    logger.info(f"Added channel: {channel.name} ({channel.channel_type}) category={category}")
 
     return {
         "status": "added",
@@ -390,6 +412,46 @@ async def toggle_channel_lock(
         "channel_id": channel_id,
         "name": channel.name,
         "locked": channel.locked,
+    }
+
+
+@router.patch("/{channel_id}/category")
+async def set_channel_category(
+    channel_id: int,
+    request: ChannelCategoryRequest,
+    db: AsyncSession = Depends(get_db_session),
+):
+    """
+    Set the content category for a channel.
+
+    Valid categories: general, movies, tv, nature, music, adult, live_tv, vimeo.
+    Adding new categories in the future requires no migration — just update
+    VALID_CATEGORIES in models.py and the web UI dropdown.
+    """
+    category = request.category.lower()
+    if category not in VALID_CATEGORIES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid category '{category}'. Must be one of: {', '.join(VALID_CATEGORIES)}"
+        )
+
+    stmt = select(Channel).where(Channel.id == channel_id)
+    result = await db.execute(stmt)
+    channel = result.scalar_one_or_none()
+
+    if channel is None:
+        raise HTTPException(status_code=404, detail="Channel not found")
+
+    old_category = channel.category
+    channel.category = category
+    await db.commit()
+
+    logger.info(f"Channel '{channel.name}' category: {old_category} -> {category}")
+    return {
+        "status": "updated",
+        "channel_id": channel_id,
+        "name": channel.name,
+        "category": channel.category,
     }
 
 

@@ -14,6 +14,8 @@ Key behaviors:
   only as a last resort — never to DASH, since browsers cannot play .mpd.
 - Error handling: Dead links, geo-blocks, DMCA takedowns, and private videos
   are caught, flagged as permanent failures, and auto-deleted from the feed.
+  Rate-limit errors (HTTP 429, YouTube session rate-limit) are explicitly
+  guarded as transient and will never trigger auto-delete.
 - Auto-dedup: After successful resolution, the CDN fingerprint is checked
   against all other resolved Vimeo videos. If a duplicate physical file is
   found, the lower-scored copy is deleted and playback is transparently
@@ -95,6 +97,21 @@ PERMANENT_ERROR_KEYWORDS = [
     "video is no longer available",
     "this video does not exist",
     "page not found",
+]
+
+# Rate-limit safeguard — checked BEFORE permanent keywords.
+# YouTube rate-limit errors contain "video unavailable" in their message, which
+# would normally trigger a permanent deletion. These phrases unambiguously identify
+# a transient rate-limit condition and must short-circuit the permanent check.
+# Confirmed from live log: "Video unavailable. This content isn't available, try
+# again later. The current session has been rate-limited by YouTube for up to an hour."
+RATE_LIMIT_SAFEGUARD_KEYWORDS = [
+    "the current session has been rate-limited",
+    "rate-limited by youtube",
+    "it is recommended to use `-t sleep`",
+    "http error 429",
+    "too many requests",
+    "please try again later",
 ]
 
 # Vimeo CDN domains — fingerprinting ONLY fires for URLs from these domains.
@@ -257,6 +274,12 @@ def _extract_sync_worker(url: str, cookies_path: Optional[str]) -> Tuple[Optiona
     except Exception as e:
         error_msg = str(e)
         error_lower = error_msg.lower()
+        # GUARD: rate-limit errors are transient. Check before permanent keywords
+        # because YouTube rate-limit messages contain "video unavailable" which
+        # would otherwise trigger auto-delete. Confirmed from live logs.
+        for keyword in RATE_LIMIT_SAFEGUARD_KEYWORDS:
+            if keyword in error_lower:
+                return None, f"Transient(rate-limit): {error_msg[:300]}", False
         for keyword in permanent_keywords:
             if keyword in error_lower:
                 return None, f"Permanent: {error_msg[:300]}", True
@@ -319,6 +342,7 @@ def _extract_tv_sync_worker(url: str, cookies_path: Optional[str]) -> Tuple[Opti
         if info is None:
             return None, "yt-dlp returned no info", False
 
+        # ── Split stream path ─────────────────────────────────────────────────
         requested = info.get("requested_formats", [])
         video_url = None
         audio_url = None
@@ -364,6 +388,12 @@ def _extract_tv_sync_worker(url: str, cookies_path: Optional[str]) -> Tuple[Opti
     except Exception as e:
         error_msg = str(e)
         error_lower = error_msg.lower()
+        # GUARD: rate-limit errors are transient. Check before permanent keywords
+        # because YouTube rate-limit messages contain "video unavailable" which
+        # would otherwise trigger auto-delete. Confirmed from live logs.
+        for keyword in RATE_LIMIT_SAFEGUARD_KEYWORDS:
+            if keyword in error_lower:
+                return None, f"Transient(rate-limit): {error_msg[:300]}", False
         for keyword in permanent_keywords:
             if keyword in error_lower:
                 return None, f"Permanent: {error_msg[:300]}", True

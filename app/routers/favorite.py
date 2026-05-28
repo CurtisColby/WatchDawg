@@ -1,16 +1,28 @@
 """
 Favorite / Download API Router.
 
-Endpoints:
-- POST   /favorite/{video_id}         — Mark a video as favorite and start download.
-- GET    /favorite                     — List all favorited videos.
-- DELETE /favorite/{favorite_id}       — Remove a favorite (optionally delete downloaded file).
-- POST   /favorite/{favorite_id}/retry — Retry a failed/pending download.
+Milestone B: Favorite and Download are now separate actions.
 
-Internal helpers exported for use by scraper.py:
-- _download_sync()       — synchronous yt-dlp download (runs in thread)
-- _build_filename()      — build a safe filesystem filename from title/artist
-- _find_downloaded_file() — locate the actual file yt-dlp wrote (ext may differ)
+Endpoints:
+- POST   /favorite/{video_id}          — Bookmark a video as a favorite (no download).
+- POST   /favorite/{video_id}/download — Trigger yt-dlp download for a favorited video.
+- GET    /favorite                      — List all favorited videos.
+- DELETE /favorite/{favorite_id}        — Remove a favorite (optionally delete downloaded file).
+- POST   /favorite/{favorite_id}/retry  — Retry a failed/pending download.
+
+Design:
+  Favorite = bookmark only. The heart button on the TV/web UI adds the video to
+  the favorites list without triggering a download. This lets users build a
+  favorites collection without filling up the NAS.
+
+  Download = explicit NAS save. A separate download button triggers yt-dlp.
+  Can be called on any favorited video regardless of its current download_status
+  (will re-download if already complete, giving a refresh mechanism).
+
+  This split means:
+  - Locked state: neither button visible (Milestone E enforces this on Android)
+  - Unlocked state: heart + download button both visible, independent actions
+  - Adult content: both buttons require PIN (channel lock enforced server-side)
 """
 
 import asyncio
@@ -33,13 +45,22 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/favorite", tags=["favorite"])
 
 
+# ---------------------------------------------------------------------------
+# POST /favorite/{video_id} — Bookmark only, no download
+# ---------------------------------------------------------------------------
+
 @router.post("/{video_id}")
 async def favorite_video(
     video_id: int,
-    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db_session),
 ):
-    """Mark a video as a favorite and trigger a background download."""
+    """
+    Bookmark a video as a favorite.
+
+    Creates a Favorite record with download_status='none'.
+    Does NOT trigger a download — use POST /favorite/{video_id}/download for that.
+    Idempotent — returns 'already_favorited' if already bookmarked.
+    """
     stmt = select(Video).where(Video.id == video_id)
     result = await db.execute(stmt)
     video = result.scalar_one_or_none()
@@ -53,8 +74,58 @@ async def favorite_video(
     if existing.scalar_one_or_none() is not None:
         return {"status": "already_favorited", "video_id": video_id}
 
-    favorite = Favorite(video_id=video_id, download_status="pending")
+    favorite = Favorite(video_id=video_id, download_status="none")
     db.add(favorite)
+    await db.commit()
+
+    logger.info(f"Favorited video {video_id}: {video.title}")
+    return {
+        "status": "favorited",
+        "video_id": video_id,
+        "title": video.title,
+        "download_status": "none",
+    }
+
+
+# ---------------------------------------------------------------------------
+# POST /favorite/{video_id}/download — Trigger yt-dlp download
+# ---------------------------------------------------------------------------
+
+@router.post("/{video_id}/download")
+async def download_video(
+    video_id: int,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db_session),
+):
+    """
+    Trigger a yt-dlp download for a video.
+
+    If the video is not yet favorited, favorites it first then starts the download.
+    If already favorited, starts or restarts the download regardless of current status.
+    This gives a clean "re-download" path if the file was deleted or corrupted.
+    """
+    stmt = select(Video).where(Video.id == video_id)
+    result = await db.execute(stmt)
+    video = result.scalar_one_or_none()
+
+    if video is None:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    # Get or create the Favorite record
+    fav_result = await db.execute(
+        select(Favorite).where(Favorite.video_id == video_id)
+    )
+    favorite = fav_result.scalar_one_or_none()
+
+    if favorite is None:
+        favorite = Favorite(video_id=video_id, download_status="pending")
+        db.add(favorite)
+    else:
+        if favorite.download_status == "downloading":
+            return {"status": "already_downloading", "video_id": video_id}
+        favorite.download_status = "pending"
+        favorite.download_error = None
+
     await db.commit()
 
     background_tasks.add_task(
@@ -65,14 +136,18 @@ async def favorite_video(
         artist=video.artist,
     )
 
-    logger.info(f"Favorited video {video_id}: {video.title}")
+    logger.info(f"Download queued for video {video_id}: {video.title}")
     return {
-        "status": "favorited",
+        "status": "download_queued",
         "video_id": video_id,
         "title": video.title,
         "download_status": "pending",
     }
 
+
+# ---------------------------------------------------------------------------
+# GET /favorite — List all favorites
+# ---------------------------------------------------------------------------
 
 @router.get("")
 async def list_favorites(db: AsyncSession = Depends(get_db_session)):
@@ -84,6 +159,8 @@ async def list_favorites(db: AsyncSession = Depends(get_db_session)):
     Also returns stream_url for completed local downloads so the player
     can stream directly without resolving.
     """
+    # Left-join Channel so we get the friendly channel name even when
+    # a video's channel has been deleted (channel_id becomes null).
     stmt = (
         select(Favorite, Video, Channel)
         .join(Video, Favorite.video_id == Video.id)
@@ -124,6 +201,10 @@ async def list_favorites(db: AsyncSession = Depends(get_db_session)):
     return {"favorites": favorites}
 
 
+# ---------------------------------------------------------------------------
+# DELETE /favorite/{favorite_id} — Remove a favorite
+# ---------------------------------------------------------------------------
+
 @router.delete("/{favorite_id}")
 async def remove_favorite(
     favorite_id: int,
@@ -154,6 +235,10 @@ async def remove_favorite(
     logger.info(f"Removed favorite {favorite_id}")
     return {"status": "removed", "favorite_id": favorite_id, "file_deleted": deleted_file}
 
+
+# ---------------------------------------------------------------------------
+# POST /favorite/{favorite_id}/retry — Retry a failed download
+# ---------------------------------------------------------------------------
 
 @router.post("/{favorite_id}/retry")
 async def retry_download(
@@ -196,6 +281,10 @@ async def retry_download(
     logger.info(f"Retrying download for favorite {favorite_id}: {video.title}")
     return {"status": "retrying", "favorite_id": favorite_id, "title": video.title}
 
+
+# ---------------------------------------------------------------------------
+# Background download task
+# ---------------------------------------------------------------------------
 
 async def _download_video_task(
     video_id: int,
@@ -244,6 +333,7 @@ async def _download_video_task(
             # Determine output directory: channel subfolder or Uncategorized
             base_dir = settings.music_videos_path
             if channel_name:
+                # Sanitize channel name for filesystem use
                 safe_channel = re.sub(r'[<>:"/\\|?*]', '', channel_name).strip()
                 safe_channel = re.sub(r'\s+', ' ', safe_channel)
                 output_dir = os.path.join(base_dir, safe_channel) if safe_channel else base_dir
@@ -290,6 +380,7 @@ async def _download_video_task(
                 await db.commit()
                 return
 
+            # Use asyncio.to_thread() — correct for FastAPI background tasks
             success, error_msg = await asyncio.to_thread(
                 _download_sync, source_url, output_path
             )
@@ -324,10 +415,7 @@ async def _download_video_task(
 
 
 def _find_downloaded_file(expected_path: str) -> Optional[str]:
-    """
-    Find the actual downloaded file — yt-dlp may change the extension.
-    Checks the exact path first, then common video extensions.
-    """
+    """Find the actual downloaded file — yt-dlp may change the extension."""
     if os.path.isfile(expected_path):
         return expected_path
     base = os.path.splitext(expected_path)[0]
@@ -341,9 +429,6 @@ def _find_downloaded_file(expected_path: str) -> Optional[str]:
 def _download_sync(source_url: str, output_path: str) -> tuple:
     """
     Synchronous yt-dlp download. Runs in a thread via asyncio.to_thread().
-
-    Exported for use by scraper.py Reddit auto-download logic.
-
     Returns: (success: bool, error_message: str or None)
     """
     import yt_dlp
@@ -390,10 +475,7 @@ def _download_sync(source_url: str, output_path: str) -> tuple:
 
 
 def _build_filename(title: str, artist: Optional[str]) -> str:
-    """
-    Build a safe filename from title and artist.
-    Exported for use by scraper.py Reddit auto-download logic.
-    """
+    """Build a safe filename from title and artist."""
     if artist and artist.lower() not in title.lower():
         name = f"{artist} - {title}"
     else:

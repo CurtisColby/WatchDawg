@@ -28,8 +28,12 @@ services:
       # Browser cookies for yt-dlp (read-only inside container)
       - ./config/cookies.txt:/config/cookies.txt
 
-      # Local download directory for favorited music videos
-      - /media/colby/NAS1/WatchDawg:/music_videos
+      # Downloads root — contains Public/ and Private/ subfolders.
+      # Host folder: /media/colby/NAS1/WD_Downloads
+      # Internal container path: /watchdawg
+      # Public/  — unlocked source downloads, visible without PIN
+      # Private/ — locked source downloads, visible only with PIN (Library tab)
+      - /media/colby/NAS1/WD_Downloads:/watchdawg
     environment:
       - TZ=${TIMEZONE:-America/Chicago}
       # Tell FFmpeg and VA-API where the Intel iHD driver lives inside the container

@@ -139,7 +139,7 @@
         .nav-item-label { flex: 1; }
         .nav-item-count { font-size: 11px; font-family: 'JetBrains Mono', monospace; color: var(--text-muted); background: var(--bg-surface); padding: 1px 7px; border-radius: 10px; }
         .nav-item.active .nav-item-count { background: var(--accent-orange-dim); color: var(--accent-orange); }
-        .nav-item.pin-hidden { display: none; }
+        .nav-item.pin-hidden { display: none !important; }
 
         /* =====================================================================
            MAIN CONTENT AREA
@@ -239,7 +239,7 @@
         .cat-pill { padding: 4px 14px; border-radius: 20px; border: 1px solid var(--border-subtle); background: var(--bg-surface); color: var(--text-muted); font-size: 12px; font-weight: 500; cursor: pointer; transition: all 0.15s; white-space: nowrap; }
         .cat-pill:hover { border-color: var(--accent-orange); color: var(--text-primary); }
         .cat-pill.active { background: var(--accent-orange); border-color: var(--accent-orange); color: var(--bg-primary); font-weight: 600; }
-        .cat-pill.pin-hidden { display: none; }
+        .cat-pill.pin-hidden { display: none !important; }
 
         /* Video count badge */
         .video-count-badge { font-family: 'JetBrains Mono', monospace; font-size: 12px; font-weight: 600; color: var(--accent-orange); background: var(--accent-orange-dim); border: 1px solid var(--accent-orange); border-radius: 20px; padding: 3px 12px; white-space: nowrap; }
@@ -447,7 +447,7 @@
         .modal-btn { width: 30px; height: 30px; background: none; border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); color: var(--text-muted); font-size: 14px; cursor: pointer; display: flex; align-items: center; justify-content: center; transition: all 0.15s; }
         .modal-btn:hover { border-color: var(--accent-orange); color: var(--accent-orange); }
         .modal-btn-close:hover { border-color: var(--accent-red); color: var(--accent-red); }
-        .modal-video { width: 100%; aspect-ratio: 16/9; background: #000; border-radius: 0 0 var(--radius) var(--radius); overflow: hidden; display: flex; align-items: center; justify-content: center; min-height: 300px; }
+        .modal-video { flex: 1; min-height: 0; background: #000; border-radius: 0 0 var(--radius) var(--radius); overflow: hidden; display: flex; align-items: center; justify-content: center; }
         .modal-video video { width: 100%; height: 100%; max-height: 70vh; }
         .modal-error { color: var(--accent-red); padding: 20px; text-align: center; font-size: 14px; line-height: 1.8; }
 
@@ -589,15 +589,12 @@
                         <div class="cat-pills" id="catPills">
                             <span class="cat-pill active" data-cat="" onclick="setCatFilter('', this)">All</span>
                             <span class="cat-pill" data-cat="music" onclick="setCatFilter('music', this)">&#x1F3B5; Music</span>
-                            <span class="cat-pill" data-cat="ccm" onclick="setCatFilter('ccm', this)">&#x271D; CCM</span>
-                            <span class="cat-pill" data-cat="chill" onclick="setCatFilter('chill', this)">&#x1F3B6; Chill</span>
                             <span class="cat-pill" data-cat="nature" onclick="setCatFilter('nature', this)">&#x1F333; Nature</span>
                             <span class="cat-pill" data-cat="movies" onclick="setCatFilter('movies', this)">&#x1F3AC; Movies</span>
                             <span class="cat-pill" data-cat="tv" onclick="setCatFilter('tv', this)">&#x1F4FA; TV</span>
-                            <span class="cat-pill pin-hidden" data-cat="vimeo" onclick="setCatFilter('vimeo', this)">&#x25B6; Vimeo</span>
+                            <span class="cat-pill" data-cat="vimeo" onclick="setCatFilter('vimeo', this)">&#x25B6; Vimeo</span>
                             <span class="cat-pill" data-cat="general" onclick="setCatFilter('general', this)">&#x1F310; General</span>
-                            <span class="cat-pill pin-hidden" data-cat="sexy" onclick="setCatFilter('sexy', this)">&#x1F525; Sexy</span>
-                            <span class="cat-pill pin-hidden" data-cat="adult" onclick="setCatFilter('adult', this)">&#x1F525; Adult</span>
+                            <span class="cat-pill pin-hidden" data-cat="adult" onclick="setCatFilter('adult', this)">&#x1F512; Adult</span>
                         </div>
                     </div>
                     <div class="feed-toolbar-right">
@@ -805,13 +802,10 @@
                             <select id="channelCatInput">
                                 <option value="general">General</option>
                                 <option value="music">Music</option>
-                                <option value="ccm">CCM</option>
-                                <option value="chill">Chill</option>
                                 <option value="nature">Nature</option>
                                 <option value="movies">Movies</option>
                                 <option value="tv">TV</option>
                                 <option value="vimeo">Vimeo</option>
-                                <option value="sexy">Sexy</option>
                                 <option value="adult">Adult</option>
                                 <option value="live_tv">Live TV</option>
                             </select>
@@ -951,20 +945,14 @@
 
         const CAT_CONFIG = {
             music:   { label: 'Music',   color: '#a855f7' },
-            ccm:     { label: 'CCM',     color: '#60a5fa' },
-            chill:   { label: 'Chill',   color: '#34d399' },
             nature:  { label: 'Nature',  color: '#22c55e' },
             movies:  { label: 'Movies',  color: '#3b82f6' },
             tv:      { label: 'TV',      color: '#06b6d4' },
             vimeo:   { label: 'Vimeo',   color: '#1ab7ea' },
             general: { label: 'General', color: '#8a8a9a' },
-            sexy:    { label: 'Sexy',    color: '#f472b6' },
             adult:   { label: 'Adult',   color: '#ff6b35' },
             live_tv: { label: 'Live TV', color: '#eab308' },
         };
-
-        // Categories hidden behind PIN lock
-        const LOCKED_CATS = new Set(['vimeo', 'sexy', 'adult']);
 
         function buildFeedSidebar(channels, resetState = false) {
             if (resetState) { feedSidebarState = {}; channels.forEach(ch => { feedSidebarState[ch.id] = true; }); }
@@ -975,7 +963,7 @@
 
             const groups = {};
             channels.forEach(ch => { const cat = ch.category || 'general'; if (!groups[cat]) groups[cat] = []; groups[cat].push(ch); });
-            const catOrder = ['music','ccm','chill','nature','movies','tv','vimeo','general','sexy','adult','live_tv'];
+            const catOrder = ['music','nature','movies','tv','vimeo','general','adult','live_tv'];
             const sorted = Object.keys(groups).sort((a,b) => { const ai = catOrder.indexOf(a), bi = catOrder.indexOf(b); return (ai===-1?99:ai)-(bi===-1?99:bi); });
 
             container.innerHTML = sorted.map(cat => {
@@ -1179,7 +1167,7 @@
             if (!channels.length) { list.innerHTML = `<div class="channel-empty"><h3>No channels yet</h3><p>Add a URL above. Examples: <code>r/listentothis</code> &nbsp; <code>https://vimeo.com/channels/name</code></p></div>`; return; }
             const groups = {};
             channels.forEach(ch => { const cat = ch.category || 'general'; if (!groups[cat]) groups[cat] = []; groups[cat].push(ch); });
-            const catOrder = ['music','ccm','chill','nature','movies','tv','vimeo','general','sexy','adult','live_tv'];
+            const catOrder = ['music','nature','movies','tv','vimeo','general','adult','live_tv'];
             const sorted = Object.keys(groups).sort((a,b) => { const ai=catOrder.indexOf(a),bi=catOrder.indexOf(b); return (ai===-1?99:ai)-(bi===-1?99:bi); });
             list.innerHTML = sorted.map(cat => {
                 const cfg = CAT_CONFIG[cat] || { label: cat, color: 'var(--text-muted)' };
@@ -1199,7 +1187,7 @@
             const typeLabel = ch.channel_type==='reddit_subreddit'?'Reddit':ch.channel_type==='vimeo_channel'?'Vimeo':'YouTube';
             const typeBadge = ch.channel_type==='reddit_subreddit'?'badge-reddit':ch.channel_type==='vimeo_channel'?'badge-vimeo':'badge-playlist';
             const lastScraped = ch.last_scraped_at ? new Date(ch.last_scraped_at).toLocaleString() : 'Never';
-            const catOptions = ['general','music','ccm','chill','nature','movies','tv','vimeo','sexy','adult','live_tv'].map(c =>
+            const catOptions = ['general','music','nature','movies','tv','vimeo','adult','live_tv'].map(c =>
                 `<option value="${c}" ${ch.category===c?'selected':''}>${c.charAt(0).toUpperCase()+c.slice(1).replace('_',' ')}</option>`).join('');
             return `<div class="channel-card ${ch.locked?'locked-channel':''}" style="animation-delay:${i*0.04}s" id="channelCard_${ch.id}">
                 <div class="channel-type-badge ${typeBadge}">${typeLabel}</div>
@@ -1896,192 +1884,83 @@
         //  PLAYER
         // =====================================================================
         function _openPlayer(title) {
-            const container = document.getElementById('playerContainer');
-            container.innerHTML = '<div class="spinner" style="width:40px;height:40px;border-width:4px;margin:auto;"></div>';
-            document.getElementById('playerTitle').textContent = title || 'Loading...';
+            document.getElementById('playerTitle').textContent=title||'Now Playing';
             document.getElementById('playerModal').classList.add('active');
-            updateQueueUI();
+            document.getElementById('playerContainer').innerHTML='<div style="color:var(--text-muted);padding:20px;font-size:13px;">Loading...</div>';
         }
 
         function _attachVideo(container, streamUrl, mediaType) {
-            const videoEl = document.createElement('video');
-            videoEl.controls = true;
-            videoEl.autoplay = true;
-            videoEl.style.width = '100%';
-            videoEl.style.height = '100%';
-            videoEl.addEventListener('ended', () => { if (playQueue.length > 0) playNext(); });
-            container.innerHTML = '';
-            container.appendChild(videoEl);
-
-            const isHLS  = streamUrl && (streamUrl.includes('.m3u8') || streamUrl.includes('m3u8'));
-            const isDASH = streamUrl && (streamUrl.includes('.mpd') || streamUrl.includes('playlist.mpd') || streamUrl.includes('/playlist/av/primary'));
-
-            if (isDASH) {
-                log('DASH stream — browsers cannot play .mpd. Try Resolve All for a fresh MP4.', 'error');
-                container.innerHTML = `<div class="modal-error">&#x26A0; This video is a DASH stream which browsers cannot play natively.<br><br>Click <strong>Resolve All</strong> or try another video.</div>`;
-                if (playQueue.length > 0) setTimeout(playNext, 3000);
-                return;
-            }
-
-            const isYouTubeCDN = streamUrl && streamUrl.includes('googlevideo.com');
-
-            if (isYouTubeCDN) {
-                const proxiedUrl = `${API_BASE}/proxy/stream?url=${encodeURIComponent(streamUrl)}`;
-                log('YouTube CDN — routing through proxy', 'info');
-                const source = document.createElement('source');
-                source.src = proxiedUrl; source.type = 'video/mp4';
-                videoEl.appendChild(source);
-                videoEl.addEventListener('error', () => {
-                    log('YouTube proxy stream failed — forcing re-resolve', 'warn');
-                    if (container._watchdawgVideoId) {
-                        fetch(`${API_BASE}/resolve/${container._watchdawgVideoId}?force=true`)
-                            .then(r => r.ok ? r.json() : Promise.reject('Re-resolve failed'))
-                            .then(data => {
-                                const newProxied = `${API_BASE}/proxy/stream?url=${encodeURIComponent(data.stream_url)}`;
-                                source.src = newProxied; videoEl.load(); videoEl.play().catch(() => {});
-                                log('Re-resolved YouTube video — retrying', 'success');
-                            })
-                            .catch(e => {
-                                container.innerHTML = `<div class="modal-error">&#x26A0; YouTube stream failed and could not be re-resolved.<br><small>${escapeHtml(String(e))}</small></div>`;
-                                if (playQueue.length > 0) setTimeout(playNext, 3000);
-                            });
-                    }
-                });
-                videoEl.load(); videoEl.play().catch(() => {});
-
-            } else if (isHLS && window.Hls && Hls.isSupported()) {
-                const proxiedUrl = `${API_BASE}/proxy/stream?url=${encodeURIComponent(streamUrl)}`;
-                log('HLS stream — routing through proxy', 'info');
-                const hls = new Hls({ enableWorker: false });
-                hls.loadSource(proxiedUrl);
-                hls.attachMedia(videoEl);
-                hls.on(Hls.Events.MANIFEST_PARSED, () => videoEl.play().catch(() => {}));
-                hls.on(Hls.Events.ERROR, (event, data) => {
-                    if (data.fatal) {
-                        log(`HLS fatal: ${data.details} (${data.type})`, 'error');
-                        container.innerHTML = `<div class="modal-error">&#x26A0; HLS playback failed: ${escapeHtml(data.details)}<br><small>Check the Debug Console → Proxy tab.</small></div>`;
-                        if (playQueue.length > 0) setTimeout(playNext, 2000);
-                    } else { log(`HLS non-fatal: ${data.details}`, 'warn'); }
-                });
-                videoEl._hls = hls;
-
+            const isHLS=streamUrl&&(streamUrl.includes('.m3u8')||streamUrl.includes('m3u8'));
+            const video=document.createElement('video');
+            video.controls=true; video.autoplay=true; video.style.cssText='width:100%;height:100%;';
+            container.innerHTML=''; container.appendChild(video);
+            if(isHLS&&window.Hls&&Hls.isSupported()){
+                const hls=new Hls({enableWorker:false}); hls.loadSource(streamUrl); hls.attachMedia(video);
+                hls.on(Hls.Events.MANIFEST_PARSED,()=>video.play().catch(()=>{})); video._hls=hls;
+            } else if(isHLS&&video.canPlayType('application/vnd.apple.mpegurl')){
+                video.src=streamUrl; video.play().catch(()=>{});
             } else {
-                log('Direct MP4 — playing without proxy', 'info');
-                const source = document.createElement('source');
-                source.src = streamUrl; source.type = mediaType || 'video/mp4';
-                videoEl.appendChild(source);
-                videoEl.addEventListener('error', async () => {
-                    const err = videoEl.error;
-                    const code = err ? err.code : 0;
-                    if ((code === 2 || code === 4 || code === 0) && container._watchdawgVideoId) {
-                        log(`MP4 load failed (code=${code}) — forcing re-resolve`, 'warn');
-                        try {
-                            const res = await fetch(`${API_BASE}/resolve/${container._watchdawgVideoId}?force=true`);
-                            if (!res.ok) throw new Error('Re-resolve failed');
-                            const data = await res.json();
-                            log(`Re-resolved — retrying`, 'success');
-                            source.src = data.stream_url; videoEl.load(); videoEl.play().catch(() => {});
-                        } catch (e) {
-                            container.innerHTML = `<div class="modal-error">&#x26A0; Video failed and could not be re-resolved.<br><br>CDN token may have expired. Try clicking Play again.</div>`;
-                            if (playQueue.length > 0) setTimeout(playNext, 3000);
-                        }
-                    } else if (code !== 0) {
-                        container.innerHTML = `<div class="modal-error">&#x26A0; Video failed to load (error code ${code}).<br><br>Click Play again to get a fresh URL.</div>`;
-                        if (playQueue.length > 0) setTimeout(playNext, 3000);
-                    }
-                });
-                videoEl.load(); videoEl.play().catch(() => {});
+                if(mediaType){const src=document.createElement('source');src.src=streamUrl;src.type=mediaType;video.appendChild(src);}
+                else video.src=streamUrl;
+                video.play().catch(()=>{});
             }
+            video.addEventListener('ended',()=>{if(playQueue.length>1) setTimeout(playNext,800);});
         }
 
-        async function playVideo(videoId, fromQueue = false) {
-            log(`Resolving video ${videoId}...`, 'info');
-            _openPlayer('Resolving...');
-            const container = document.getElementById('playerContainer');
-            const titleEl = document.getElementById('playerTitle');
+        async function playVideo(videoId, fromQueue=false) {
+            _openPlayer('Loading...');
+            const container=document.getElementById('playerContainer');
+            const titleEl=document.getElementById('playerTitle');
             try {
-                const opts = {}; if (_pinToken) opts.headers = { 'X-WatchDawg-Token': _pinToken };
-                const res = await fetch(`${API_BASE}/resolve/${videoId}`, opts);
-                if (!res.ok) {
-                    const err = await res.json();
-                    if (res.status === 404) {
-                        currentVideos = currentVideos.filter(v => v.id !== videoId);
-                        feedTotal = Math.max(0, feedTotal - 1);
-                        renderGrid(currentVideos);
-                        document.getElementById('videoCount').textContent = `${feedTotal.toLocaleString()} videos`;
-                    }
-                    throw new Error(err.detail || 'Resolution failed');
-                }
-                const data = await res.json();
-                titleEl.textContent = data.title || 'Now Playing';
-                updateQueueUI();
-                let streamUrl = data.stream_url;
-                if (!streamUrl) throw new Error('No stream URL returned from server');
-                let isHLS  = streamUrl.includes('.m3u8') || streamUrl.includes('m3u8');
-                let isDASH = streamUrl.includes('.mpd') || streamUrl.includes('playlist.mpd') || streamUrl.includes('/playlist/av/primary');
-
-                // If cached URL is DASH, force a fresh re-resolve before giving up.
-                // Vimeo often caches a DASH URL but serves a progressive MP4 on re-resolve.
-                if (isDASH) {
-                    log(`Cached DASH URL for "${data.title}" — forcing fresh re-resolve...`, 'warn');
-                    try {
-                        const reRes = await fetch(`${API_BASE}/resolve/${videoId}?force=true`, opts);
-                        if (reRes.ok) {
-                            const reData = await reRes.json();
-                            if (reData.stream_url) {
-                                streamUrl = reData.stream_url;
-                                isHLS  = streamUrl.includes('.m3u8') || streamUrl.includes('m3u8');
-                                isDASH = streamUrl.includes('.mpd') || streamUrl.includes('playlist.mpd') || streamUrl.includes('/playlist/av/primary');
-                                log(`Re-resolved "${reData.title}": ${isDASH ? 'still DASH' : isHLS ? 'HLS' : 'MP4'}`, isDASH ? 'error' : 'success');
-                            }
-                        }
-                    } catch (_) {}
-                }
-
-                log(`Playing: ${data.title} [${data.format}] (${isDASH?'DASH':isHLS?'HLS':'MP4'})`, isDASH ? 'warn' : 'success');
-                _debugLogStream(videoId, streamUrl, data.format);
-                container._watchdawgVideoId = videoId;
-                _attachVideo(container, streamUrl);
-                if (!fromQueue) refreshFeed();
-            } catch (e) {
-                titleEl.textContent = 'Unavailable';
-                container.innerHTML = `<div class="modal-error">&#x26A0; ${escapeHtml(e.message)}<br><br>The video may be unavailable, age-restricted, or geo-blocked.</div>`;
-                log(`Playback failed for ${videoId}: ${e.message}`, 'error');
-                if (playQueue.length > 0) setTimeout(playNext, 2000);
+                const opts={}; if(_pinToken) opts.headers={'X-WatchDawg-Token':_pinToken};
+                const res=await fetch(`${API_BASE}/resolve/${videoId}`,opts);
+                if(!res.ok){const err=await res.json();throw new Error(err.detail||`HTTP ${res.status}`);}
+                const data=await res.json();
+                titleEl.textContent=data.title||'Now Playing'; updateQueueUI();
+                const streamUrl=data.stream_url;
+                if(!streamUrl) throw new Error('No stream URL returned');
+                const isHLS=streamUrl.includes('.m3u8'), isDASH=streamUrl.includes('.mpd');
+                log(`Playing: ${data.title} [${data.format}] (${isDASH?'DASH':isHLS?'HLS':'MP4'})`,isDASH?'warn':'success');
+                _debugLogStream(videoId,streamUrl,data.format);
+                _attachVideo(container,streamUrl);
+                if(!fromQueue) refreshFeed();
+            } catch(e){
+                titleEl.textContent='Unavailable';
+                container.innerHTML=`<div class="modal-error">&#x26A0; ${escapeHtml(e.message)}<br><br>Video may be unavailable or geo-blocked.</div>`;
+                log(`Playback failed: ${e.message}`,'error');
+                if(playQueue.length>0) setTimeout(playNext,2000);
             }
         }
 
-        async function playLocalFile(streamUrl, title, fromQueue = false) {
-            log(`Playing local: ${title}`, 'info');
+        async function playLocalFile(streamUrl, title, fromQueue=false) {
+            log(`Playing local: ${title}`,'info');
             _openPlayer(title);
-            const container = document.getElementById('playerContainer');
-            document.getElementById('playerTitle').textContent = title || 'Now Playing';
-            const ext = streamUrl.split('.').pop().toLowerCase().split('?')[0];
-            const typeMap = { mp4: 'video/mp4', mkv: 'video/x-matroska', webm: 'video/webm', m4v: 'video/mp4' };
-            _attachVideo(container, API_BASE + streamUrl, typeMap[ext] || 'video/mp4');
-            log(`Streaming local: ${title}`, 'success');
+            const container=document.getElementById('playerContainer');
+            document.getElementById('playerTitle').textContent=title;
+            const ext=streamUrl.split('.').pop().toLowerCase().split('?')[0];
+            const typeMap={mp4:'video/mp4',mkv:'video/x-matroska',webm:'video/webm',m4v:'video/mp4'};
+            _attachVideo(container,API_BASE+streamUrl,typeMap[ext]||'video/mp4');
         }
 
         function closePlayer() {
             document.getElementById('playerModal').classList.remove('active');
-            const container = document.getElementById('playerContainer');
-            const video = container.querySelector('video');
-            if (video) { if (video._hls) { video._hls.destroy(); } video.pause(); }
-            container.innerHTML = '';
-            playQueue = []; queueIndex = -1; updateQueueUI();
-            document.querySelectorAll('.video-card.now-playing').forEach(el => el.classList.remove('now-playing'));
+            const container=document.getElementById('playerContainer');
+            const video=container.querySelector('video');
+            if(video){if(video._hls){video._hls.destroy();}video.pause();}
+            container.innerHTML=''; playQueue=[]; queueIndex=-1; updateQueueUI();
+            document.querySelectorAll('.video-card.now-playing').forEach(el=>el.classList.remove('now-playing'));
         }
 
         function toggleFullscreen() {
-            const modal = document.getElementById('playerModal');
-            if (!document.fullscreenElement) modal.requestFullscreen().catch(() => {});
-            else document.exitFullscreen().catch(() => {});
+            const modal=document.getElementById('playerModal');
+            if(!document.fullscreenElement) modal.requestFullscreen().catch(()=>{});
+            else document.exitFullscreen().catch(()=>{});
         }
 
-        document.addEventListener('keydown', e => {
-            if (e.key === 'Escape') { closePlayer(); return; }
-            if (e.key === 'ArrowRight' && document.getElementById('playerModal').classList.contains('active') && playQueue.length > 0) { playNext(); return; }
-            if ((e.key === 'f' || e.key === 'F') && document.getElementById('playerModal').classList.contains('active')) { toggleFullscreen(); return; }
+        document.addEventListener('keydown',e=>{
+            if(e.key==='Escape'){closePlayer();return;}
+            if(e.key==='ArrowRight'&&document.getElementById('playerModal').classList.contains('active')&&playQueue.length>0){playNext();return;}
+            if((e.key==='f'||e.key==='F')&&document.getElementById('playerModal').classList.contains('active')){toggleFullscreen();return;}
         });
 
         // =====================================================================
@@ -2188,24 +2067,19 @@
             // Nav rail: hide Favorites and Library when locked
             ['nav-favorites','nav-library'].forEach(id=>{
                 const el=document.getElementById(id); if(!el) return;
-                if(_pinLockEnabled&&!_isUnlocked) el.classList.add('pin-hidden');
-                else el.classList.remove('pin-hidden');
+                el.style.display=(_pinLockEnabled&&!_isUnlocked)?'none':'';
             });
-            // Hide PIN-gated category pills (vimeo, sexy, adult) when locked
-            const locked = _pinLockEnabled && !_isUnlocked;
-            LOCKED_CATS.forEach(cat => {
-                const pill = document.querySelector(`.cat-pill[data-cat="${cat}"]`);
-                if (!pill) return;
-                if (locked) pill.classList.add('pin-hidden');
-                else pill.classList.remove('pin-hidden');
-            });
-            // If active cat is now hidden, reset to All
-            if (locked && LOCKED_CATS.has(_activeCat)) {
-                _activeCat = '';
-                document.querySelectorAll('.cat-pill').forEach(p => p.classList.remove('active'));
-                const allPill = document.querySelector('.cat-pill[data-cat=""]'); if (allPill) allPill.classList.add('active');
+            // Adult category pill
+            const adultPill=document.querySelector('.cat-pill[data-cat="adult"]');
+            if(adultPill){
+                adultPill.style.display=(_pinLockEnabled&&!_isUnlocked)?'none':'';
+                if(_pinLockEnabled&&!_isUnlocked&&_activeCat==='adult'){
+                    _activeCat='';
+                    document.querySelectorAll('.cat-pill').forEach(p=>p.classList.remove('active'));
+                    const allPill=document.querySelector('.cat-pill[data-cat=""]'); if(allPill) allPill.classList.add('active');
+                }
             }
-            // If on a PIN-gated page while locked, redirect to feed
+            // If on a gated page, redirect to feed
             const activePage=document.querySelector('.page.active');
             if(_pinLockEnabled&&!_isUnlocked&&activePage&&(activePage.id==='page-favorites'||activePage.id==='page-library')){
                 switchPage('feed',null);

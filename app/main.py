@@ -9,8 +9,16 @@ This is the FastAPI application root. It:
 5. Starts the background scheduler for periodic scraping.
 6. Configures CORS for local development.
 7. Installs the in-memory log ring buffer so /debug/logs works.
-8. Runs the locked column migration if it doesn't already exist.
+8. Runs schema migrations on every boot (safe, additive only).
 9. Logs a warning if WATCHDAWG_PIN is not set (PIN lock disabled).
+
+Milestone B migrations added:
+- channels.category column
+- channels.last_scrape_error column
+- videos.tmdb_poster_url, tmdb_description, tmdb_year, tmdb_rating, tmdb_id columns
+- watch_history table
+- watchlist table
+- live_tv_channels table
 """
 
 import logging
@@ -36,25 +44,101 @@ async def _run_migrations():
     """
     Apply any schema migrations that aren't handled by init_db().
 
-    Currently handles:
-    - Adding the 'locked' column to the channels table (PIN lock feature).
-      Safe to run on every startup — uses IF NOT EXISTS / try-except pattern.
+    All migrations are additive (ADD COLUMN / CREATE TABLE IF NOT EXISTS).
+    Safe to run on every startup — each block is guarded by existence checks.
     """
     async with async_session_factory() as db:
         try:
-            # SQLite: check if 'locked' column exists by querying PRAGMA
+            # ----------------------------------------------------------------
+            # channels table migrations
+            # ----------------------------------------------------------------
             result = await db.execute(text("PRAGMA table_info(channels)"))
-            columns = [row[1] for row in result.fetchall()]
-            if "locked" not in columns:
+            channel_columns = [row[1] for row in result.fetchall()]
+
+            if "locked" not in channel_columns:
                 await db.execute(
                     text("ALTER TABLE channels ADD COLUMN locked INTEGER DEFAULT 0 NOT NULL")
                 )
-                await db.commit()
-                logger.info("Migration applied: added 'locked' column to channels table.")
-            else:
-                logger.debug("Migration check: 'locked' column already exists — skipping.")
+                logger.info("Migration applied: channels.locked")
+
+            if "category" not in channel_columns:
+                await db.execute(
+                    text("ALTER TABLE channels ADD COLUMN category TEXT DEFAULT 'general' NOT NULL")
+                )
+                logger.info("Migration applied: channels.category")
+
+            # ----------------------------------------------------------------
+            # videos table migrations
+            # ----------------------------------------------------------------
+            result = await db.execute(text("PRAGMA table_info(videos)"))
+            video_columns = [row[1] for row in result.fetchall()]
+
+            tmdb_cols = {
+                "tmdb_poster_url": "TEXT",
+                "tmdb_description": "TEXT",
+                "tmdb_year": "INTEGER",
+                "tmdb_rating": "REAL",
+                "tmdb_id": "INTEGER",
+            }
+            for col, col_type in tmdb_cols.items():
+                if col not in video_columns:
+                    await db.execute(
+                        text(f"ALTER TABLE videos ADD COLUMN {col} {col_type}")
+                    )
+                    logger.info(f"Migration applied: videos.{col}")
+
+            # ----------------------------------------------------------------
+            # New tables — CREATE TABLE IF NOT EXISTS (fully safe to re-run)
+            # ----------------------------------------------------------------
+            await db.execute(text("""
+                CREATE TABLE IF NOT EXISTS watch_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    video_id INTEGER NOT NULL UNIQUE REFERENCES videos(id) ON DELETE CASCADE,
+                    position_seconds REAL NOT NULL DEFAULT 0.0,
+                    duration_seconds REAL,
+                    completed INTEGER NOT NULL DEFAULT 0,
+                    last_watched_at DATETIME NOT NULL
+                )
+            """))
+
+            await db.execute(text("""
+                CREATE INDEX IF NOT EXISTS ix_watch_history_video_id
+                ON watch_history (video_id)
+            """))
+
+            await db.execute(text("""
+                CREATE TABLE IF NOT EXISTS watchlist (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    video_id INTEGER NOT NULL UNIQUE REFERENCES videos(id) ON DELETE CASCADE,
+                    added_at DATETIME NOT NULL
+                )
+            """))
+
+            await db.execute(text("""
+                CREATE INDEX IF NOT EXISTS ix_watchlist_video_id
+                ON watchlist (video_id)
+            """))
+
+            await db.execute(text("""
+                CREATE TABLE IF NOT EXISTS live_tv_channels (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    logo_url TEXT,
+                    stream_url TEXT,
+                    group_name TEXT,
+                    channel_type TEXT NOT NULL DEFAULT 'real',
+                    is_online INTEGER,
+                    last_checked DATETIME,
+                    source_m3u TEXT,
+                    created_at DATETIME NOT NULL
+                )
+            """))
+
+            await db.commit()
+            logger.info("All migrations complete.")
+
         except Exception as e:
-            logger.warning(f"Migration check failed (non-fatal): {e}")
+            logger.warning(f"Migration error (non-fatal): {e}")
 
 
 async def seed_channels_from_env():
@@ -85,6 +169,7 @@ async def seed_channels_from_env():
                     unique_key=detected["unique_key"],
                     enabled=True,
                     locked=False,
+                    category="general",
                 )
                 db.add(channel)
                 seeded += 1
@@ -129,6 +214,12 @@ async def lifespan(app: FastAPI):
             "Set WATCHDAWG_PIN in .env to enable channel locking."
         )
 
+    # TMDb startup diagnostic
+    if settings.tmdb_api_key:
+        logger.info("TMDb integration is ENABLED. Movie/TV channels will get metadata enrichment.")
+    else:
+        logger.info("TMDB_API_KEY not set — TMDb metadata enrichment is disabled.")
+
     await seed_channels_from_env()
     start_scheduler()
 
@@ -141,7 +232,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="WatchDawg",
     description="Secure media aggregation and streaming backend.",
-    version="0.4.0",
+    version="0.5.0",
     lifespan=lifespan,
 )
 
@@ -155,16 +246,19 @@ app.add_middleware(
 )
 
 # --- Register Routers ---
-from app.routers.health import router as health_router      # noqa: E402
-from app.routers.auth import router as auth_router          # noqa: E402
-from app.routers.feed import router as feed_router          # noqa: E402
-from app.routers.resolve import router as resolve_router    # noqa: E402
-from app.routers.skip import router as skip_router          # noqa: E402
-from app.routers.favorite import router as favorite_router  # noqa: E402
-from app.routers.channel import router as channel_router    # noqa: E402
-from app.routers.library import router as library_router    # noqa: E402
-from app.routers.proxy import router as proxy_router        # noqa: E402
-from app.routers.web_ui import router as web_ui_router      # noqa: E402
+from app.routers.health import router as health_router          # noqa: E402
+from app.routers.auth import router as auth_router              # noqa: E402
+from app.routers.feed import router as feed_router              # noqa: E402
+from app.routers.resolve import router as resolve_router        # noqa: E402
+from app.routers.skip import router as skip_router              # noqa: E402
+from app.routers.favorite import router as favorite_router      # noqa: E402
+from app.routers.channel import router as channel_router        # noqa: E402
+from app.routers.library import router as library_router        # noqa: E402
+from app.routers.proxy import router as proxy_router            # noqa: E402
+from app.routers.watchlist import router as watchlist_router    # noqa: E402
+from app.routers.history import router as history_router        # noqa: E402
+from app.routers.live_tv import router as live_tv_router        # noqa: E402
+from app.routers.web_ui import router as web_ui_router          # noqa: E402
 
 app.include_router(health_router)
 app.include_router(auth_router)
@@ -175,6 +269,9 @@ app.include_router(favorite_router)
 app.include_router(channel_router)
 app.include_router(library_router)
 app.include_router(proxy_router)
+app.include_router(watchlist_router)
+app.include_router(history_router)
+app.include_router(live_tv_router)
 
 # Web UI must be registered LAST so its "/" route doesn't shadow the API
 app.include_router(web_ui_router)
