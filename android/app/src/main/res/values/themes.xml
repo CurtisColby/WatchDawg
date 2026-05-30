@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Minimal theme for a pure Compose TV app. Parent is the base Android
+         theme which exists on every SDK version. Compose overrides everything;
+         we only need this to suppress the title bar and set the window color. -->
+    <style name="Theme.WatchDawg" parent="android:Theme">
+        <item name="android:windowBackground">@color/wd_bg</item>
+        <item name="android:colorBackground">@color/wd_bg</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowFullscreen">true</item>
+    </style>
+</resources>
