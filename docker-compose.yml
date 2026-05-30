@@ -39,3 +39,6 @@ services:
       # Tell FFmpeg and VA-API where the Intel iHD driver lives inside the container
       - LIBVA_DRIVER_NAME=iHD
       - LIBVA_DRIVERS_PATH=/usr/lib/x86_64-linux-gnu/dri
+      # Explicitly pass TMDb API key — env_file alone doesn't guarantee
+      # all keys reach the container when an environment: block also exists.
+      - TMDB_API_KEY=c1b957165d2c293ad1831558b6730b80
