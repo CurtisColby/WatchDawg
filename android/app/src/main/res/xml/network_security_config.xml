@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- LAN-only sideloaded client. The backend runs over plain HTTP on the
+         local network (e.g. http://192.168.50.42:6868). Cleartext is permitted
+         broadly because the target host is user-configurable in Settings.
+         The app only ever contacts the single backend the user configures.
+         Tighten this if you later put the backend behind HTTPS. -->
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

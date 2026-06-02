@@ -1,0 +1,35 @@
+# Secrets — never push
+**/.env
+**/cookies.txt
+
+# Database — stays local
+**/data/
+**/*.db
+**/*.db-shm
+**/*.db-wal
+
+# Python cache
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+
+# Android build output — large binary artifacts
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+**/*.iml
+.idea/
+
+# Media files — never push
+**/*.mp4
+**/*.mkv
+**/*.webm
+**/*.m4v
+**/*.avi
+**/*.mov
+
+# OS
+.DS_Store
+Thumbs.db
+backend/android/
