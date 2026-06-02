@@ -33,3 +33,9 @@ android/local.properties
 .DS_Store
 Thumbs.db
 backend/android/
+**/*.s14backup
+**/*.session*backup
+backend/config/
+backend/templates/
+**/*.bak
+**/*.backup

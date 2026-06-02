@@ -1,0 +1,44 @@
+services:
+  watchdawg:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: watchdawg-backend
+    restart: unless-stopped
+    ports:
+      - "${APP_PORT:-6868}:6868"
+    env_file:
+      - .env
+    devices:
+      # Pass Intel GPU into container for QuickSync hardware transcoding
+      - /dev/dri:/dev/dri
+    group_add:
+      # Give container permission to use the GPU render device
+      - video
+    volumes:
+      # SOURCE CODE — live-mounted so deploys are just file copy + restart.
+      # The image bakes in a copy of app/ as fallback, but this mount
+      # takes precedence at runtime. Edit files in ~/watchdawg-backend/app/
+      # and restart the container — no docker cp, no rebuild needed.
+      - ./app:/app/app
+
+      # Persistent database storage
+      - ./data:/app/data
+
+      # Browser cookies for yt-dlp (read-only inside container)
+      - ./config/cookies.txt:/config/cookies.txt
+
+      # Downloads root — contains Public/ and Private/ subfolders.
+      # Host folder: /media/colby/NAS1/WD_Downloads
+      # Internal container path: /watchdawg
+      # Public/  — unlocked source downloads, visible without PIN
+      # Private/ — locked source downloads, visible only with PIN (Library tab)
+      - /media/colby/NAS1/WD_Downloads:/watchdawg
+    environment:
+      - TZ=${TIMEZONE:-America/Chicago}
+      # Tell FFmpeg and VA-API where the Intel iHD driver lives inside the container
+      - LIBVA_DRIVER_NAME=iHD
+      - LIBVA_DRIVERS_PATH=/usr/lib/x86_64-linux-gnu/dri
+      # Explicitly pass TMDb API key — env_file alone doesn't guarantee
+      # all keys reach the container when an environment: block also exists.
+      - TMDB_API_KEY=c1b957165d2c293ad1831558b6730b80

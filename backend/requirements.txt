@@ -1,0 +1,33 @@
+# Core framework
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.3
+pydantic-settings==2.7.0
+
+# Database
+sqlalchemy==2.0.36
+aiosqlite==0.20.0
+
+# Encryption (ChartHound-standard at-rest encryption)
+cryptography==44.0.0
+
+# Templating for web test UI
+jinja2==3.1.4
+
+# HTTP client for Reddit scraping
+httpx==0.28.1
+
+# Media resolution and discovery engine
+# Dev build required — stable releases prior to 2026.5.x fail on Vimeo channel
+# flat extraction and certain CDN URL patterns.
+yt-dlp>=2026.5.16.233954.dev0
+
+# curl-cffi — required by yt-dlp for impersonation on newer Vimeo CDN responses.
+# Without this, Vimeo HLS-only split-track videos fail with a TLS fingerprint error.
+curl-cffi>=0.15.0
+
+# Background task scheduling
+apscheduler==3.10.4
+
+# Environment variable loading
+python-dotenv==1.0.1
