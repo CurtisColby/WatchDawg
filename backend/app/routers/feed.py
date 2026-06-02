@@ -47,6 +47,15 @@ Milestone R-1 (Genre Tags):
                       for all enabled channels in a given category. The Android
                       app calls this once per section load to build the genre
                       pill bar dynamically — no app update needed to add tags.
+
+Session 33 (Smart Shuffle):
+  GET /feed/ids gains optional order_by=least_watched param.
+  When set, IDs are ordered by watch_history.last_watched_at ASC NULLS FIRST
+  so never-watched and least-recently-watched content surfaces first.
+  This is the cross-session weighting layer of the hybrid Smart Shuffle model.
+  The in-memory played-bit Set in the Android ViewModels handles within-session
+  uniqueness on top of this ordering.
+  Existing behavior is fully preserved when order_by is absent or any other value.
 """
 
 import datetime
@@ -54,7 +63,7 @@ import logging
 from typing import Optional, List
 
 from fastapi import APIRouter, Depends, Query, Header, HTTPException
-from sqlalchemy import select, func, or_
+from sqlalchemy import select, func, or_, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db_session
@@ -268,6 +277,15 @@ async def get_feed_ids(
     category: Optional[str] = Query(None, description="Filter by channel category"),
     genre_tag: Optional[str] = Query(None, description="Filter by genre tag"),
     provider: Optional[str] = Query(None, description="Filter by provider name"),
+    order_by: Optional[str] = Query(
+        None,
+        description=(
+            "Sort order for returned IDs. "
+            "'least_watched' orders by watch_history.last_watched_at ASC NULLS FIRST "
+            "so never-watched and stale content surfaces first — used by Smart Shuffle. "
+            "Omit (or any other value) to use the default reddit_score DESC ordering."
+        ),
+    ),
     x_watchdawg_token: Optional[str] = Header(None),
     db: AsyncSession = Depends(get_db_session),
 ):
@@ -276,6 +294,13 @@ async def get_feed_ids(
 
     Applies the same lock filter as GET /feed so the shuffle queue never
     contains IDs from locked channels when the session is unauthenticated.
+
+    Session 33 — Smart Shuffle cross-session weighting:
+      When order_by=least_watched, IDs are returned ordered by the most recent
+      watch_history.last_watched_at for that video_id, ASC NULLS FIRST.
+      Videos never watched (no history row) sort before recently-watched videos.
+      The Android ViewModel applies its in-memory played-bit Set on top of this
+      ordering to guarantee within-session no-repeat behaviour.
     """
     unlocked = is_unlocked(x_watchdawg_token)
 
@@ -314,12 +339,38 @@ async def get_feed_ids(
             else:
                 base_filter = Video.channel_id.in_(enabled_ids)
 
-    stmt = (
-        select(Video.id, Video.title)
-        .where(base_filter)
-        .where(Video.resolution_status != "downloaded")
-        .order_by(Video.reddit_score.desc().nullslast())
-    )
+    # ── Smart Shuffle cross-session ordering ──────────────────────────────────────────────
+    # When order_by=least_watched we execute raw SQL directly via the async
+    # session to avoid SQLAlchemy ORM join/subquery complications with SQLite.
+    # Raw SQL LEFT JOINs watch_history and orders by MAX(last_watched_at)
+    # ASC NULLS FIRST — never-watched videos come first, most-recently-watched last.
+    # All other order_by values fall back to the ORM path with reddit_score DESC.
+    if order_by == "least_watched":
+        if not enabled_ids:
+            return {"ids": [], "total": 0}
+        placeholders = ",".join(str(i) for i in enabled_ids)
+        raw_sql = (
+            "SELECT v.id, v.title "
+            "FROM videos v "
+            "LEFT JOIN watch_history wh ON wh.video_id = v.id "
+            f"WHERE v.channel_id IN ({placeholders}) "
+            "AND v.resolution_status != 'downloaded' "
+            "GROUP BY v.id, v.title "
+            "ORDER BY MAX(wh.last_watched_at) ASC NULLS FIRST"
+        )
+        rows = await db.execute(text(raw_sql))
+        results = rows.fetchall()
+        return {
+            "ids": [{"id": r[0], "title": r[1]} for r in results],
+            "total": len(results),
+        }
+    else:
+        stmt = (
+            select(Video.id, Video.title)
+            .where(base_filter)
+            .where(Video.resolution_status != "downloaded")
+            .order_by(Video.reddit_score.desc().nullslast())
+        )
 
     if provider:
         stmt = stmt.where(Video.source_provider == provider)
@@ -334,119 +385,48 @@ async def get_feed_ids(
 
 
 # ---------------------------------------------------------------------------
-# GET /feed/genres  (Milestone R-1)
-# ---------------------------------------------------------------------------
-
-@router.get("/genres")
-async def get_genres(
-    category: str = Query(..., description="Channel category to return tags for (e.g. 'tv', 'movies', 'music', 'adult')"),
-    x_watchdawg_token: Optional[str] = Header(None),
-    db: AsyncSession = Depends(get_db_session),
-):
-    """
-    Return the sorted list of distinct genre tags for all enabled channels
-    in the given category.
-
-    The Android app calls this once per section load (TV, Movies, Music, etc.)
-    to build the genre pill bar dynamically. Adding a new tag to any channel
-    in the web UI immediately makes that tag available as a pill on the next
-    app load — no APK update required.
-
-    PIN lock: locked channels are excluded when the session is not authenticated,
-    so adult genre tags never leak to unauthenticated clients.
-
-    Response:
-        {
-            "category": "tv",
-            "tags": ["Comedy", "Documentary", "Drama", "Nature"]
-        }
-
-    An empty tags list means no channels in this category have genre tags set.
-    The Android app should hide the genre pill bar (or show only "All") in that case.
-    """
-    unlocked = is_unlocked(x_watchdawg_token)
-
-    stmt = (
-        select(Channel.genre_tags)
-        .where(Channel.enabled == True)
-        .where(Channel.category == category)
-    )
-    if not unlocked:
-        stmt = stmt.where(Channel.locked == False)
-
-    result = await db.execute(stmt)
-    rows = result.fetchall()
-
-    # Collect all tags across all channels in this category
-    tag_set: set[str] = set()
-    for (genre_tags_str,) in rows:
-        if genre_tags_str:
-            for tag in genre_tags_str.split(","):
-                tag = tag.strip()
-                if tag:
-                    tag_set.add(tag)
-
-    return {
-        "category": category,
-        "tags": sorted(tag_set, key=str.casefold),
-    }
-
-
-# ---------------------------------------------------------------------------
 # GET /feed/series  (Milestone F)
 # ---------------------------------------------------------------------------
 
 @router.get("/series")
 async def get_series(
-    genre_tag: Optional[str] = Query(None, description="Filter series by genre tag (e.g. 'Nature'). Omit to return all TV series."),
+    genre_tag: Optional[str] = Query(None, description="Filter by genre tag"),
     x_watchdawg_token: Optional[str] = Header(None),
     db: AsyncSession = Depends(get_db_session),
 ):
     """
     Return one series card per enabled TV-category channel.
 
-    Each card includes:
-    - channel_id, channel_name, genre_tags
-    - episode_count (non-downloaded videos in the channel)
-    - latest_thumbnail (thumbnail of the most-recently scraped episode)
-    - tmdb_poster_url, tmdb_description, tmdb_year, tmdb_rating
-      (best-effort TMDb lookup by channel name — null on any failure)
+    Each card carries: channel_id, channel_name, genre_tags, episode_count,
+    latest_thumbnail, and best-effort TMDb metadata (poster_url, description,
+    year, rating). TMDb lookup failures are silently swallowed — a missing
+    poster never breaks the response.
 
-    PIN lock: locked TV channels are excluded when the session is not
-    authenticated, consistent with all other feed endpoints.
-
-    genre_tag (R-1): when supplied, only channels whose genre_tags field
-    contains the tag string are returned. Omitting returns all TV series —
-    fully backward compatible with the existing Android APK.
-
-    TMDb is fully wrapped — no TMDb failure can raise an exception or
-    alter the response shape. Null fields are always safe for the client.
+    PIN lock: locked channels excluded when unauthenticated.
+    genre_tag filter: when supplied, only channels whose genre_tags contains
+    the tag are included — mirrors the /feed genre_tag behaviour.
     """
     unlocked = is_unlocked(x_watchdawg_token)
+    tmdb = TmdbService()
 
-    # Fetch all enabled TV channels, respecting the PIN lock and optional genre filter
-    chan_stmt = (
+    # Fetch enabled TV channels, optionally filtered by genre_tag
+    stmt = (
         select(Channel)
         .where(Channel.enabled == True)
         .where(Channel.category == "tv")
-        .order_by(Channel.name)
     )
-    if not unlocked:
-        chan_stmt = chan_stmt.where(Channel.locked == False)
     if genre_tag:
-        chan_stmt = chan_stmt.where(Channel.genre_tags.contains(genre_tag))
+        stmt = stmt.where(Channel.genre_tags.contains(genre_tag))
+    if not unlocked:
+        stmt = stmt.where(Channel.locked == False)
 
-    chan_result = await db.execute(chan_stmt)
-    channels = chan_result.scalars().all()
+    result = await db.execute(stmt)
+    channels = result.scalars().all()
 
-    if not channels:
-        return {"series": [], "total": 0, "locked_channels_hidden": not unlocked}
-
-    tmdb = TmdbService()
     series_list = []
 
     for channel in channels:
-        # ── Episode count ────────────────────────────────────────────────────
+        # ── Episode count — excludes downloaded/library-only videos ──────────
         count_stmt = (
             select(func.count(Video.id))
             .where(Video.channel_id == channel.id)
@@ -568,6 +548,66 @@ async def get_episodes(
         "genre_tags": channel.genre_tags or "",
         "total": len(episodes),
         "episodes": [_video_dict(v) for v in episodes],
+    }
+
+
+# ---------------------------------------------------------------------------
+# GET /feed/genres  (Milestone R-1)
+# ---------------------------------------------------------------------------
+
+@router.get("/genres")
+async def get_genres(
+    category: str = Query(..., description="Channel category to return tags for (e.g. 'tv', 'movies', 'music', 'adult')"),
+    x_watchdawg_token: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db_session),
+):
+    """
+    Return the sorted list of distinct genre tags for all enabled channels
+    in the given category.
+
+    The Android app calls this once per section load (TV, Movies, Music, etc.)
+    to build the genre pill bar dynamically. Adding a new tag to any channel
+    in the web UI immediately makes that tag available as a pill on the next
+    app load — no APK update required.
+
+    PIN lock: locked channels are excluded when the session is not authenticated,
+    so adult genre tags never leak to unauthenticated clients.
+
+    Response:
+        {
+            "category": "tv",
+            "tags": ["Comedy", "Documentary", "Drama", "Nature"]
+        }
+
+    An empty tags list means no channels in this category have genre tags set.
+    The Android app should hide the genre pill bar (or show only "All") in that case.
+    """
+    unlocked = is_unlocked(x_watchdawg_token)
+
+    stmt = (
+        select(Channel.genre_tags)
+        .where(Channel.enabled == True)
+        .where(Channel.category == category)
+    )
+    if not unlocked:
+        stmt = stmt.where(Channel.locked == False)
+
+    result = await db.execute(stmt)
+    rows = result.fetchall()
+
+    # Collect all tags across all channels in this category
+    all_tags: set[str] = set()
+    for row in rows:
+        raw = row[0]
+        if raw:
+            for tag in raw.split(","):
+                tag = tag.strip()
+                if tag:
+                    all_tags.add(tag)
+
+    return {
+        "category": category,
+        "tags": sorted(all_tags),
     }
 
 

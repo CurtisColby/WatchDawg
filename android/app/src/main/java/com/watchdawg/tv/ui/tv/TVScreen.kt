@@ -29,12 +29,7 @@ import com.watchdawg.tv.ui.theme.WatchDawgColors
 import com.watchdawg.tv.ui.theme.focusGlow
 
 /**
- * TV Section screen — Milestone R-2.5.
- *
- * Milestone R-2.5 change: [miniPlayerActive] param removed. The mini-player
- * system has been deleted entirely (NavRail focus problem is solved by the
- * Home Screen architecture). TVScreen is now a pure full-screen content view
- * with no awareness of player state.
+ * TV Section screen — Milestone R-2.
  *
  * Layout:
  *   ┌──────────────────────────────────────────────────────────┐
@@ -46,16 +41,20 @@ import com.watchdawg.tv.ui.theme.focusGlow
  *   └──────────────────────────────────────────────────────────┘
  *
  * Navigation flow:
- *   Home → TVScreen → tap series card → EpisodeListScreen → tap episode → Player
- *   Back from Player → EpisodeListScreen
- *   Back from EpisodeListScreen → TVScreen
- *   Back from TVScreen → Home
+ *   TVScreen → tap series card → EpisodeListScreen → tap episode → Player
+ *   Back from EpisodeList → TVScreen (series grid)
+ *   Back from series grid → NavRail
  *
  * Genre pill behaviour:
  *   - "All" pill is always present and always first.
  *   - Selecting a genre pill calls seriesViewModel.loadSeries(tag).
  *   - Selecting "All" calls seriesViewModel.loadSeries(null).
  *   - Pill bar is hidden when no tags exist yet (all channels have empty genre_tags).
+ *
+ * Back-nav safety:
+ *   SeriesScreen owns no NavController — it calls [onSeriesTap] / [onPlay] callbacks
+ *   which are handled by MainActivity. The screen has no miniPlayerActive guard
+ *   (see Restructure Plan — Bug 3 was caused by exactly this pattern on MovieDetail).
  *
  * @param tvViewModel      Owns genre list + selected genre state.
  * @param seriesViewModel  Owns series grid + episode state. Hoisted at WatchDawgRoot
@@ -81,7 +80,10 @@ fun TVScreen(
     }
 
     // Reload series whenever the genre selection changes.
+    // Also clear the Smart Shuffle played-bit Set so each genre
+    // gets its own independent played cycle.
     LaunchedEffect(selectedGenre) {
+        seriesViewModel.clearPlayedIds()
         seriesViewModel.loadSeries(genreTag = selectedGenre)
     }
 
@@ -108,8 +110,8 @@ fun TVScreen(
         // ── Series grid ───────────────────────────────────────────────────────
         SeriesScreen(
             viewModel                 = seriesViewModel,
-            selectedGenre             = selectedGenre,
             lastTappedSeriesChannelId = lastTappedSeriesChannelId,
+            selectedGenre             = selectedGenre,
             onSeriesTap               = onSeriesTap,
             onPlay                    = onPlay,
             modifier                  = Modifier

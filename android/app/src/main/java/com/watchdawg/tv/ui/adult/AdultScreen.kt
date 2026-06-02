@@ -196,7 +196,7 @@ fun AdultScreen(
                             modifier = Modifier.focusGlow(),
                         ) { Text("▶  Play All", style = MaterialTheme.typography.titleSmall) }
                         Button(
-                            onClick  = { viewModel.shuffleAll() },
+                            onClick  = { viewModel.smartShuffle() },
                             colors   = ButtonDefaults.colors(
                                 containerColor        = WatchDawgColors.OrangeDim,
                                 contentColor          = WatchDawgColors.Orange,
@@ -204,7 +204,7 @@ fun AdultScreen(
                                 focusedContentColor   = WatchDawgColors.Background,
                             ),
                             modifier = Modifier.focusGlow(),
-                        ) { Text("🔀  Shuffle", style = MaterialTheme.typography.titleSmall) }
+                        ) { Text("🎲  Smart Shuffle", style = MaterialTheme.typography.titleSmall) }
                     }
                     // Generate Thumbnails — shown when Local pill is active
                     if (selectedPill == AdultViewModel.LOCAL_PILL) {

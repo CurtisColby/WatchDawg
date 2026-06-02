@@ -6,6 +6,7 @@ import com.watchdawg.tv.data.api.FavoriteDto
 import com.watchdawg.tv.data.api.LibraryFileDto
 import com.watchdawg.tv.data.api.VideoDto
 import com.watchdawg.tv.data.auth.TokenHolder
+import com.watchdawg.tv.data.prefs.QueueHolder
 import com.watchdawg.tv.data.repo.WatchDawgRepository
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -36,6 +37,19 @@ import kotlinx.coroutines.launch
  * Duplicate favorite prevention: handled server-side — POST /favorite/{id}/bookmark
  * returns {"status":"already_favorited"} silently with no duplicate created.
  * No client-side guard needed.
+ *
+ * Session 33 — Smart Shuffle (hybrid played-bit model):
+ *   smartShuffle() replaces shuffleAll() for genre pill content (backend feed).
+ *   Favorites and Local pills use simple shuffled() — they are small curated
+ *   lists where repeat-prevention is less important and there is no backend
+ *   ordering endpoint for them.
+ *
+ *   Genre pill smart shuffle behaviour is identical to MusicViewModel:
+ *   - In-memory playedIds Set tracks played videos within the session.
+ *   - Backend order_by=least_watched gives cross-session weighting.
+ *   - playedIds is cleared when the pill changes (genre isolation).
+ *   - Silent cycle reset when pool is exhausted.
+ *   - QueueHolder.onVideoPlayed callback wired to markPlayed().
  */
 class AdultViewModel(private val repo: WatchDawgRepository) : ViewModel() {
 
@@ -97,6 +111,15 @@ class AdultViewModel(private val repo: WatchDawgRepository) : ViewModel() {
 
     private val _pendingUrlQueue = MutableStateFlow<List<String>?>(null)
     val pendingUrlQueue: StateFlow<List<String>?> = _pendingUrlQueue
+
+    // ── Smart Shuffle — in-memory played-bit Set ──────────────────────────────
+
+    /**
+     * Tracks video IDs that have already been played this session for the
+     * current genre pill. Cleared on genre pill change and on full-cycle reset.
+     * Does NOT apply to Favorites or Local pills (they use simple shuffle).
+     */
+    private val playedIds: MutableSet<Int> = mutableSetOf()
 
     // ── Init ──────────────────────────────────────────────────────────────────
 
@@ -169,6 +192,12 @@ class AdultViewModel(private val repo: WatchDawgRepository) : ViewModel() {
     }
 
     fun selectPill(pill: String?) {
+        // Clear played Set when switching between genre pills so each genre
+        // has its own independent played cycle. Favorites / Local do not use
+        // the played Set so the clear is harmless for them.
+        if (pill != _selectedPill.value) {
+            playedIds.clear()
+        }
         _selectedPill.value = pill
         if (pill != FAVORITES_PILL && pill != LOCAL_PILL) {
             loadAdult(genreTag = pill)
@@ -220,6 +249,17 @@ class AdultViewModel(private val repo: WatchDawgRepository) : ViewModel() {
         }
     }
 
+    // ── Mark played (Smart Shuffle callback) ──────────────────────────────────
+
+    /**
+     * Called by QueueHolder.onVideoPlayed when PlayerViewModel successfully
+     * resolves a new video during a smart shuffle queue. Adds the videoId to
+     * the in-memory playedIds Set so the next smartShuffle() call excludes it.
+     */
+    fun markPlayed(videoId: Int) {
+        playedIds.add(videoId)
+    }
+
     // ── Play All / Shuffle All ────────────────────────────────────────────────
 
     fun playAll() {
@@ -228,7 +268,10 @@ class AdultViewModel(private val repo: WatchDawgRepository) : ViewModel() {
                 val ids = _lockedFavorites.value
                     .filter { it.downloadStatus != "complete" && it.videoId != null && it.videoId > 0 }
                     .mapNotNull { it.videoId }
-                if (ids.isNotEmpty()) _pendingIdQueue.value = PendingIdQueue(ids, 0)
+                if (ids.isNotEmpty()) {
+                    QueueHolder.onVideoPlayed = null
+                    _pendingIdQueue.value = PendingIdQueue(ids, 0)
+                }
             }
             LOCAL_PILL -> {
                 val urls = _privateFiles.value.mapNotNull { it.streamUrl?.takeIf { u -> u.isNotBlank() } }
@@ -239,21 +282,36 @@ class AdultViewModel(private val repo: WatchDawgRepository) : ViewModel() {
                     repo.getFeedIds(category = "adult", genreTag = pill)
                         .onSuccess { response ->
                             val ids = response.ids.map { it.id }
-                            if (ids.isNotEmpty()) _pendingIdQueue.value = PendingIdQueue(ids, 0)
+                            if (ids.isNotEmpty()) {
+                                QueueHolder.onVideoPlayed = null
+                                _pendingIdQueue.value = PendingIdQueue(ids, 0)
+                            }
                         }
                 }
             }
         }
     }
 
-    fun shuffleAll() {
+    /**
+     * Smart Shuffle:
+     * - Favorites pill: simple shuffle of the in-memory favorites list (small
+     *   curated list, no played-bit tracking needed).
+     * - Local pill: simple shuffle of the in-memory private files list.
+     * - Genre pills: hybrid Smart Shuffle — same model as MusicViewModel.
+     *   Cross-session weighting via order_by=least_watched, within-session
+     *   no-repeat via playedIds Set, silent cycle reset when pool exhausted.
+     */
+    fun smartShuffle() {
         when (val pill = _selectedPill.value) {
             FAVORITES_PILL -> {
                 val ids = _lockedFavorites.value
                     .filter { it.downloadStatus != "complete" && it.videoId != null && it.videoId > 0 }
                     .mapNotNull { it.videoId }
                     .shuffled()
-                if (ids.isNotEmpty()) _pendingIdQueue.value = PendingIdQueue(ids, 0)
+                if (ids.isNotEmpty()) {
+                    QueueHolder.onVideoPlayed = null
+                    _pendingIdQueue.value = PendingIdQueue(ids, 0)
+                }
             }
             LOCAL_PILL -> {
                 val urls = _privateFiles.value
@@ -262,12 +320,44 @@ class AdultViewModel(private val repo: WatchDawgRepository) : ViewModel() {
                 if (urls.isNotEmpty()) _pendingUrlQueue.value = urls
             }
             else -> {
+                // Genre pill — full Smart Shuffle with played-bit + cross-session weighting
                 viewModelScope.launch {
-                    repo.getFeedIds(category = "adult", genreTag = pill)
-                        .onSuccess { response ->
-                            val ids = response.ids.map { it.id }.shuffled()
-                            if (ids.isNotEmpty()) _pendingIdQueue.value = PendingIdQueue(ids, 0)
+                    repo.getFeedIds(
+                        category = "adult",
+                        genreTag = pill,
+                        orderBy  = "least_watched",
+                    ).onSuccess { response ->
+                        val allIds = response.ids.map { it.id }
+                        if (allIds.isEmpty()) return@onSuccess
+
+                        // Filter to unplayed videos for this session
+                        val unplayed = allIds.filter { it !in playedIds }
+
+                        // If pool exhausted — silent cycle reset
+                        val pool = if (unplayed.isEmpty()) {
+                            playedIds.clear()
+                            allIds
+                        } else {
+                            unplayed
                         }
+
+                        // Shuffle within the backend-ordered pool
+                        val shuffled = pool.shuffled()
+
+                        // Register played callback BEFORE queuing
+                        QueueHolder.onVideoPlayed = { videoId -> markPlayed(videoId) }
+
+                        _pendingIdQueue.value = PendingIdQueue(shuffled, 0)
+
+                    }.onFailure {
+                        // Backend call failed — fall back to plain shuffle of visible videos
+                        val visibleIds = (_adultState.value as? AdultState.Ready)
+                            ?.videos?.map { it.id }?.shuffled() ?: return@onFailure
+                        if (visibleIds.isNotEmpty()) {
+                            QueueHolder.onVideoPlayed = { videoId -> markPlayed(videoId) }
+                            _pendingIdQueue.value = PendingIdQueue(visibleIds, 0)
+                        }
+                    }
                 }
             }
         }

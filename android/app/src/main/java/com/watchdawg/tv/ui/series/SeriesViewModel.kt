@@ -5,6 +5,7 @@ import androidx.lifecycle.viewModelScope
 import com.watchdawg.tv.data.api.EpisodesResponse
 import com.watchdawg.tv.data.api.SeriesItemDto
 import com.watchdawg.tv.data.api.VideoDto
+import com.watchdawg.tv.data.prefs.QueueHolder
 import com.watchdawg.tv.data.repo.WatchDawgRepository
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -18,6 +19,9 @@ import kotlinx.coroutines.launch
  *  - [EpisodeListScreen] — sortable episode list for a selected series
  *
  * Milestone R-2: loadSeries() gains optional [genreTag] param.
+ * Session 33: shuffleAllTv() upgraded to smartShuffleTv() — hybrid played-bit
+ *             + cross-session weighting. playedIds Set tracks within-session
+ *             no-repeat. Cleared on genre pill change. Same model as MusicViewModel.
  *   When non-null the backend filters to channels whose genre_tags field
  *   contains the tag. Null = return all TV series (backward compat).
  *   Called by TVScreen whenever the user selects a genre pill.
@@ -79,6 +83,19 @@ class SeriesViewModel(private val repo: WatchDawgRepository) : ViewModel() {
 
     private val _tvQueueLoading = MutableStateFlow(false)
     val tvQueueLoading: StateFlow<Boolean> = _tvQueueLoading
+
+    // ── Smart Shuffle — in-memory played-bit Set ─────────────────────────────
+
+    /**
+     * Tracks video IDs already played this session for the current genre.
+     * Cleared on genre pill change via clearPlayedIds(). Silent cycle reset
+     * when the entire pool has been played.
+     */
+    private val playedIds: MutableSet<Int> = mutableSetOf()
+
+    fun clearPlayedIds() { playedIds.clear() }
+
+    fun markPlayed(videoId: Int) { playedIds.add(videoId) }
 
     // ── Actions ───────────────────────────────────────────────────────────────
 
@@ -175,16 +192,51 @@ class SeriesViewModel(private val repo: WatchDawgRepository) : ViewModel() {
         }
     }
 
-    fun shuffleAllTv(genreTag: String? = null) {
+    /**
+     * Smart Shuffle — hybrid played-bit + cross-session weighting.
+     * Identical model to MusicViewModel.smartShuffle():
+     *   1. Backend returns IDs ordered by least_watched ASC NULLS FIRST.
+     *   2. Client filters out already-played IDs from in-memory playedIds Set.
+     *   3. If pool exhausted, playedIds cleared silently for a fresh cycle.
+     *   4. QueueHolder.onVideoPlayed wired to markPlayed() before queuing.
+     * Falls back to plain shuffle of all IDs if the backend call fails.
+     */
+    fun smartShuffleTv(genreTag: String? = null) {
         viewModelScope.launch {
             _tvQueueLoading.value = true
-            repo.getFeedIds(category = "tv", genreTag = genreTag)
-                .onSuccess { resp ->
-                    val ids = resp.ids.map { it.id }.shuffled()
-                    _tvQueueLoading.value = false
-                    if (ids.isNotEmpty()) _pendingQueue.value = QueuePayload(ids, 0)
+            repo.getFeedIds(
+                category = "tv",
+                genreTag = genreTag,
+                orderBy  = "least_watched",
+            ).onSuccess { resp ->
+                val allIds = resp.ids.map { it.id }
+                _tvQueueLoading.value = false
+                if (allIds.isEmpty()) return@onSuccess
+
+                val unplayed = allIds.filter { it !in playedIds }
+                val pool = if (unplayed.isEmpty()) {
+                    playedIds.clear()
+                    allIds
+                } else {
+                    unplayed
                 }
-                .onFailure { _tvQueueLoading.value = false }
+
+                val shuffled = pool.shuffled()
+                QueueHolder.onVideoPlayed = { videoId -> markPlayed(videoId) }
+                _pendingQueue.value = QueuePayload(shuffled, 0)
+
+            }.onFailure {
+                // Backend call failed — fall back to plain shuffle
+                _tvQueueLoading.value = false
+                repo.getFeedIds(category = "tv", genreTag = genreTag)
+                    .onSuccess { resp ->
+                        val ids = resp.ids.map { it.id }.shuffled()
+                        if (ids.isNotEmpty()) {
+                            QueueHolder.onVideoPlayed = { videoId -> markPlayed(videoId) }
+                            _pendingQueue.value = QueuePayload(ids, 0)
+                        }
+                    }
+            }
         }
     }
 }

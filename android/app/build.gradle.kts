@@ -67,7 +67,7 @@ dependencies {
 
     // tv-material only (tv-foundation removed; lazy containers use standard Compose)
     implementation(libs.androidx.tv.material)
-
+    implementation("androidx.palette:palette-ktx:1.0.0")
     implementation(libs.androidx.navigation.compose)
     implementation(libs.androidx.palette)
 

@@ -85,6 +85,19 @@ import com.watchdawg.tv.ui.watchlater.WatchLaterViewModel
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // ── Keep the screen alive for the entire app session ──────────────────
+        // FLAG_KEEP_SCREEN_ON is set once here and intentionally NEVER cleared
+        // in onPause(). Clearing it on pause was the root cause of the 30–60
+        // minute crash: Projectivy Launcher fires onPause/onResume on our
+        // activity periodically while it manages its own overlay UI. Each cycle
+        // stripped the flag, eventually allowing the TV's Ambient Mode to
+        // reclaim the activity. The Android docs confirm the system already
+        // allows the screen to turn off normally when the app is backgrounded —
+        // we do not need to clear it manually. It is only fully released in
+        // onDestroy() when the user explicitly exits the app.
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+
         setContent {
             WatchDawgTheme {
                 Surface(
@@ -97,14 +110,15 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        // Re-add the flag on every resume as a belt-and-suspenders guard.
+        // Some OEM TV firmware strips window flags on resume — this ensures
+        // the flag is always present when WatchDawg is the foreground activity.
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         Graph.playerManagerIfExists()?.reattachSurface()
     }
 
-    override fun onPause() {
-        super.onPause()
-        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-    }
+    // onPause() intentionally has NO clearFlags() call.
+    // See onCreate() comment above for the full explanation.
 
     override fun onStop() {
         super.onStop()
@@ -113,6 +127,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        // Only clear the flag when the user is truly done with the app.
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         TokenHolder.clear()
         QueueHolder.clear()
         Graph.releasePlayerManager()
@@ -377,7 +393,7 @@ private fun WatchDawgRoot(onFinish: () -> Unit) {
                 AdultScreen(
                     viewModel = adultViewModel,
                     onPlayById = { videoId, queue, index, hlsMode ->
-                        QueueHolder.setIdQueue(queue, index, hls = hlsMode)
+                        QueueHolder.setIdQueue(queue, index, hls = hlsMode, locked = true)
                         navController.navigate(Routes.player(videoId, index))
                     },
                     onPlayByUrl = { relativeUrl, title ->

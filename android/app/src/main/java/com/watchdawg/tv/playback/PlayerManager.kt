@@ -46,6 +46,27 @@ import okhttp3.OkHttpClient
  *   audioUrl present + URL contains "m3u8" or is VIMEO_CDN type  → playMerged()
  *   audioUrl present + URL is progressive MP4 (YouTube)           → playDash()
  *   audioUrl absent                                                → play()
+ *
+ * Surface lifecycle:
+ *   detachSurface()    — called from MainActivity.onStop(). Clears the video
+ *                        surface from the player so ExoPlayer does not hold a
+ *                        reference to a Surface that the system is about to
+ *                        destroy (e.g. when Projectivy Launcher takes focus or
+ *                        the TV briefly interrupts the activity). The player
+ *                        instance is NOT released — it survives the lifecycle
+ *                        transition so audio continues and state is preserved.
+ *
+ *   reattachSurface()  — called from MainActivity.onResume(). Previously this
+ *                        incorrectly called clearVideoSurface() again (same as
+ *                        detachSurface), which meant the surface was never
+ *                        restored and ExoPlayer would eventually throw a null
+ *                        surface exception and crash. The correct behaviour is
+ *                        to do nothing here — PlayerView re-binds itself to
+ *                        the player automatically when it re-enters composition
+ *                        on the next frame. Calling clearVideoSurface() a second
+ *                        time would race with that re-bind and could prevent
+ *                        video from ever rendering again after a Projectivy
+ *                        overlay interaction.
  */
 @OptIn(UnstableApi::class)
 class PlayerManager(
@@ -187,17 +208,32 @@ class PlayerManager(
 
     /**
      * Detach the video surface from the player without releasing it.
+     *
      * Called from MainActivity.onStop() so the player survives the activity
-     * lifecycle transition (e.g. screensaver activation) without throwing a
-     * null surface exception. Calling clearVideoSurface() then letting
-     * PlayerView rebind is the safe pattern here.
+     * lifecycle transition (e.g. Projectivy Launcher overlay interactions,
+     * screensaver activation) without throwing a null surface exception.
+     * Audio continues playing; only the video surface is disconnected.
      */
     fun detachSurface() {
         player.clearVideoSurface()
     }
 
+    /**
+     * Signal that the activity has resumed and the video surface is available
+     * again.
+     *
+     * The correct implementation here is intentionally a no-op. PlayerView
+     * re-binds itself to the player automatically when it re-enters the Compose
+     * composition on the next frame after onResume(). Calling clearVideoSurface()
+     * here (as the previous broken implementation did) would race with that
+     * automatic re-bind and could permanently prevent video from rendering,
+     * ultimately causing a crash when ExoPlayer tries to decode to a null surface.
+     *
+     * Do NOT add clearVideoSurface() or setVideoSurface() calls here.
+     */
     fun reattachSurface() {
-        player.clearVideoSurface()
+        // Intentional no-op. PlayerView handles its own re-bind on resume.
+        // See class-level KDoc for the full explanation.
     }
 
     /**
@@ -210,4 +246,3 @@ class PlayerManager(
         player.release()
     }
 }
-

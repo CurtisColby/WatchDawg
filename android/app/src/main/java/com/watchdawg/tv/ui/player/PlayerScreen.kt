@@ -64,7 +64,15 @@ import androidx.tv.material3.Button
 import androidx.tv.material3.ButtonDefaults
 import androidx.tv.material3.MaterialTheme
 import androidx.tv.material3.Text
+import android.graphics.Bitmap
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.tween
+import androidx.compose.ui.graphics.toArgb
+import androidx.palette.graphics.Palette
+import coil.ImageLoader
 import coil.compose.AsyncImage
+import coil.request.ImageRequest
+import coil.request.SuccessResult
 import com.watchdawg.tv.Graph
 import com.watchdawg.tv.ui.theme.WatchDawgColors
 import com.watchdawg.tv.ui.theme.focusGlow
@@ -134,6 +142,17 @@ fun PlayerScreen(
     var speedMenuVisible by remember { mutableStateOf(false) }
     val speedMenuFirstFocus = remember { FocusRequester() }
 
+    // Session 33 — Dynamic Tinting: dominant colour extracted from the
+    // current video's thumbnail via Palette API. Applied as a subtle background
+    // tint behind the control bar. Falls back to transparent (solid black base)
+    // when the thumbnail is null or Palette returns no suitable swatch.
+    var tintColor by remember { mutableStateOf(Color.Transparent) }
+    val animatedTint by animateColorAsState(
+        targetValue  = tintColor,
+        animationSpec = tween(durationMillis = 600),
+        label        = "playerTint",
+    )
+
     var scrubActive         by remember { mutableStateOf(false) }
     var scrubTickCount      by remember { mutableStateOf(0) }
     var holdKeyDownTime     by remember { mutableLongStateOf(0L) }
@@ -199,6 +218,43 @@ fun PlayerScreen(
     LaunchedEffect(deleteBubble) { if (deleteBubble) { delay(1200); deleteBubble = false } }
     LaunchedEffect(speedBubble)  { if (speedBubble != null) { delay(1200); speedBubble = null } }
     LaunchedEffect(state.ended)  { if (state.ended) onStop() }
+
+    // ── Dynamic Tinting: extract dominant muted colour from thumbnail ─────────
+    // Fires whenever the thumbnail URL changes (i.e. on each new video).
+    // Uses Coil's ImageLoader to load the bitmap then Palette to extract the
+    // dominant dark muted swatch. The resulting colour is darkened to 40% alpha
+    // so it blends subtly with the black background rather than overwhelming it.
+    // No-op when thumbnailUrl is null — tintColor stays transparent.
+    LaunchedEffect(state.thumbnailUrl) {
+        val rawUrl = state.thumbnailUrl
+        if (rawUrl.isNullOrBlank()) {
+            tintColor = Color.Transparent
+            return@LaunchedEffect
+        }
+        val baseUrl = Graph.serverPrefs.getBaseUrl().trimEnd('/')
+        val resolvedUrl = if (rawUrl.startsWith("http")) rawUrl else "${'$'}baseUrl${'$'}rawUrl"
+        try {
+            val loader  = ImageLoader(context)
+            val request = ImageRequest.Builder(context).data(resolvedUrl).allowHardware(false).build()
+            val result  = loader.execute(request)
+            if (result is SuccessResult) {
+                val bitmap: Bitmap = (result.drawable as? android.graphics.drawable.BitmapDrawable)
+                    ?.bitmap ?: return@LaunchedEffect
+                val palette = Palette.from(bitmap).generate()
+                val swatch  = palette.darkMutedSwatch
+                    ?: palette.mutedSwatch
+                    ?: palette.darkVibrantSwatch
+                if (swatch != null) {
+                    // Apply at 35% alpha so the tint is atmospheric, not garish
+                    tintColor = Color(swatch.rgb).copy(alpha = 0.35f)
+                } else {
+                    tintColor = Color.Transparent
+                }
+            }
+        } catch (_: Exception) {
+            tintColor = Color.Transparent
+        }
+    }
 
     // ── Initial start ─────────────────────────────────────────────────────────
     LaunchedEffect(Unit) {
@@ -338,6 +394,10 @@ fun PlayerScreen(
         modifier = Modifier
             .fillMaxSize()
             .background(Color.Black)
+            // Session 33: Dynamic Tinting — subtle ambient colour derived from
+            // the video thumbnail, animated on video change. Layered above the
+            // solid black base so black always shows when tint is transparent.
+            .background(animatedTint)
             .focusRequester(playerSurfaceFocus)
             .focusable()  // ← critical: Box must be in focus graph to receive key events
             .onKeyEvent { event ->

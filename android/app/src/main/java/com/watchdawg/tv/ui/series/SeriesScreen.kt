@@ -49,22 +49,21 @@ import com.watchdawg.tv.ui.theme.focusGlowCard
 import kotlinx.coroutines.delay
 
 /**
- * Series grid screen — R-3 thumbnail fix.
+ * Series grid screen — Milestone F.
  *
- * All cards are uniform 2:3 portrait aspect ratio regardless of art source.
+ * Milestone R-2 focus fix: when returning from EpisodeList via Back, focus is
+ * restored to the series card that was last tapped. [lastTappedSeriesChannelId]
+ * is passed from MainActivity (hoisted state) and drives a LaunchedEffect that
+ * fires on first composition to pull focus away from the NavRail.
  *
- * ContentScale strategy:
- *   - TMDB poster → ContentScale.Crop  (poster is already 2:3, fills card perfectly)
- *   - YouTube thumbnail → ContentScale.Fit  (16:9 image letterboxed inside 2:3 card,
- *     dark bars top/bottom, image stays sharp at native resolution — no stretching)
- *
- * This keeps the grid rows uniform height while never distorting images.
+ * Same pattern used in EpisodeListScreen — FocusRequester map keyed by
+ * channelId, 150ms delay for grid layout to complete.
  */
 @Composable
 fun SeriesScreen(
     viewModel: SeriesViewModel,
-    selectedGenre: String? = null,
     lastTappedSeriesChannelId: Int = -1,
+    selectedGenre: String? = null,   // Session 33: passed from TVScreen for genre-aware Smart Shuffle
     onSeriesTap: (channelId: Int, channelName: String) -> Unit,
     onPlay: (videoId: Int, queue: List<Int>, index: Int, hlsMode: Boolean) -> Unit,
     modifier: Modifier = Modifier,
@@ -73,14 +72,23 @@ fun SeriesScreen(
     val queueLoading by viewModel.tvQueueLoading.collectAsStateWithLifecycle()
     val pendingQueue by viewModel.pendingQueue.collectAsStateWithLifecycle()
 
-    val gridState           = rememberLazyGridState()
+    val gridState = rememberLazyGridState()
+
+    // FocusRequester map — one per series channelId.
+    // Populated as cards are composed. Used to restore focus on Back from
+    // EpisodeList and on first load (to pull focus from the NavRail).
     val cardFocusRequesters = remember { mutableMapOf<Int, FocusRequester>() }
-    val firstCardFocus      = remember { FocusRequester() }
 
-    // TVScreen owns the load via LaunchedEffect(selectedGenre) in TVScreen.
-    // SeriesScreen must never call loadSeries() independently — it overwrites
-    // the genre-filtered result every time this composable re-enters composition.
+    // Dedicated requester for the first card — used when no specific card
+    // is targeted (e.g. first load, no prior series tapped).
+    val firstCardFocus = remember { FocusRequester() }
 
+    // Load on entry — idempotent if already loaded.
+    LaunchedEffect(Unit) {
+        viewModel.loadSeries()
+    }
+
+    // One-shot: fire play when queue is ready, then clear.
     LaunchedEffect(pendingQueue) {
         val q = pendingQueue ?: return@LaunchedEffect
         if (q.ids.isNotEmpty()) {
@@ -89,14 +97,21 @@ fun SeriesScreen(
         }
     }
 
+    // Restore focus when series load completes.
+    //   - If lastTappedSeriesChannelId is valid: focus that card (Back from EpisodeList).
+    //   - Otherwise: focus the first card (first load, pulls focus from NavRail).
+    // 150ms delay: grid must finish layout before requestFocus() works.
     LaunchedEffect(state) {
         if (state !is SeriesViewModel.SeriesState.Success) return@LaunchedEffect
         val items = (state as SeriesViewModel.SeriesState.Success).items
         if (items.isEmpty()) return@LaunchedEffect
         delay(150)
         if (lastTappedSeriesChannelId > 0) {
-            try { cardFocusRequesters[lastTappedSeriesChannelId]?.requestFocus() }
-            catch (_: Exception) { try { firstCardFocus.requestFocus() } catch (_: Exception) {} }
+            try {
+                cardFocusRequesters[lastTappedSeriesChannelId]?.requestFocus()
+            } catch (_: Exception) {
+                try { firstCardFocus.requestFocus() } catch (_: Exception) {}
+            }
         } else {
             try { firstCardFocus.requestFocus() } catch (_: Exception) {}
         }
@@ -104,12 +119,13 @@ fun SeriesScreen(
 
     Column(modifier = modifier.fillMaxSize()) {
 
-        // ── Header ────────────────────────────────────────────────────────────
+        // ── Header row ────────────────────────────────────────────────────────
         Row(
             verticalAlignment     = Alignment.Bottom,
             horizontalArrangement = Arrangement.SpaceBetween,
             modifier              = Modifier.fillMaxWidth(),
         ) {
+            // Title + count
             Row(verticalAlignment = Alignment.Bottom) {
                 Text(
                     text  = "TV Series",
@@ -118,7 +134,8 @@ fun SeriesScreen(
                 )
                 Spacer(Modifier.width(12.dp))
                 val subtitle = when (val s = state) {
-                    is SeriesViewModel.SeriesState.Success -> "${s.items.size} series"
+                    is SeriesViewModel.SeriesState.Success ->
+                        "${s.items.size} series"
                     is SeriesViewModel.SeriesState.Loading -> "Loading…"
                     is SeriesViewModel.SeriesState.Error   -> "Error"
                 }
@@ -130,13 +147,14 @@ fun SeriesScreen(
                 )
             }
 
+            // Action buttons — only shown when series loaded and non-empty
             if (state is SeriesViewModel.SeriesState.Success &&
                 (state as SeriesViewModel.SeriesState.Success).items.isNotEmpty()
             ) {
                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     Button(
-                        onClick  = { if (!queueLoading) viewModel.playAllTv(selectedGenre) },
-                        colors   = ButtonDefaults.colors(
+                        onClick = { if (!queueLoading) viewModel.playAllTv() },
+                        colors  = ButtonDefaults.colors(
                             containerColor        = WatchDawgColors.OrangeDim,
                             contentColor          = WatchDawgColors.Orange,
                             focusedContainerColor = WatchDawgColors.Orange,
@@ -150,8 +168,8 @@ fun SeriesScreen(
                         )
                     }
                     Button(
-                        onClick  = { if (!queueLoading) viewModel.shuffleAllTv(selectedGenre) },
-                        colors   = ButtonDefaults.colors(
+                        onClick = { if (!queueLoading) viewModel.smartShuffleTv(selectedGenre) },
+                        colors  = ButtonDefaults.colors(
                             containerColor        = WatchDawgColors.OrangeDim,
                             contentColor          = WatchDawgColors.Orange,
                             focusedContainerColor = WatchDawgColors.Orange,
@@ -159,7 +177,7 @@ fun SeriesScreen(
                         ),
                         modifier = Modifier.focusGlow(),
                     ) {
-                        Text("🔀  Shuffle All TV", style = MaterialTheme.typography.titleSmall)
+                        Text("🎲  Smart Shuffle TV", style = MaterialTheme.typography.titleSmall)
                     }
                 }
             }
@@ -171,47 +189,79 @@ fun SeriesScreen(
         when (val s = state) {
             is SeriesViewModel.SeriesState.Loading -> {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    Text("Loading series…", style = MaterialTheme.typography.titleLarge, color = WatchDawgColors.TextSecondary)
+                    Text(
+                        text  = "Loading series…",
+                        style = MaterialTheme.typography.titleLarge,
+                        color = WatchDawgColors.TextSecondary,
+                    )
                 }
             }
+
             is SeriesViewModel.SeriesState.Error -> {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
                         Text("📺", style = MaterialTheme.typography.displayLarge)
                         Spacer(Modifier.height(12.dp))
-                        Text("Could not load series.", style = MaterialTheme.typography.titleLarge, color = WatchDawgColors.TextSecondary)
-                        Text(s.message, style = MaterialTheme.typography.bodyMedium, color = WatchDawgColors.TextTertiary, modifier = Modifier.padding(top = 8.dp))
+                        Text(
+                            text  = "Could not load series.",
+                            style = MaterialTheme.typography.titleLarge,
+                            color = WatchDawgColors.TextSecondary,
+                        )
+                        Text(
+                            text     = s.message,
+                            style    = MaterialTheme.typography.bodyMedium,
+                            color    = WatchDawgColors.TextTertiary,
+                            modifier = Modifier.padding(top = 8.dp),
+                        )
                     }
                 }
             }
+
             is SeriesViewModel.SeriesState.Success -> {
                 if (s.items.isEmpty()) {
                     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                         Column(horizontalAlignment = Alignment.CenterHorizontally) {
                             Text("📺", style = MaterialTheme.typography.displayLarge)
                             Spacer(Modifier.height(12.dp))
-                            Text("No TV series yet.", style = MaterialTheme.typography.titleLarge, color = WatchDawgColors.TextSecondary)
-                            Text("Add a channel with category 'tv' in the web UI.", style = MaterialTheme.typography.bodyMedium, color = WatchDawgColors.TextTertiary, modifier = Modifier.padding(top = 8.dp))
+                            Text(
+                                text  = "No TV series yet.",
+                                style = MaterialTheme.typography.titleLarge,
+                                color = WatchDawgColors.TextSecondary,
+                            )
+                            Text(
+                                text     = "Add a channel with category 'tv' in the web UI.",
+                                style    = MaterialTheme.typography.bodyMedium,
+                                color    = WatchDawgColors.TextTertiary,
+                                modifier = Modifier.padding(top = 8.dp),
+                            )
                         }
                     }
                 } else {
                     LazyVerticalGrid(
-                        state                 = gridState,
-                        columns               = GridCells.Fixed(4),
-                        contentPadding        = PaddingValues(top = 8.dp, bottom = 48.dp),
+                        state   = gridState,
+                        columns = GridCells.Fixed(4),
+                        contentPadding = PaddingValues(top = 8.dp, bottom = 48.dp),
                         horizontalArrangement = Arrangement.spacedBy(20.dp),
                         verticalArrangement   = Arrangement.spacedBy(20.dp),
-                        modifier              = Modifier.fillMaxSize(),
+                        modifier = Modifier.fillMaxSize(),
                     ) {
                         items(s.items, key = { it.channelId }) { series ->
                             val isFirst = s.items.indexOf(series) == 0
-                            val cardFr  = cardFocusRequesters.getOrPut(series.channelId) { FocusRequester() }
-                            if (isFirst) cardFocusRequesters[series.channelId] = firstCardFocus
+                            val cardFr = cardFocusRequesters.getOrPut(series.channelId) {
+                                FocusRequester()
+                            }
+                            // Register firstCardFocus on the first card so the
+                            // LaunchedEffect can use it as a fallback target.
+                            if (isFirst) {
+                                cardFocusRequesters[series.channelId] = firstCardFocus
+                            }
                             SeriesCard(
                                 series   = series,
                                 onTap    = { onSeriesTap(series.channelId, series.channelName) },
-                                modifier = if (isFirst) Modifier.focusRequester(firstCardFocus)
-                                           else Modifier.focusRequester(cardFr),
+                                modifier = if (isFirst)
+                                    Modifier.focusRequester(firstCardFocus)
+                                else
+                                    Modifier.focusRequester(cardFr),
                             )
                         }
                     }
@@ -231,15 +281,12 @@ private fun SeriesCard(
 ) {
     var focused by remember { mutableStateOf(false) }
 
-    val hasPoster = series.tmdbPosterUrl != null
-    val artUrl    = series.tmdbPosterUrl ?: series.latestThumbnail
+    val artUrl = series.tmdbPosterUrl ?: series.latestThumbnail
 
     Card(
         onClick  = onTap,
         modifier = modifier
-            .fillMaxWidth()
-            // All cards uniform 2:3 portrait — consistent grid rows, no layout jumps
-            .aspectRatio(2f / 3f)
+            .width(300.dp)
             .onFocusChanged { focused = it.isFocused }
             .focusGlowCard(focused),
         colors = CardDefaults.colors(
@@ -248,95 +295,87 @@ private fun SeriesCard(
         ),
         border = CardDefaults.border(
             focusedBorder = Border(
-                border = androidx.compose.foundation.BorderStroke(3.dp, WatchDawgColors.Orange),
+                border = androidx.compose.foundation.BorderStroke(
+                    3.dp, WatchDawgColors.Orange,
+                ),
             ),
         ),
         scale = CardDefaults.scale(focusedScale = 1.06f),
     ) {
-        Box(modifier = Modifier.fillMaxSize()) {
-
-            if (artUrl != null) {
+        Column {
+            // ── Thumbnail ─────────────────────────────────────────────────────
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .aspectRatio(16f / 9f)
+                    .clip(MaterialTheme.shapes.medium),
+            ) {
                 AsyncImage(
                     model              = artUrl,
                     contentDescription = series.channelName,
-                    // TMDB poster → Crop (already 2:3, fills card edge-to-edge)
-                    // YouTube thumbnail → Fit (16:9 letterboxed inside 2:3, sharp, no stretch)
-                    contentScale       = if (hasPoster) ContentScale.Crop else ContentScale.Fit,
+                    contentScale       = ContentScale.Crop,
                     modifier           = Modifier
                         .fillMaxSize()
                         .background(WatchDawgColors.SurfaceElevated),
                 )
-            } else {
-                Box(
-                    modifier         = Modifier.fillMaxSize().background(WatchDawgColors.SurfaceElevated),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Text("📺", style = MaterialTheme.typography.displayMedium)
-                }
-            }
 
-            // Episode count badge — bottom-left
-            Text(
-                text     = "${series.episodeCount} ep",
-                style    = MaterialTheme.typography.labelSmall,
-                color    = Color.White,
-                modifier = Modifier
-                    .align(Alignment.BottomStart)
-                    .padding(6.dp)
-                    .clip(MaterialTheme.shapes.small)
-                    .background(Color(0xBB000000))
-                    .padding(horizontal = 6.dp, vertical = 2.dp),
-            )
-
-            // TMDB rating badge — bottom-right
-            if (series.tmdbRating != null && series.tmdbRating > 0f) {
+                // Episode count badge — bottom-left corner
                 Text(
-                    text     = "★ ${"%.1f".format(series.tmdbRating)}",
+                    text     = "${series.episodeCount} ep",
                     style    = MaterialTheme.typography.labelSmall,
                     color    = Color.White,
                     modifier = Modifier
-                        .align(Alignment.BottomEnd)
+                        .align(Alignment.BottomStart)
                         .padding(6.dp)
                         .clip(MaterialTheme.shapes.small)
-                        .background(WatchDawgColors.OrangeDim)
+                        .background(Color(0xBB000000))
                         .padding(horizontal = 6.dp, vertical = 2.dp),
                 )
-            }
 
-            // Title overlay at bottom (gradient) for non-poster cards
-            if (!hasPoster) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .align(Alignment.BottomStart)
-                        .background(
-                            androidx.compose.ui.graphics.Brush.verticalGradient(
-                                colors = listOf(Color.Transparent, Color(0xDD000000)),
-                            )
-                        )
-                        .padding(start = 8.dp, end = 8.dp, top = 20.dp, bottom = 28.dp),
-                ) {
-                    Column {
-                        Text(
-                            text     = series.channelName,
-                            style    = MaterialTheme.typography.labelMedium,
-                            color    = WatchDawgColors.TextPrimary,
-                            maxLines = 2,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                        if (series.tmdbYear != null) {
-                            Text(
-                                text  = series.tmdbYear.toString(),
-                                style = MaterialTheme.typography.labelSmall,
-                                color = WatchDawgColors.Orange,
-                            )
-                        }
-                    }
+                // TMDb rating badge — bottom-right corner
+                if (series.tmdbRating != null && series.tmdbRating > 0f) {
+                    Text(
+                        text     = "★ ${"%.1f".format(series.tmdbRating)}",
+                        style    = MaterialTheme.typography.labelSmall,
+                        color    = Color.White,
+                        modifier = Modifier
+                            .align(Alignment.BottomEnd)
+                            .padding(6.dp)
+                            .clip(MaterialTheme.shapes.small)
+                            .background(WatchDawgColors.OrangeDim)
+                            .padding(horizontal = 6.dp, vertical = 2.dp),
+                    )
                 }
             }
 
-            // For TMDB poster cards: show name + year below image
-            // (handled by card Column below when hasPoster)
+            // ── Metadata ──────────────────────────────────────────────────────
+            Column(Modifier.padding(12.dp)) {
+                Text(
+                    text     = series.channelName,
+                    style    = MaterialTheme.typography.titleSmall,
+                    color    = WatchDawgColors.TextPrimary,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                if (series.tmdbYear != null) {
+                    Text(
+                        text     = series.tmdbYear.toString(),
+                        style    = MaterialTheme.typography.bodySmall,
+                        color    = WatchDawgColors.Orange,
+                        maxLines = 1,
+                    )
+                }
+                if (!series.tmdbDescription.isNullOrBlank()) {
+                    Text(
+                        text     = series.tmdbDescription,
+                        style    = MaterialTheme.typography.bodySmall,
+                        color    = WatchDawgColors.TextTertiary,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.padding(top = 4.dp),
+                    )
+                }
+            }
         }
     }
 }

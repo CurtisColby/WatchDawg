@@ -3,6 +3,7 @@ package com.watchdawg.tv.ui.player
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.watchdawg.tv.data.api.ChannelDto
+import com.watchdawg.tv.data.prefs.QueueHolder
 import com.watchdawg.tv.data.prefs.ResumeState
 import com.watchdawg.tv.data.repo.WatchDawgRepository
 import kotlinx.coroutines.Job
@@ -25,6 +26,13 @@ import kotlinx.coroutines.launch
  * Speed reset guarantee: every code path that emits a new playToken explicitly
  * sets playbackSpeed = 1.0f. The token-refresh path does NOT reset speed since
  * that is a mid-video CDN URL swap, not a new video.
+ *
+ * Session 33 — Smart Shuffle:
+ *   resolveCurrent() calls QueueHolder.onVideoPlayed(videoId) each time a new
+ *   video successfully resolves. The callback is set by MusicViewModel /
+ *   AdultViewModel before queuing a Smart Shuffle so they can mark the video
+ *   as played in their in-memory playedIds Set. For all other queue types the
+ *   callback is null and this call is a no-op.
  */
 class PlayerViewModel(
     private val repo: WatchDawgRepository,
@@ -124,10 +132,11 @@ class PlayerViewModel(
      * (position = 0). On resume it starts from the beginning, which is correct for
      * non-seekable split-stream content.
      *
-     * Not called for locked sources — isLockedSource guards the call site.
+     * Not called for locked sources — isLockedSource guards this function directly.
      */
     fun writeHistoryStarted(playerDurationMs: () -> Long) {
         if (mode != Mode.RESOLVE || hlsMode) return  // HLS loop handles its own writes
+        if (isLockedSource) return                   // never write history for locked/adult content
         val videoId = _state.value.videoId ?: return
         viewModelScope.launch {
             val durMs = playerDurationMs()
@@ -141,6 +150,7 @@ class PlayerViewModel(
 
     fun writeHistoryCompletion(positionMs: Long, durationMs: Long) {
         if (mode != Mode.RESOLVE) return
+        if (isLockedSource) return  // never write history for locked/adult content
         val videoId = _state.value.videoId ?: return
         viewModelScope.launch {
             repo.postHistory(
@@ -291,6 +301,12 @@ class PlayerViewModel(
                         )
                         pendingStartMs = 0L
                         scheduleTokenRefresh(videoId)
+
+                        // Session 33 — Smart Shuffle: notify the originating ViewModel
+                        // that this video is now playing so it can mark it as played in
+                        // its in-memory playedIds Set. Null-safe — no-op for all non-smart
+                        // queues where onVideoPlayed was not set.
+                        QueueHolder.onVideoPlayed?.invoke(videoId)
                     }
                 }
                 WatchDawgRepository.ResolveOutcome.Unavailable -> advanceAfterFailure()
