@@ -62,6 +62,8 @@ import com.watchdawg.tv.ui.home.HomeViewModel
 import com.watchdawg.tv.ui.library.FavoritesViewModel
 import com.watchdawg.tv.ui.library.LibraryScreen
 import com.watchdawg.tv.ui.library.LibraryViewModel
+import com.watchdawg.tv.ui.livetv.LiveTvScreen
+import com.watchdawg.tv.ui.livetv.LiveTvViewModel
 import com.watchdawg.tv.ui.movies.MovieDetailScreen
 import com.watchdawg.tv.ui.movies.MovieDetailViewModel
 import com.watchdawg.tv.ui.movies.MoviesScreen
@@ -142,13 +144,15 @@ private fun WatchDawgRoot(onFinish: () -> Unit) {
     val factory = remember { WatchDawgViewModelFactory() }
 
     // ── ViewModels hoisted at root — survive navigation ───────────────────────
-    val homeViewModel:   HomeViewModel   = viewModel(factory = factory)
-    val tvViewModel:     TVViewModel     = viewModel(factory = factory)
-    val seriesViewModel: SeriesViewModel = viewModel(factory = factory)
-    val pinViewModel:    PinViewModel    = viewModel(factory = factory)
-    val moviesViewModel: MoviesViewModel = viewModel(factory = factory)
-    val musicViewModel:  MusicViewModel  = viewModel(factory = factory)
-    val adultViewModel:  AdultViewModel  = viewModel(factory = factory)
+    val homeViewModel:    HomeViewModel    = viewModel(factory = factory)
+    val tvViewModel:      TVViewModel      = viewModel(factory = factory)
+    val seriesViewModel:  SeriesViewModel  = viewModel(factory = factory)
+    val pinViewModel:     PinViewModel     = viewModel(factory = factory)
+    val moviesViewModel:  MoviesViewModel  = viewModel(factory = factory)
+    val musicViewModel:   MusicViewModel   = viewModel(factory = factory)
+    val adultViewModel:   AdultViewModel   = viewModel(factory = factory)
+    // Milestone I — Live TV: hoisted so channel list survives Back → re-enter
+    val liveTvViewModel:  LiveTvViewModel  = viewModel(factory = factory)
 
     var showPinPad     by remember { mutableStateOf(false) }
     var showExitDialog by remember { mutableStateOf(false) }
@@ -305,9 +309,17 @@ private fun WatchDawgRoot(onFinish: () -> Unit) {
                 )
             }
 
-            // ── Live TV (stub — Milestone I) ──────────────────────────────────
+            // ── Live TV — Milestone I ─────────────────────────────────────────
+            // Tune-in routes directly to PLAYER_DIRECT — live HLS/MPEG-TS streams
+            // need no resolve step; ExoPlayer handles both natively.
             composable(Routes.LIVE_TV) {
-                ComingSoonScreen(label = "📡  Live TV", subtitle = "Coming in Milestone I")
+                LiveTvScreen(
+                    viewModel = liveTvViewModel,
+                    onTuneIn  = { streamUrl, channelName ->
+                        navController.navigate(Routes.playerDirect(streamUrl, channelName))
+                    },
+                    onBack = { navController.popBackStack() },
+                )
             }
 
             // ── Music — Milestone R-4 ─────────────────────────────────────────
@@ -509,30 +521,6 @@ private fun WatchDawgRoot(onFinish: () -> Unit) {
                 onConfirm = { onFinish() },
                 onDismiss = { showExitDialog = false },
             )
-        }
-    }
-}
-
-// ── Stub screen ───────────────────────────────────────────────────────────────
-
-@Composable
-private fun ComingSoonScreen(
-    label: String,
-    subtitle: String,
-    modifier: Modifier = Modifier,
-) {
-    Box(
-        modifier = modifier
-            .fillMaxSize()
-            .background(WatchDawgColors.Background),
-        contentAlignment = Alignment.Center,
-    ) {
-        Column(
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
-            Text(text = label,    style = MaterialTheme.typography.displayLarge, color = WatchDawgColors.TextPrimary)
-            Text(text = subtitle, style = MaterialTheme.typography.bodyLarge,    color = WatchDawgColors.TextTertiary)
         }
     }
 }

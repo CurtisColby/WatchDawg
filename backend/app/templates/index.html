@@ -1816,7 +1816,15 @@
             try {
                 const res=await fetch(`${API_BASE}/live-tv/import-m3u`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url})});
                 const data=await res.json();
-                log(`M3U: ${data.imported} imported, ${data.skipped} skipped`,data.imported>0?'success':'info');
+                if(!res.ok){
+                    log(`M3U import failed: ${data.detail||'Unknown error (HTTP '+res.status+')'}`, 'error');
+                    return;
+                }
+                if(data.warning){
+                    log(`M3U: ${data.warning}`, 'warn');
+                } else {
+                    log(`M3U: ${data.imported} imported, ${data.skipped} skipped`,data.imported>0?'success':'info');
+                }
                 input.value=''; await loadLiveTv();
             } catch(e){log(`M3U import failed: ${e.message}`,'error');}
             finally{btn.disabled=false;btn.innerHTML='Import';}

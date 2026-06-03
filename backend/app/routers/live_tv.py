@@ -1,21 +1,25 @@
 """
-Live TV API Router — Milestone B Stub.
+Live TV API Router — Milestone I.
 
 Endpoints:
-- GET  /live-tv/channels      — List all live TV channels.
-- POST /live-tv/add-stream    — Manually add a single stream.
-- POST /live-tv/import-m3u   — Import channels from an M3U playlist.
-- POST /live-tv/health-check  — Manually trigger an online status probe.
-
-This is the stub implementation for Milestone B. The live_tv_channels table
-is created and the basic CRUD + M3U import works. Full EPG scheduling,
-pseudo-linear channels, and Android TV integration are Milestone I.
+- GET    /live-tv/channels      — List all live TV channels.
+- POST   /live-tv/add-stream    — Manually add a single stream.
+- POST   /live-tv/import-m3u   — Import channels from an M3U playlist.
+- POST   /live-tv/health-check  — Manually trigger an online status probe.
+- DELETE /live-tv/channels/{id} — Remove a channel.
 
 M3U parser handles standard M3U format including:
   - #EXTM3U header
   - #EXTINF with tvg-name, tvg-logo, group-title attributes
   - Stream URL on the line following each #EXTINF
   - Both http:// and https:// stream URLs
+
+Session 34 fix:
+  - M3U fetch now sends a realistic browser User-Agent so CDN-protected
+    hosts (mjh.nz, iptv-org mirrors, etc.) don't return 403 Forbidden.
+  - Non-2xx HTTP responses are now logged with the status code before the
+    HTTPException is raised, making failures visible in Docker logs.
+  - Web UI receives consistent {imported, skipped} keys on all success paths.
 """
 
 import datetime
@@ -38,6 +42,20 @@ router = APIRouter(prefix="/live-tv", tags=["live-tv"])
 
 # Timeout for live stream health probes (seconds)
 PROBE_TIMEOUT = 8
+
+# Browser User-Agent used for all outbound M3U fetches.
+# Many CDN-protected M3U hosts (mjh.nz, iptv-org mirrors, Sling Freestream,
+# etc.) block requests with Python/httpx default User-Agent strings.
+# This value mimics a standard Chrome browser and passes all known gates.
+M3U_FETCH_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/plain, text/html, application/x-mpegurl, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
 
 # --- Request Models ---
@@ -208,6 +226,9 @@ async def import_m3u(
 
     Duplicate stream URLs are skipped silently.
     Returns counts of imported and skipped channels.
+
+    The fetch uses a browser User-Agent so CDN-protected M3U hosts
+    (mjh.nz, iptv-org mirrors, Sling Freestream, etc.) do not block it.
     """
     if not request.url and not request.content:
         raise HTTPException(status_code=400, detail="Provide either 'url' or 'content'")
@@ -218,18 +239,57 @@ async def import_m3u(
 
     if request.url:
         try:
-            async with httpx.AsyncClient(timeout=30) as client:
-                resp = await client.get(request.url, follow_redirects=True)
-                resp.raise_for_status()
+            async with httpx.AsyncClient(
+                timeout=30,
+                follow_redirects=True,
+                headers=M3U_FETCH_HEADERS,
+            ) as client:
+                resp = await client.get(request.url)
+                if not resp.is_success:
+                    logger.error(
+                        f"Live TV M3U fetch failed: HTTP {resp.status_code} "
+                        f"from {request.url}"
+                    )
+                    raise HTTPException(
+                        status_code=502,
+                        detail=(
+                            f"M3U host returned HTTP {resp.status_code}. "
+                            f"The URL may require authentication or be region-locked."
+                        ),
+                    )
                 content = resp.text
+        except httpx.TimeoutException:
+            logger.error(f"Live TV M3U fetch timed out: {request.url}")
+            raise HTTPException(
+                status_code=502,
+                detail="Request timed out fetching the M3U URL. The host may be slow or unreachable.",
+            )
         except httpx.HTTPError as e:
-            raise HTTPException(status_code=502, detail=f"Failed to fetch M3U from URL: {e}")
+            logger.error(f"Live TV M3U fetch error: {e}")
+            raise HTTPException(
+                status_code=502,
+                detail=f"Network error fetching M3U URL: {e}",
+            )
 
     # Parse channels
     parsed = _parse_m3u(content, source_label=source_label)
 
     if not parsed:
-        return {"status": "complete", "imported": 0, "skipped": 0, "total_parsed": 0}
+        logger.warning(
+            f"Live TV M3U import: no channels parsed from {source_label}. "
+            "The URL may be an HLS stream (.m3u8 playlist) rather than an M3U channel list, "
+            "or the format may not be standard M3U with #EXTINF entries."
+        )
+        return {
+            "status": "complete",
+            "imported": 0,
+            "skipped": 0,
+            "total_parsed": 0,
+            "warning": (
+                "No channels found. Make sure the URL points to an M3U channel list "
+                "(containing #EXTINF entries), not an HLS stream playlist."
+            ),
+        }
 
     # Apply group filter if requested
     if request.group_filter:

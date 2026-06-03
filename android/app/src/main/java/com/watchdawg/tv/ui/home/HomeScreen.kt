@@ -54,10 +54,14 @@ import com.watchdawg.tv.ui.theme.WatchDawgColors
  * Adult card:
  *   Structurally absent when locked (TokenHolder emits null).
  *   Appears immediately when PIN is entered, disappears on lock.
+ *
+ * Milestone I (Session 34):
+ *   Live TV subtitle updated from "Coming in Milestone I" to "Channels & Live TV".
+ *   APP_VERSION bumped to v34.1.
  */
 
 /** Bump this each build. Format: v{session}.{build-within-session} */
-const val APP_VERSION = "v32.1"
+const val APP_VERSION = "v34.1"
 
 @Composable
 fun HomeScreen(
@@ -286,7 +290,7 @@ private fun Modifier.homeFocusGlow(isFocused: Boolean): Modifier = this.drawBehi
 private fun subtitleFor(section: NavSection): String = when (section) {
     NavSection.TV                -> "Browse series"
     NavSection.MOVIES            -> "Browse movies"
-    NavSection.LIVE_TV           -> "Coming in Milestone I"
+    NavSection.LIVE_TV           -> "Channels & Live TV"
     NavSection.MUSIC             -> "Browse music videos"
     NavSection.CONTINUE_WATCHING -> "Pick up where you left off"
     NavSection.WATCH_LATER       -> "Your saved videos"
