@@ -638,3 +638,51 @@ async def scrape_channel(
         "channel_type": channel.channel_type,
         "result": scrape_result.to_dict(),
     }
+
+
+@router.delete("/all")
+async def delete_all_channels(
+    confirm: bool = Query(
+        False,
+        description="Must be true to execute. Prevents accidental wipes.",
+    ),
+    db: AsyncSession = Depends(get_db_session),
+):
+    """
+    Wipe ALL channels and all their associated videos and favorites.
+
+    Protected by ?confirm=true to prevent accidental calls.
+    Called from the Channels tab "Wipe All" button in the web UI,
+    which requires a two-step confirmation dialog before firing.
+
+    This is a destructive, irreversible operation. Use with care.
+    """
+    if not confirm:
+        raise HTTPException(
+            status_code=400,
+            detail="Pass ?confirm=true to execute this operation.",
+        )
+
+    # Fetch all channel IDs
+    stmt = select(Channel)
+    result = await db.execute(stmt)
+    channels = result.scalars().all()
+
+    total_channels = len(channels)
+    total_videos   = 0
+
+    for channel in channels:
+        count = await _clear_channel_videos(db, channel.id)
+        total_videos += count
+        await db.delete(channel)
+
+    await db.commit()
+
+    logger.warning(
+        f"WIPE ALL: deleted {total_channels} channels and {total_videos} videos"
+    )
+    return {
+        "status": "wiped",
+        "channels_deleted": total_channels,
+        "videos_deleted":   total_videos,
+    }

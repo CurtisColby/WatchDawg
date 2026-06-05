@@ -19,6 +19,11 @@ Milestone B migrations added:
 - watch_history table
 - watchlist table
 - live_tv_channels table
+
+Session 35 migrations added:
+- live_tv_sources table
+- live_tv_channels.is_favorite column
+- live_tv_channels.sort_order column
 """
 
 import logging
@@ -133,6 +138,40 @@ async def _run_migrations():
                     created_at DATETIME NOT NULL
                 )
             """))
+
+            # ----------------------------------------------------------------
+            # Session 35: live_tv_channels new columns
+            # ----------------------------------------------------------------
+            result = await db.execute(text("PRAGMA table_info(live_tv_channels)"))
+            live_tv_columns = [row[1] for row in result.fetchall()]
+
+            if "is_favorite" not in live_tv_columns:
+                await db.execute(
+                    text("ALTER TABLE live_tv_channels ADD COLUMN is_favorite INTEGER NOT NULL DEFAULT 0")
+                )
+                logger.info("Migration applied: live_tv_channels.is_favorite")
+
+            if "sort_order" not in live_tv_columns:
+                await db.execute(
+                    text("ALTER TABLE live_tv_channels ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 999")
+                )
+                logger.info("Migration applied: live_tv_channels.sort_order")
+
+            # ----------------------------------------------------------------
+            # Session 35: live_tv_sources table
+            # ----------------------------------------------------------------
+            await db.execute(text("""
+                CREATE TABLE IF NOT EXISTS live_tv_sources (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    label TEXT NOT NULL,
+                    url TEXT NOT NULL UNIQUE,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    channel_count INTEGER NOT NULL DEFAULT 0,
+                    created_at DATETIME NOT NULL,
+                    last_imported_at DATETIME
+                )
+            """))
+            logger.info("Migration checked: live_tv_sources table")
 
             await db.commit()
             logger.info("All migrations complete.")

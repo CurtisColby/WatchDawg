@@ -1,52 +1,54 @@
 """
-Live TV API Router — Milestone I.
+Live TV API Router — Milestone I / Session 36.
 
 Endpoints:
-- GET    /live-tv/channels      — List all live TV channels.
-- POST   /live-tv/add-stream    — Manually add a single stream.
-- POST   /live-tv/import-m3u   — Import channels from an M3U playlist.
-- POST   /live-tv/health-check  — Manually trigger an online status probe.
-- DELETE /live-tv/channels/{id} — Remove a channel.
+  GET    /live-tv/channels                  — List channels (disabled-source filter,
+                                              dead-channel filter optional).
+  POST   /live-tv/add-stream                — Manually add a single stream.
+  POST   /live-tv/import-m3u               — Import from M3U playlist URL.
+  POST   /live-tv/health-check              — Trigger online-status probe.
+  DELETE /live-tv/channels/{id}             — Remove a single channel.
+  POST   /live-tv/channels/{id}/favorite    — Toggle is_favorite on a channel.
 
-M3U parser handles standard M3U format including:
-  - #EXTM3U header
-  - #EXTINF with tvg-name, tvg-logo, group-title attributes
-  - Stream URL on the line following each #EXTINF
-  - Both http:// and https:// stream URLs
+Source management:
+  GET    /live-tv/sources                   — List all M3U sources with stats.
+  PATCH  /live-tv/sources/{id}/toggle       — Enable / disable a source.
+  DELETE /live-tv/sources/{id}              — Delete source + all its channels.
 
-Session 34 fix:
-  - M3U fetch now sends a realistic browser User-Agent so CDN-protected
-    hosts (mjh.nz, iptv-org mirrors, etc.) don't return 403 Forbidden.
-  - Non-2xx HTTP responses are now logged with the status code before the
-    HTTPException is raised, making failures visible in Docker logs.
-  - Web UI receives consistent {imported, skipped} keys on all success paths.
+Group management (Session 36):
+  GET    /live-tv/groups                    — List distinct group names with
+                                              current sort_order and channel count.
+  PATCH  /live-tv/groups/reorder            — Bulk-set sort_order for groups.
+  DELETE /live-tv/groups/{group_name}       — Delete all channels in a group.
+
+Session 34: browser User-Agent for M3U fetch; improved error handling.
+Session 35: LiveTvSource table wired in; include_disabled query param;
+            source CRUD endpoints; dead-channel filter default.
+Session 36: is_favorite toggle endpoint; sort_order applied to channel list
+            ordering; group management endpoints; serializer updated.
 """
 
 import datetime
 import logging
 import re
-from typing import Optional
+import urllib.parse
+from typing import Optional, List
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import select, func, delete as sa_delete, update as sa_update, distinct
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db_session, async_session_factory
-from app.models import LiveTvChannel
+from app.models import LiveTvChannel, LiveTvSource
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/live-tv", tags=["live-tv"])
 
-# Timeout for live stream health probes (seconds)
 PROBE_TIMEOUT = 8
 
-# Browser User-Agent used for all outbound M3U fetches.
-# Many CDN-protected M3U hosts (mjh.nz, iptv-org mirrors, Sling Freestream,
-# etc.) block requests with Python/httpx default User-Agent strings.
-# This value mimics a standard Chrome browser and passes all known gates.
 M3U_FETCH_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -58,131 +60,196 @@ M3U_FETCH_HEADERS = {
 }
 
 
-# --- Request Models ---
+# ---------------------------------------------------------------------------
+# Request models
+# ---------------------------------------------------------------------------
 
 class AddStreamRequest(BaseModel):
     name: str = Field(..., description="Display name for the channel")
     stream_url: str = Field(..., description="Direct stream URL (HLS/MPEG-TS)")
-    logo_url: Optional[str] = Field(None, description="Channel logo image URL")
-    group_name: Optional[str] = Field(None, description="Group/category label")
+    logo_url: Optional[str] = Field(None)
+    group_name: Optional[str] = Field(None)
 
 
 class ImportM3URequest(BaseModel):
-    url: Optional[str] = Field(None, description="URL to fetch the M3U playlist from")
-    content: Optional[str] = Field(None, description="Raw M3U playlist text (alternative to URL)")
-    group_filter: Optional[str] = Field(None, description="Only import channels from this group-title")
+    url: Optional[str] = Field(None)
+    content: Optional[str] = Field(None)
+    group_filter: Optional[str] = Field(None)
+    label: Optional[str] = Field(None, description="Friendly label for source (auto-derived if omitted)")
 
 
-# --- Serializer ---
+class ReorderGroupsRequest(BaseModel):
+    """
+    Body for PATCH /live-tv/groups/reorder.
+    groups is an ordered list of group names — index 0 = top.
+    The endpoint assigns sort_order = index*10 to all channels in each group.
+    """
+    groups: List[str] = Field(..., description="Group names in desired display order")
+
+
+# ---------------------------------------------------------------------------
+# Serializers
+# ---------------------------------------------------------------------------
 
 def _serialize_channel(ch: LiveTvChannel) -> dict:
     return {
-        "id": ch.id,
-        "name": ch.name,
-        "logo_url": ch.logo_url,
-        "stream_url": ch.stream_url,
-        "group_name": ch.group_name,
+        "id":           ch.id,
+        "name":         ch.name,
+        "logo_url":     ch.logo_url,
+        "stream_url":   ch.stream_url,
+        "group_name":   ch.group_name,
         "channel_type": ch.channel_type,
-        "is_online": ch.is_online,
+        "is_online":    ch.is_online,
+        "is_favorite":  ch.is_favorite,
+        "sort_order":   ch.sort_order,
         "last_checked": ch.last_checked.isoformat() if ch.last_checked else None,
-        "source_m3u": ch.source_m3u,
-        "created_at": ch.created_at.isoformat() if ch.created_at else None,
+        "source_m3u":   ch.source_m3u,
+        "created_at":   ch.created_at.isoformat() if ch.created_at else None,
     }
 
 
-# --- M3U Parser ---
+def _serialize_source(src: LiveTvSource) -> dict:
+    return {
+        "id":               src.id,
+        "label":            src.label,
+        "url":              src.url,
+        "enabled":          src.enabled,
+        "channel_count":    src.channel_count,
+        "created_at":       src.created_at.isoformat() if src.created_at else None,
+        "last_imported_at": src.last_imported_at.isoformat() if src.last_imported_at else None,
+    }
+
+
+def _derive_label(url: str) -> str:
+    clean = url.split("?")[0].rstrip("/")
+    parts = clean.split("/")
+    for part in reversed(parts):
+        if part:
+            label = re.sub(r"\.(m3u8?|txt)$", "", part, flags=re.IGNORECASE)
+            if label:
+                return label[:200]
+    try:
+        return urllib.parse.urlparse(url).hostname or url[:200]
+    except Exception:
+        return url[:200]
+
+
+# ---------------------------------------------------------------------------
+# M3U parser
+# ---------------------------------------------------------------------------
 
 def _parse_m3u(content: str, source_label: Optional[str] = None) -> list:
-    """
-    Parse M3U playlist text and return a list of channel dicts.
-
-    Handles standard M3U format:
-      #EXTM3U
-      #EXTINF:-1 tvg-name="Channel Name" tvg-logo="http://..." group-title="Group",Display Name
-      http://stream.url/path
-
-    Returns list of dicts with keys: name, stream_url, logo_url, group_name, source_m3u
-    """
     channels = []
     lines = content.splitlines()
-
     i = 0
     while i < len(lines):
         line = lines[i].strip()
-
         if line.startswith("#EXTINF"):
-            # Parse attributes from the #EXTINF line
-            name = None
-            logo_url = None
-            group_name = None
+            name = logo_url = group_name = None
 
-            # tvg-name attribute
-            tvg_name_match = re.search(r'tvg-name="([^"]*)"', line)
-            if tvg_name_match:
-                name = tvg_name_match.group(1).strip()
+            m = re.search(r'tvg-name="([^"]*)"', line)
+            if m:
+                name = m.group(1).strip()
 
-            # tvg-logo attribute
-            tvg_logo_match = re.search(r'tvg-logo="([^"]*)"', line)
-            if tvg_logo_match:
-                logo_url = tvg_logo_match.group(1).strip() or None
+            m = re.search(r'tvg-logo="([^"]*)"', line)
+            if m:
+                logo_url = m.group(1).strip() or None
 
-            # group-title attribute
-            group_match = re.search(r'group-title="([^"]*)"', line)
-            if group_match:
-                group_name = group_match.group(1).strip() or None
+            m = re.search(r'group-title="([^"]*)"', line)
+            if m:
+                group_name = m.group(1).strip() or None
 
-            # Display name is after the last comma on the #EXTINF line
             comma_idx = line.rfind(",")
             if comma_idx >= 0:
                 display_name = line[comma_idx + 1:].strip()
                 if display_name:
-                    # Use display name if tvg-name wasn't found
                     name = name or display_name
 
             name = name or "Unknown Channel"
 
-            # The next non-empty, non-comment line is the stream URL
             j = i + 1
             stream_url = None
             while j < len(lines):
                 next_line = lines[j].strip()
                 if next_line and not next_line.startswith("#"):
                     stream_url = next_line
-                    i = j  # advance outer loop past the URL line
+                    i = j
                     break
                 j += 1
 
             if stream_url and (stream_url.startswith("http://") or stream_url.startswith("https://")):
                 channels.append({
-                    "name": name,
+                    "name":       name,
                     "stream_url": stream_url,
-                    "logo_url": logo_url,
+                    "logo_url":   logo_url,
                     "group_name": group_name,
                     "source_m3u": source_label,
                 })
-
         i += 1
-
     return channels
 
 
-# --- Endpoints ---
+# ---------------------------------------------------------------------------
+# Endpoints — channels
+# ---------------------------------------------------------------------------
 
 @router.get("/channels")
 async def list_live_channels(
+    include_disabled: bool = Query(
+        False,
+        description="Include channels from disabled sources (web UI uses true).",
+    ),
     db: AsyncSession = Depends(get_db_session),
 ):
-    """List all live TV channels ordered by group then name."""
-    stmt = select(LiveTvChannel).order_by(
-        LiveTvChannel.group_name.nullslast(),
-        LiveTvChannel.name,
-    )
-    result = await db.execute(stmt)
-    channels = result.scalars().all()
+    """
+    List live TV channels.
+
+    Ordering: sort_order ASC (per-group custom order), then group_name ASC,
+    then name ASC within each group.
+
+    Default (include_disabled=false): channels from disabled LiveTvSources
+    are excluded. Android always uses the default.
+    Web UI passes include_disabled=true to show everything.
+    """
+    from sqlalchemy import text
+
+    if include_disabled:
+        stmt = select(LiveTvChannel).order_by(
+            LiveTvChannel.sort_order,
+            LiveTvChannel.group_name.nullslast(),
+            LiveTvChannel.name,
+        )
+        result = await db.execute(stmt)
+        channels = result.scalars().all()
+    else:
+        # Exclude channels from disabled sources; manually-added always included.
+        raw = await db.execute(text("""
+            SELECT ltc.id
+            FROM live_tv_channels ltc
+            LEFT JOIN live_tv_sources lts ON ltc.source_m3u = lts.url
+            WHERE lts.enabled IS NULL OR lts.enabled = 1
+            ORDER BY ltc.sort_order ASC, ltc.group_name NULLS LAST, ltc.name ASC
+        """))
+        included_ids = [row[0] for row in raw.fetchall()]
+
+        if not included_ids:
+            return {"channels": [], "total": 0}
+
+        stmt = (
+            select(LiveTvChannel)
+            .where(LiveTvChannel.id.in_(included_ids))
+            .order_by(
+                LiveTvChannel.sort_order,
+                LiveTvChannel.group_name.nullslast(),
+                LiveTvChannel.name,
+            )
+        )
+        result = await db.execute(stmt)
+        channels = result.scalars().all()
 
     return {
         "channels": [_serialize_channel(ch) for ch in channels],
-        "total": len(channels),
+        "total":    len(channels),
     }
 
 
@@ -201,15 +268,17 @@ async def add_stream(
         stream_url=request.stream_url,
         group_name=request.group_name,
         channel_type="real",
-        is_online=None,  # Not yet probed
+        is_online=None,
         source_m3u=None,
+        is_favorite=False,
+        sort_order=999,
         created_at=datetime.datetime.utcnow(),
     )
     db.add(channel)
     await db.commit()
     await db.refresh(channel)
 
-    logger.info(f"Live TV: added stream '{request.name}' -> {request.stream_url}")
+    logger.info(f"Live TV: added stream '{request.name}'")
     return {"status": "added", "channel": _serialize_channel(channel)}
 
 
@@ -219,21 +288,13 @@ async def import_m3u(
     db: AsyncSession = Depends(get_db_session),
 ):
     """
-    Import channels from an M3U playlist.
-
-    Provide either a URL (fetched server-side) or raw M3U text content.
-    Optionally filter to a specific group-title with group_filter.
-
-    Duplicate stream URLs are skipped silently.
-    Returns counts of imported and skipped channels.
-
-    The fetch uses a browser User-Agent so CDN-protected M3U hosts
-    (mjh.nz, iptv-org mirrors, Sling Freestream, etc.) do not block it.
+    Import channels from an M3U playlist URL or raw content.
+    Auto-creates/updates a LiveTvSource record when importing from a URL.
+    Duplicate stream URLs are silently skipped.
     """
     if not request.url and not request.content:
         raise HTTPException(status_code=400, detail="Provide either 'url' or 'content'")
 
-    # Fetch M3U content if URL provided
     content = request.content
     source_label = request.url or "manual_import"
 
@@ -246,72 +307,42 @@ async def import_m3u(
             ) as client:
                 resp = await client.get(request.url)
                 if not resp.is_success:
-                    logger.error(
-                        f"Live TV M3U fetch failed: HTTP {resp.status_code} "
-                        f"from {request.url}"
-                    )
+                    logger.error(f"Live TV M3U fetch failed: HTTP {resp.status_code} from {request.url}")
                     raise HTTPException(
                         status_code=502,
-                        detail=(
-                            f"M3U host returned HTTP {resp.status_code}. "
-                            f"The URL may require authentication or be region-locked."
-                        ),
+                        detail=f"M3U host returned HTTP {resp.status_code}.",
                     )
                 content = resp.text
         except httpx.TimeoutException:
-            logger.error(f"Live TV M3U fetch timed out: {request.url}")
-            raise HTTPException(
-                status_code=502,
-                detail="Request timed out fetching the M3U URL. The host may be slow or unreachable.",
-            )
+            raise HTTPException(status_code=502, detail="Request timed out fetching M3U URL.")
         except httpx.HTTPError as e:
-            logger.error(f"Live TV M3U fetch error: {e}")
-            raise HTTPException(
-                status_code=502,
-                detail=f"Network error fetching M3U URL: {e}",
-            )
+            raise HTTPException(status_code=502, detail=f"Network error: {e}")
 
-    # Parse channels
     parsed = _parse_m3u(content, source_label=source_label)
 
     if not parsed:
-        logger.warning(
-            f"Live TV M3U import: no channels parsed from {source_label}. "
-            "The URL may be an HLS stream (.m3u8 playlist) rather than an M3U channel list, "
-            "or the format may not be standard M3U with #EXTINF entries."
-        )
         return {
-            "status": "complete",
-            "imported": 0,
-            "skipped": 0,
+            "status":       "complete",
+            "imported":     0,
+            "skipped":      0,
             "total_parsed": 0,
-            "warning": (
-                "No channels found. Make sure the URL points to an M3U channel list "
-                "(containing #EXTINF entries), not an HLS stream playlist."
-            ),
+            "warning":      "No channels found. The URL may point to an HLS stream, not an M3U channel list.",
         }
 
-    # Apply group filter if requested
     if request.group_filter:
-        parsed = [
-            ch for ch in parsed
-            if (ch.get("group_name") or "").lower() == request.group_filter.lower()
-        ]
+        parsed = [ch for ch in parsed if (ch.get("group_name") or "").lower() == request.group_filter.lower()]
 
-    # Fetch existing stream URLs to detect duplicates
     existing_stmt = select(LiveTvChannel.stream_url)
     existing_result = await db.execute(existing_stmt)
     existing_urls = {row[0] for row in existing_result.fetchall() if row[0]}
 
-    imported = 0
-    skipped = 0
+    imported = skipped = 0
     now = datetime.datetime.utcnow()
 
     for ch_data in parsed:
         if ch_data["stream_url"] in existing_urls:
             skipped += 1
             continue
-
         channel = LiveTvChannel(
             name=ch_data["name"],
             stream_url=ch_data["stream_url"],
@@ -320,6 +351,8 @@ async def import_m3u(
             channel_type="real",
             is_online=None,
             source_m3u=ch_data["source_m3u"],
+            is_favorite=False,
+            sort_order=999,
             created_at=now,
         )
         db.add(channel)
@@ -328,13 +361,16 @@ async def import_m3u(
 
     await db.commit()
 
+    if request.url:
+        await _upsert_source(db, url=request.url, label=request.label, now=now)
+
     logger.info(f"Live TV M3U import: {imported} imported, {skipped} skipped from {source_label}")
     return {
-        "status": "complete",
-        "imported": imported,
-        "skipped": skipped,
+        "status":       "complete",
+        "imported":     imported,
+        "skipped":      skipped,
         "total_parsed": len(parsed) + skipped,
-        "source": source_label,
+        "source":       source_label,
     }
 
 
@@ -343,12 +379,7 @@ async def trigger_health_check(
     background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db_session),
 ):
-    """
-    Manually trigger an online status probe for all live TV channels.
-
-    The probe runs in the background — returns immediately with a count
-    of channels to be probed. The scheduler also runs this every 15 minutes.
-    """
+    """Manually trigger an online-status probe for all live TV channels."""
     stmt = select(LiveTvChannel)
     result = await db.execute(stmt)
     channels = result.scalars().all()
@@ -357,11 +388,10 @@ async def trigger_health_check(
         return {"status": "complete", "message": "No live TV channels to probe."}
 
     background_tasks.add_task(_probe_all_channels)
-
     logger.info(f"Live TV health check triggered for {len(channels)} channels")
     return {
-        "status": "probing",
-        "message": f"Probing {len(channels)} channels in background.",
+        "status":        "probing",
+        "message":       f"Probing {len(channels)} channels in background.",
         "channel_count": len(channels),
     }
 
@@ -371,7 +401,7 @@ async def delete_live_channel(
     channel_id: int,
     db: AsyncSession = Depends(get_db_session),
 ):
-    """Remove a live TV channel."""
+    """Remove a single live TV channel."""
     stmt = select(LiveTvChannel).where(LiveTvChannel.id == channel_id)
     result = await db.execute(stmt)
     channel = result.scalar_one_or_none()
@@ -380,28 +410,331 @@ async def delete_live_channel(
         raise HTTPException(status_code=404, detail="Live TV channel not found")
 
     name = channel.name
+    source_url = channel.source_m3u
     await db.delete(channel)
     await db.commit()
+
+    if source_url:
+        await _refresh_source_count(db, source_url)
 
     logger.info(f"Live TV: deleted channel '{name}'")
     return {"status": "deleted", "name": name}
 
 
-# --- Background health probe ---
+@router.post("/channels/{channel_id}/favorite")
+async def toggle_favorite(
+    channel_id: int,
+    db: AsyncSession = Depends(get_db_session),
+):
+    """
+    Toggle the is_favorite flag on a live TV channel.
+
+    Returns the new state so the Android app can update its UI immediately
+    without a full reload.
+    """
+    stmt = select(LiveTvChannel).where(LiveTvChannel.id == channel_id)
+    result = await db.execute(stmt)
+    channel = result.scalar_one_or_none()
+
+    if channel is None:
+        raise HTTPException(status_code=404, detail="Live TV channel not found")
+
+    channel.is_favorite = not channel.is_favorite
+    await db.commit()
+    await db.refresh(channel)
+
+    state = "favorited" if channel.is_favorite else "unfavorited"
+    logger.info(f"Live TV: channel '{channel.name}' {state}")
+    return {
+        "status":      state,
+        "id":          channel.id,
+        "is_favorite": channel.is_favorite,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Endpoints — sources
+# ---------------------------------------------------------------------------
+
+@router.get("/sources")
+async def list_sources(db: AsyncSession = Depends(get_db_session)):
+    """List all M3U sources with live channel counts and online/offline stats."""
+    stmt = select(LiveTvSource).order_by(LiveTvSource.label)
+    result = await db.execute(stmt)
+    sources = result.scalars().all()
+
+    from sqlalchemy import text
+    raw = await db.execute(text("""
+        SELECT source_m3u,
+               SUM(CASE WHEN is_online = 1 THEN 1 ELSE 0 END) AS online_count,
+               SUM(CASE WHEN is_online = 0 THEN 1 ELSE 0 END) AS offline_count,
+               COUNT(*) AS total
+        FROM live_tv_channels
+        WHERE source_m3u IS NOT NULL
+        GROUP BY source_m3u
+    """))
+    stats: dict[str, dict] = {}
+    for row in raw.fetchall():
+        stats[row[0]] = {"online": row[1] or 0, "offline": row[2] or 0, "total": row[3] or 0}
+
+    serialized = []
+    for src in sources:
+        s = _serialize_source(src)
+        s.update(stats.get(src.url, {"online": 0, "offline": 0, "total": 0}))
+        serialized.append(s)
+
+    return {"sources": serialized, "total": len(serialized)}
+
+
+@router.patch("/sources/{source_id}/toggle")
+async def toggle_source(source_id: int, db: AsyncSession = Depends(get_db_session)):
+    """Enable or disable a source."""
+    stmt = select(LiveTvSource).where(LiveTvSource.id == source_id)
+    result = await db.execute(stmt)
+    source = result.scalar_one_or_none()
+
+    if source is None:
+        raise HTTPException(status_code=404, detail="Source not found")
+
+    source.enabled = not source.enabled
+    await db.commit()
+    await db.refresh(source)
+
+    state = "enabled" if source.enabled else "disabled"
+    logger.info(f"Live TV source '{source.label}' {state}")
+    return {"status": state, "source": _serialize_source(source)}
+
+
+@router.delete("/sources/{source_id}")
+async def delete_source(source_id: int, db: AsyncSession = Depends(get_db_session)):
+    """Delete a source and all channels imported from it."""
+    stmt = select(LiveTvSource).where(LiveTvSource.id == source_id)
+    result = await db.execute(stmt)
+    source = result.scalar_one_or_none()
+
+    if source is None:
+        raise HTTPException(status_code=404, detail="Source not found")
+
+    source_url = source.url
+    label = source.label
+
+    del_stmt = sa_delete(LiveTvChannel).where(LiveTvChannel.source_m3u == source_url)
+    del_result = await db.execute(del_stmt)
+    deleted_channels = del_result.rowcount
+
+    await db.delete(source)
+    await db.commit()
+
+    logger.info(f"Live TV: deleted source '{label}' and {deleted_channels} channels")
+    return {"status": "deleted", "label": label, "channels_deleted": deleted_channels}
+
+
+# ---------------------------------------------------------------------------
+# Endpoints — group management (Session 36)
+# ---------------------------------------------------------------------------
+
+@router.get("/groups")
+async def list_groups(db: AsyncSession = Depends(get_db_session)):
+    """
+    List all distinct group names with their current sort_order and channel count.
+    The sort_order returned is the minimum sort_order across all channels in the
+    group (they are all set to the same value by the reorder endpoint).
+    """
+    from sqlalchemy import text
+    raw = await db.execute(text("""
+        SELECT
+            COALESCE(group_name, 'Other') AS gname,
+            MIN(sort_order)               AS sort_ord,
+            COUNT(*)                      AS ch_count,
+            SUM(CASE WHEN is_online = 1 THEN 1 ELSE 0 END) AS online_count
+        FROM live_tv_channels
+        GROUP BY COALESCE(group_name, 'Other')
+        ORDER BY MIN(sort_order) ASC, COALESCE(group_name, 'Other') ASC
+    """))
+    groups = [
+        {
+            "name":         row[0],
+            "sort_order":   row[1],
+            "channel_count": row[2],
+            "online_count": row[3] or 0,
+        }
+        for row in raw.fetchall()
+    ]
+    return {"groups": groups, "total": len(groups)}
+
+
+@router.patch("/groups/reorder")
+async def reorder_groups(
+    request: ReorderGroupsRequest,
+    db: AsyncSession = Depends(get_db_session),
+):
+    """
+    Set sort_order for groups in bulk.
+
+    The request body is {"groups": ["Local OTA", "News", "Sports", ...]}.
+    Each group name is assigned sort_order = index * 10.
+    Groups not mentioned in the list are left unchanged.
+    """
+    updated = 0
+    for idx, group_name in enumerate(request.groups):
+        sort_val = idx * 10
+        if group_name == "Other":
+            # "Other" maps to null group_name in the DB
+            stmt = (
+                sa_update(LiveTvChannel)
+                .where(LiveTvChannel.group_name.is_(None))
+                .values(sort_order=sort_val)
+            )
+        else:
+            stmt = (
+                sa_update(LiveTvChannel)
+                .where(LiveTvChannel.group_name == group_name)
+                .values(sort_order=sort_val)
+            )
+        result = await db.execute(stmt)
+        updated += result.rowcount
+
+    await db.commit()
+    logger.info(f"Live TV group reorder: {len(request.groups)} groups, {updated} channels updated")
+    return {
+        "status":          "reordered",
+        "groups_set":      len(request.groups),
+        "channels_updated": updated,
+    }
+
+
+@router.delete("/groups/{group_name}")
+async def delete_group(
+    group_name: str,
+    db: AsyncSession = Depends(get_db_session),
+):
+    """
+    Delete all channels whose group_name matches the given value.
+    Use the special value '__other__' to delete channels with no group_name.
+    Returns the count of deleted channels.
+    """
+    if group_name == "__other__":
+        stmt = sa_delete(LiveTvChannel).where(LiveTvChannel.group_name.is_(None))
+    else:
+        stmt = sa_delete(LiveTvChannel).where(LiveTvChannel.group_name == group_name)
+
+    result = await db.execute(stmt)
+    deleted = result.rowcount
+    await db.commit()
+
+    # Refresh source counts for any affected sources
+    # (bulk delete doesn't trigger per-channel refresh, so do a full pass)
+    src_stmt = select(LiveTvSource)
+    src_result = await db.execute(src_stmt)
+    for src in src_result.scalars().all():
+        await _refresh_source_count(db, src.url)
+
+    logger.info(f"Live TV: deleted group '{group_name}' — {deleted} channels removed")
+    return {"status": "deleted", "group_name": group_name, "channels_deleted": deleted}
+
+
+
+# ---------------------------------------------------------------------------
+# Wipe all live TV channels
+# ---------------------------------------------------------------------------
+
+@router.delete("/channels/all")
+async def delete_all_live_channels(
+    confirm: bool = Query(
+        False,
+        description="Must be true to execute. Prevents accidental wipes.",
+    ),
+    db: AsyncSession = Depends(get_db_session),
+):
+    """
+    Delete ALL live TV channels in one shot.
+
+    Protected by ?confirm=true. Also clears channel_count on all sources
+    so they accurately reflect zero after the wipe.
+    """
+    if not confirm:
+        raise HTTPException(
+            status_code=400,
+            detail="Pass ?confirm=true to execute this operation.",
+        )
+
+    result = await db.execute(sa_delete(LiveTvChannel))
+    deleted = result.rowcount
+    await db.commit()
+
+    # Zero out all source channel counts
+    src_result = await db.execute(select(LiveTvSource))
+    for src in src_result.scalars().all():
+        src.channel_count = 0
+    await db.commit()
+
+    logger.warning(f"Live TV WIPE ALL: {deleted} channels deleted")
+    return {"status": "wiped", "channels_deleted": deleted}
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+async def _upsert_source(
+    db: AsyncSession,
+    url: str,
+    label: Optional[str],
+    now: datetime.datetime,
+) -> None:
+    stmt = select(LiveTvSource).where(LiveTvSource.url == url)
+    result = await db.execute(stmt)
+    source = result.scalar_one_or_none()
+
+    count_stmt = select(func.count()).select_from(LiveTvChannel).where(
+        LiveTvChannel.source_m3u == url
+    )
+    count_result = await db.execute(count_stmt)
+    channel_count = count_result.scalar_one()
+
+    if source is None:
+        source = LiveTvSource(
+            url=url,
+            label=label or _derive_label(url),
+            enabled=True,
+            channel_count=channel_count,
+            created_at=now,
+            last_imported_at=now,
+        )
+        db.add(source)
+    else:
+        if label:
+            source.label = label
+        source.channel_count = channel_count
+        source.last_imported_at = now
+
+    await db.commit()
+
+
+async def _refresh_source_count(db: AsyncSession, source_url: str) -> None:
+    src_stmt = select(LiveTvSource).where(LiveTvSource.url == source_url)
+    src_result = await db.execute(src_stmt)
+    source = src_result.scalar_one_or_none()
+    if source is None:
+        return
+
+    count_stmt = select(func.count()).select_from(LiveTvChannel).where(
+        LiveTvChannel.source_m3u == source_url
+    )
+    count_result = await db.execute(count_stmt)
+    source.channel_count = count_result.scalar_one()
+    await db.commit()
+
+
+# ---------------------------------------------------------------------------
+# Background health probe
+# ---------------------------------------------------------------------------
 
 async def _probe_all_channels():
-    """
-    Probe all live TV channels for online status.
-    Called by the scheduler every 15 minutes and on manual trigger.
-    Uses a HEAD request — fast, minimal data transfer.
-    Falls back to a short GET if HEAD returns 405.
-    """
     async with async_session_factory() as db:
         try:
             stmt = select(LiveTvChannel)
             result = await db.execute(stmt)
             channels = result.scalars().all()
-
             now = datetime.datetime.utcnow()
 
             async with httpx.AsyncClient(timeout=PROBE_TIMEOUT) as client:
@@ -410,8 +743,6 @@ async def _probe_all_channels():
                         continue
                     try:
                         resp = await client.head(channel.stream_url, follow_redirects=True)
-                        # 2xx or 3xx = online. 4xx/5xx = offline.
-                        # 405 Method Not Allowed = server doesn't support HEAD, try GET
                         if resp.status_code == 405:
                             get_resp = await client.get(
                                 channel.stream_url,
@@ -429,14 +760,10 @@ async def _probe_all_channels():
 
             await db.commit()
             online_count = sum(1 for ch in channels if ch.is_online)
-            logger.info(
-                f"Live TV health probe complete: "
-                f"{online_count}/{len(channels)} channels online"
-            )
+            logger.info(f"Live TV health probe complete: {online_count}/{len(channels)} online")
 
         except Exception as e:
             logger.error(f"Live TV health probe failed: {e}")
 
 
-# Expose for scheduler import
 probe_all_channels = _probe_all_channels

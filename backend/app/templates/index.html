@@ -436,13 +436,97 @@
         .live-tv-import-row input { flex: 1; padding: 7px 12px; background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); color: var(--text-primary); font-size: 13px; font-family: 'Outfit', sans-serif; outline: none; }
         .live-tv-import-row input:focus { border-color: var(--accent-orange); }
 
-        .live-ch-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 10px; }
-        .live-ch-card { background: var(--bg-card); border: 1px solid var(--border-subtle); border-radius: var(--radius); padding: 12px 14px; display: flex; align-items: center; gap: 12px; }
-        .live-ch-logo { width: 40px; height: 40px; border-radius: 6px; object-fit: contain; background: var(--bg-surface); flex-shrink: 0; }
-        .live-ch-logo-placeholder { width: 40px; height: 40px; border-radius: 6px; background: var(--bg-surface); display: flex; align-items: center; justify-content: center; font-size: 20px; flex-shrink: 0; }
+        /* Sources panel */
+        .live-tv-sources { margin-bottom: 20px; }
+        .live-tv-sources-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+        .live-tv-sources-header h3 { font-size: 14px; font-weight: 600; color: var(--text-secondary); }
+        .live-src-list { display: flex; flex-direction: column; gap: 8px; }
+        .live-src-card { background: var(--bg-card); border: 1px solid var(--border-subtle); border-radius: var(--radius); padding: 12px 14px; display: flex; align-items: center; gap: 12px; transition: border-color 0.15s; }
+        .live-src-card.disabled { opacity: 0.55; }
+        .live-src-card:hover { border-color: var(--accent-orange); }
+        .live-src-info { flex: 1; min-width: 0; }
+        .live-src-label { font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .live-src-url { font-size: 11px; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: 'JetBrains Mono', monospace; }
+        .live-src-meta { font-size: 11px; color: var(--text-secondary); margin-top: 2px; }
+        .live-src-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+        .live-src-toggle { padding: 3px 10px; border-radius: var(--radius-sm); font-size: 11px; font-weight: 600; cursor: pointer; border: 1px solid; transition: all 0.15s; }
+        .live-src-toggle.enabled { background: var(--accent-green-dim); color: var(--accent-green); border-color: var(--accent-green); }
+        .live-src-toggle.enabled:hover { background: var(--accent-green); color: #000; }
+        .live-src-toggle.disabled-btn { background: var(--accent-red-dim); color: var(--accent-red); border-color: var(--accent-red); }
+        .live-src-toggle.disabled-btn:hover { background: var(--accent-red); color: #fff; }
+        .live-src-filter { padding: 3px 10px; border-radius: var(--radius-sm); font-size: 11px; font-weight: 600; cursor: pointer; border: 1px solid var(--border-subtle); background: none; color: var(--text-secondary); transition: all 0.15s; }
+        .live-src-filter:hover, .live-src-filter.active { border-color: var(--accent-orange); color: var(--accent-orange); background: var(--accent-orange-dim); }
+
+        /* Group order panel */
+        .live-tv-groups { margin-bottom: 20px; }
+        .live-tv-groups-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+        .live-tv-groups-header h3 { font-size: 14px; font-weight: 600; color: var(--text-secondary); }
+        .live-grp-list { display: flex; flex-direction: column; gap: 6px; }
+        .live-grp-row { background: var(--bg-card); border: 1px solid var(--border-subtle); border-radius: var(--radius); padding: 10px 14px; display: flex; align-items: center; gap: 10px; cursor: grab; transition: border-color 0.15s; }
+        .live-grp-row:hover { border-color: var(--accent-orange); }
+        .live-grp-row.dragging { opacity: 0.45; border-style: dashed; border-color: var(--accent-orange); }
+        .live-grp-handle { color: var(--text-muted); font-size: 14px; cursor: grab; user-select: none; flex-shrink: 0; }
+        .live-grp-name { flex: 1; font-size: 13px; font-weight: 600; }
+        .live-grp-meta { font-size: 11px; color: var(--text-muted); }
+        .live-grp-arrows { display: flex; gap: 3px; flex-shrink: 0; }
+        .live-grp-btn { width: 24px; height: 24px; background: none; border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); color: var(--text-muted); font-size: 11px; cursor: pointer; display: flex; align-items: center; justify-content: center; transition: all 0.15s; }
+        .live-grp-btn:hover { border-color: var(--accent-orange); color: var(--accent-orange); }
+        .live-grp-save { padding: 5px 14px; background: var(--accent-orange); color: var(--bg-primary); border: none; border-radius: var(--radius-sm); font-size: 12px; font-weight: 600; cursor: pointer; }
+        .live-grp-save:hover { background: #ff8555; }
+        .live-grp-delete { padding: 3px 9px; background: var(--accent-red-dim); color: var(--accent-red); border: 1px solid var(--accent-red); border-radius: var(--radius-sm); font-size: 11px; font-weight: 600; cursor: pointer; transition: all 0.15s; }
+        .live-grp-delete:hover { background: var(--accent-red); color: #fff; }
+
+        /* =====================================================================
+           LIVE TV — SOURCE-GROUPED CHANNEL MANAGEMENT
+           ===================================================================== */
+        /* Source group header */
+        .live-src-group { margin-bottom: 20px; }
+        .live-src-group-header { display: flex; align-items: center; gap: 10px; padding: 10px 14px; background: var(--bg-card); border: 1px solid var(--border-subtle); border-radius: var(--radius); margin-bottom: 8px; cursor: pointer; transition: border-color 0.15s; }
+        .live-src-group-header:hover { border-color: var(--accent-orange); }
+        .live-src-group.collapsed .live-src-group-chevron { transform: rotate(-90deg); }
+        .live-src-group.collapsed .live-src-group-body { display: none; }
+        .live-src-group-chevron { font-size: 11px; color: var(--text-muted); flex-shrink: 0; transition: transform 0.15s; }
+        .live-src-group-info { flex: 1; min-width: 0; }
+        .live-src-group-label { font-size: 13px; font-weight: 700; color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .live-src-group-meta { font-size: 11px; color: var(--text-secondary); margin-top: 2px; }
+        .live-src-group-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+        .live-src-sel-all-lbl { display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--text-secondary); cursor: pointer; padding: 3px 6px; border-radius: 4px; transition: background 0.1s; }
+        .live-src-sel-all-lbl:hover { background: var(--bg-card-hover); }
+        .live-src-group-del-btn { padding: 3px 10px; background: var(--accent-red-dim); color: var(--accent-red); border: 1px solid var(--accent-red); border-radius: var(--radius-sm); font-size: 11px; font-weight: 600; cursor: pointer; white-space: nowrap; transition: all 0.15s; }
+        .live-src-group-del-btn:hover { background: var(--accent-red); color: #fff; }
+
+        /* Bulk toolbar */
+        .live-bulk-toolbar { display: flex; align-items: center; gap: 10px; padding: 8px 12px; background: var(--bg-card); border: 1px solid var(--accent-orange); border-radius: var(--radius); margin-bottom: 12px; flex-wrap: wrap; }
+        .live-bulk-toolbar.hidden { display: none; }
+        .live-bulk-count { font-size: 13px; font-weight: 600; color: var(--accent-orange); flex: 1; }
+        .live-bulk-del-btn { padding: 5px 14px; background: var(--accent-red-dim); color: var(--accent-red); border: 1px solid var(--accent-red); border-radius: var(--radius-sm); font-size: 12px; font-weight: 600; cursor: pointer; transition: all 0.15s; }
+        .live-bulk-del-btn:hover { background: var(--accent-red); color: #fff; }
+        .live-bulk-cancel-btn { padding: 5px 14px; background: none; color: var(--text-secondary); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); font-size: 12px; font-weight: 600; cursor: pointer; transition: all 0.15s; }
+        .live-bulk-cancel-btn:hover { border-color: var(--text-secondary); }
+        .live-wipe-btn { background: none; color: var(--accent-red); border: 1px solid var(--accent-red-dim); padding: 5px 14px; border-radius: var(--radius-sm); font-size: 12px; font-weight: 600; cursor: pointer; margin-left: auto; transition: all 0.15s; }
+        .live-wipe-btn:hover { background: var(--accent-red); color: #fff; }
+
+        /* Channel card in Live TV management grid */
+        .live-ch-card { background: var(--bg-card); border: 1px solid var(--border-subtle); border-radius: var(--radius); padding: 10px 12px; display: flex; align-items: center; gap: 10px; position: relative; transition: border-color 0.15s; }
+        .live-ch-card:hover { border-color: var(--border-focus); }
+        .live-ch-card.live-ch-selected { border-color: var(--accent-orange) !important; background: var(--accent-orange-dim); }
+        .live-ch-select-cb { width: 15px; height: 15px; cursor: pointer; flex-shrink: 0; display: block; accent-color: var(--accent-orange); }
+        .live-ch-logo { width: 36px; height: 36px; border-radius: 6px; object-fit: contain; background: var(--bg-surface); flex-shrink: 0; }
+        .live-ch-logo-placeholder { width: 36px; height: 36px; border-radius: 6px; background: var(--bg-surface); display: flex; align-items: center; justify-content: center; font-size: 18px; flex-shrink: 0; }
         .live-ch-info { flex: 1; min-width: 0; }
         .live-ch-name { font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         .live-ch-group { font-size: 11px; color: var(--text-muted); }
+        .live-ch-source { font-size: 10px; color: var(--text-muted); font-family: 'JetBrains Mono', monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .live-ch-status { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+        .live-ch-status.online  { background: var(--accent-orange); }
+        .live-ch-status.offline { background: var(--text-muted); opacity: 0.5; }
+        .live-ch-status.unknown { background: transparent; }
+        .live-ch-actions { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
+        /* Channel grid */
+        .live-tv-channel-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+        .live-tv-channel-header h3 { font-size: 14px; font-weight: 600; color: var(--text-secondary); }
+        .live-tv-filter-badge { font-size: 11px; font-weight: 600; color: var(--accent-orange); background: var(--accent-orange-dim); padding: 2px 8px; border-radius: 20px; border: 1px solid var(--accent-orange); cursor: pointer; }
+        .live-ch-grid { display: flex; flex-direction: column; gap: 4px; }
         .live-ch-status { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
         .live-ch-status.online { background: var(--accent-green); }
         .live-ch-status.offline { background: var(--accent-red); }
@@ -775,16 +859,61 @@
                     </div>
                 </div>
                 <div class="simple-page-content">
+
+                    <!-- Import panel -->
                     <div class="live-tv-import">
                         <h3>&#x2795; Import M3U Playlist</h3>
                         <div class="live-tv-import-row">
-                            <input type="text" id="m3uUrlInput" placeholder="Paste M3U URL or leave blank to add manually...">
+                            <input type="text" id="m3uUrlInput" placeholder="Paste M3U URL...">
+                            <input type="text" id="m3uLabelInput" placeholder="Label (optional)" style="max-width:200px;">
                             <button class="btn btn-primary btn-sm" onclick="importM3U()">Import</button>
                         </div>
                     </div>
-                    <div class="live-ch-grid" id="liveTvGrid">
+
+                    <!-- Sources panel -->
+                    <div class="live-tv-sources">
+                        <div class="live-tv-sources-header">
+                            <h3>&#x1F4C2; Sources</h3>
+                            <span id="liveSrcCount" style="font-size:12px;color:var(--text-muted);"></span>
+                        </div>
+                        <div class="live-src-list" id="liveSrcList">
+                            <div style="font-size:13px;color:var(--text-muted);padding:8px 0;">No sources yet — import an M3U playlist above.</div>
+                        </div>
+                    </div>
+
+                    <!-- Group Order panel -->
+                    <div class="live-tv-groups">
+                        <div class="live-tv-groups-header">
+                            <h3>&#x21C5; Group Order</h3>
+                            <div style="display:flex;gap:8px;align-items:center;">
+                                <span id="liveGrpCount" style="font-size:12px;color:var(--text-muted);"></span>
+                                <button class="live-grp-save" onclick="saveGroupOrder()">Save Order</button>
+                            </div>
+                        </div>
+                        <div class="live-grp-list" id="liveGrpList">
+                            <div style="font-size:13px;color:var(--text-muted);padding:8px 0;">No groups yet — import channels first.</div>
+                        </div>
+                    </div>
+
+                    <!-- Channel management toolbar -->
+                    <div class="live-tv-channel-header">
+                        <h3>&#x1F4FA; Channels</h3>
+                        <div style="display:flex;gap:8px;align-items:center;">
+                            <span id="liveChFilterBadge" class="live-tv-filter-badge" style="display:none;" onclick="clearLiveTvFilter()">All sources &#x2715;</span>
+                        </div>
+                    </div>
+                    <!-- Bulk toolbar — always visible -->
+                    <div class="live-bulk-toolbar" id="liveBulkToolbar">
+                        <span class="live-bulk-count" id="liveBulkCount">0 selected — check boxes to select channels</span>
+                        <button class="live-bulk-del-btn" id="liveBulkDelBtn" onclick="deleteLiveSelected()" disabled style="opacity:0.4;cursor:not-allowed;">&#x1F5D1; Delete Selected</button>
+                        <button class="live-bulk-cancel-btn" onclick="clearLiveSelection()">&#x2715; Clear</button>
+                        <button class="live-wipe-btn" onclick="wipeLiveChannels()">&#x26A0; Wipe All Live TV</button>
+                    </div>
+                    <!-- Channel list — source-grouped -->
+                    <div id="liveTvGrid">
                         <div class="empty-state"><div class="empty-state-icon">&#x1F4E1;</div><h3>No channels yet</h3><p>Import an M3U playlist to add live TV channels.</p></div>
                     </div>
+
                 </div>
             </div>
 
@@ -1790,55 +1919,491 @@
         // =====================================================================
         //  LIVE TV
         // =====================================================================
+
+        let liveTvSourceFilter = null;  // active source URL filter (null = all)
+        let liveTvAllChannels  = [];    // full channel list cache
+        let liveGrpOrder       = [];    // current group order array (for reorder panel)
+
         async function loadLiveTv() {
-            try { const res=await fetch(`${API_BASE}/live-tv/channels`); const data=await res.json(); renderLiveTv(data.channels||[]); }
-            catch(e){log(`Failed to load Live TV: ${e.message}`,'error');}
+            try {
+                const [chRes, srcRes, grpRes] = await Promise.all([
+                    fetch(`${API_BASE}/live-tv/channels?include_disabled=true`),
+                    fetch(`${API_BASE}/live-tv/sources`),
+                    fetch(`${API_BASE}/live-tv/groups`),
+                ]);
+                const chData  = await chRes.json();
+                const srcData = await srcRes.json();
+                const grpData = await grpRes.json();
+                liveTvAllChannels = chData.channels || [];
+                renderLiveTvSources(srcData.sources || []);
+                renderLiveTvGroups(grpData.groups || []);
+                applyLiveTvFilter();
+            } catch(e) { log(`Failed to load Live TV: ${e.message}`, 'error'); }
         }
 
-        function renderLiveTv(channels) {
-            const grid=document.getElementById('liveTvGrid');
-            if(!channels.length){grid.innerHTML='<div class="empty-state"><div class="empty-state-icon">&#x1F4E1;</div><h3>No channels</h3><p>Import an M3U playlist to get started.</p></div>';return;}
-            grid.innerHTML=channels.map(ch=>{
-                const sc=ch.is_online===true?'online':ch.is_online===false?'offline':'unknown';
-                return `<div class="live-ch-card">
-                    ${ch.logo_url?`<img class="live-ch-logo" src="${escapeHtml(ch.logo_url)}" alt="${escapeHtml(ch.name)}" onerror="this.outerHTML='<div class=live-ch-logo-placeholder>&#x1F4E1;</div>'">`:'<div class="live-ch-logo-placeholder">&#x1F4E1;</div>'}
-                    <div class="live-ch-info"><div class="live-ch-name">${escapeHtml(ch.name)}</div>${ch.group_name?`<div class="live-ch-group">${escapeHtml(ch.group_name)}</div>`:''}</div>
-                    <div class="live-ch-status ${sc}" title="${sc}"></div>
-                    <button class="btn-icon btn-icon-danger" onclick="deleteLiveChannel(${ch.id})">&#x1F5D1;</button>
+        // ── Sources panel ──────────────────────────────────────────────────────
+
+        function renderLiveTvSources(sources) {
+            const list  = document.getElementById('liveSrcList');
+            const count = document.getElementById('liveSrcCount');
+            if (!sources.length) {
+                list.innerHTML = '<div style="font-size:13px;color:var(--text-muted);padding:8px 0;">No sources yet — import an M3U playlist above.</div>';
+                count.textContent = '';
+                return;
+            }
+            count.textContent = `${sources.length} source${sources.length !== 1 ? 's' : ''}`;
+            list.innerHTML = sources.map(src => {
+                const isActive    = liveTvSourceFilter === src.url;
+                const toggleClass = src.enabled ? 'enabled' : 'disabled-btn';
+                const toggleLabel = src.enabled ? 'Enabled' : 'Disabled';
+                const meta = [
+                    `${src.channel_count} ch`,
+                    src.total > 0 ? `${src.online}&#x25CF; ${src.offline}&#x25CB;` : 'not probed',
+                    src.last_imported_at ? `imported ${new Date(src.last_imported_at).toLocaleDateString()}` : '',
+                ].filter(Boolean).join(' &nbsp;·&nbsp; ');
+                return `<div class="live-src-card${src.enabled ? '' : ' disabled'}">
+                    <div class="live-src-info">
+                        <div class="live-src-label">${escapeHtml(src.label)}</div>
+                        <div class="live-src-url" title="${escapeHtml(src.url)}">${escapeHtml(src.url)}</div>
+                        <div class="live-src-meta">${meta}</div>
+                    </div>
+                    <div class="live-src-actions">
+                        <button class="live-src-filter${isActive ? ' active' : ''}" onclick="filterLiveTvBySource('${escapeHtml(src.url).replace(/'/g,"\\'")}', this)" title="Filter channels to this source">&#x1F50D;</button>
+                        <button class="live-src-toggle ${toggleClass}" onclick="toggleLiveTvSource(${src.id})">${toggleLabel}</button>
+                        <button class="btn-icon btn-icon-danger" onclick="deleteLiveTvSource(${src.id}, '${escapeHtml(src.label).replace(/'/g,"\\'")}', ${src.channel_count})" title="Delete source and all its channels">&#x1F5D1;</button>
+                    </div>
                 </div>`;
             }).join('');
         }
 
-        async function importM3U() {
-            const input=document.getElementById('m3uUrlInput'); const url=input.value.trim();
-            const btn=document.querySelector('.live-tv-import .btn-primary'); btn.disabled=true; btn.innerHTML='<span class="spinner"></span>';
-            if(!url){log('Enter an M3U URL.','warn');btn.disabled=false;btn.innerHTML='Import';return;}
+        function filterLiveTvBySource(url, btn) {
+            if (liveTvSourceFilter === url) { clearLiveTvFilter(); return; }
+            liveTvSourceFilter = url;
+            document.querySelectorAll('.live-src-filter').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            applyLiveTvFilter();
+        }
+
+        function clearLiveTvFilter() {
+            liveTvSourceFilter = null;
+            document.querySelectorAll('.live-src-filter').forEach(b => b.classList.remove('active'));
+            applyLiveTvFilter();
+        }
+
+        function applyLiveTvFilter() {
+            const badge = document.getElementById('liveChFilterBadge');
+            let channels = liveTvAllChannels;
+            if (liveTvSourceFilter) {
+                channels = channels.filter(ch => ch.source_m3u === liveTvSourceFilter);
+                const parts = liveTvSourceFilter.split('/').filter(Boolean);
+                const shortLabel = parts[parts.length - 1] || liveTvSourceFilter;
+                badge.textContent = shortLabel.replace(/\.m3u8?$/i, '') + ' ✕';
+                badge.style.display = 'inline-block';
+            } else {
+                badge.style.display = 'none';
+            }
+            renderLiveTvChannels(channels);
+        }
+
+        // ── Live TV selection state ─────────────────────────────────────────
+        let _liveSelectedIds = new Set();
+
+        function clearLiveSelection() {
+            _liveSelectedIds.clear();
+            document.querySelectorAll('.live-ch-card.live-ch-selected').forEach(function(el) { el.classList.remove('live-ch-selected'); });
+            document.querySelectorAll('.live-ch-select-cb').forEach(function(cb) { cb.checked = false; });
+            document.querySelectorAll('.live-src-sel-all-cb').forEach(function(cb) { cb.checked = false; });
+            _updateLiveBulkCount();
+        }
+
+        function toggleLiveChannelSelect(id) {
+            if (_liveSelectedIds.has(id)) { _liveSelectedIds.delete(id); }
+            else { _liveSelectedIds.add(id); }
+            var card = document.getElementById('liveCard_' + id);
+            var cb   = document.getElementById('liveCb_' + id);
+            if (card) card.classList.toggle('live-ch-selected', _liveSelectedIds.has(id));
+            if (cb)   cb.checked = _liveSelectedIds.has(id);
+            _updateLiveBulkCount();
+        }
+
+        function selectLiveSourceGroup(sourceUrl, checked) {
+            liveTvAllChannels.filter(function(ch) { return ch.source_m3u === sourceUrl || (!ch.source_m3u && sourceUrl === '__manual__'); }).forEach(function(ch) {
+                if (checked) { _liveSelectedIds.add(ch.id); } else { _liveSelectedIds.delete(ch.id); }
+                var card = document.getElementById('liveCard_' + ch.id);
+                var cb   = document.getElementById('liveCb_' + ch.id);
+                if (card) card.classList.toggle('live-ch-selected', checked);
+                if (cb)   cb.checked = checked;
+            });
+            _updateLiveBulkCount();
+        }
+
+        function _updateLiveBulkCount() {
+            var n   = _liveSelectedIds.size;
+            var el  = document.getElementById('liveBulkCount');
+            var btn = document.getElementById('liveBulkDelBtn');
+            if (el)  el.textContent = n > 0 ? n + ' channel' + (n !== 1 ? 's' : '') + ' selected' : '0 selected — check boxes to select channels';
+            if (btn) { btn.disabled = n === 0; btn.style.opacity = n > 0 ? '1' : '0.4'; btn.style.cursor = n > 0 ? 'pointer' : 'not-allowed'; }
+        }
+
+        async function deleteLiveSelected() {
+            var ids = Array.from(_liveSelectedIds);
+            if (!ids.length) { log('No channels selected.', 'warn'); return; }
+            if (!confirm('Delete ' + ids.length + ' channel' + (ids.length !== 1 ? 's' : '') + '? This cannot be undone.')) return;
+            var deleted = 0, failed = 0;
+            for (var i = 0; i < ids.length; i++) {
+                try {
+                    var res = await fetch(API_BASE + '/live-tv/channels/' + ids[i], { method: 'DELETE' });
+                    if (res.ok) deleted++; else failed++;
+                } catch(e) { failed++; }
+            }
+            log('Deleted ' + deleted + ' Live TV channel' + (deleted !== 1 ? 's' : '') + (failed ? ' (' + failed + ' failed)' : ''), deleted > 0 ? 'success' : 'warn');
+            _liveSelectedIds.clear();
+            _updateLiveBulkCount();
+            await loadLiveTv();
+        }
+
+        async function wipeLiveChannels() {
+            if (!confirm('\u26a0 WIPE ALL LIVE TV CHANNELS?\n\nThis permanently deletes every Live TV channel. M3U sources are kept so you can re-import. This cannot be undone.')) return;
+            if (!confirm('Absolutely sure? This deletes all ' + liveTvAllChannels.length + ' channels.')) return;
             try {
-                const res=await fetch(`${API_BASE}/live-tv/import-m3u`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url})});
-                const data=await res.json();
-                if(!res.ok){
-                    log(`M3U import failed: ${data.detail||'Unknown error (HTTP '+res.status+')'}`, 'error');
-                    return;
-                }
-                if(data.warning){
+                var res = await fetch(API_BASE + '/live-tv/channels/all?confirm=true', { method: 'DELETE' });
+                if (!res.ok) { var err = await res.json(); throw new Error(err.detail || 'Wipe failed'); }
+                var data = await res.json();
+                log('Live TV wiped: ' + data.channels_deleted + ' channels deleted', 'success');
+                clearLiveSelection();
+                await loadLiveTv();
+            } catch(e) { log('Wipe failed: ' + e.message, 'error'); }
+        }
+
+        function playLiveChannel(streamUrl, name) {
+            log('Live TV: opening ' + name, 'info');
+            _openPlayer(name);
+            var container = document.getElementById('playerContainer');
+            document.getElementById('playerTitle').textContent = name;
+            _attachVideo(container, streamUrl, 'application/x-mpegURL');
+        }
+
+        function renderLiveTvChannels(channels) {
+            var grid = document.getElementById('liveTvGrid');
+            if (!channels.length) {
+                grid.innerHTML = '<div class="empty-state"><div class="empty-state-icon">&#x1F4E1;</div><h3>No channels</h3><p>Import an M3U playlist to get started.</p></div>';
+                return;
+            }
+
+            // Group by source_m3u URL. null/blank = manual.
+            var sourceMap = {};
+            channels.forEach(function(ch) {
+                var key = ch.source_m3u || '__manual__';
+                if (!sourceMap[key]) sourceMap[key] = { key: key, channels: [] };
+                sourceMap[key].channels.push(ch);
+            });
+
+            var html = '';
+            Object.values(sourceMap).forEach(function(src, srcIdx) {
+                var chs    = src.channels;
+                var total  = chs.length;
+                var online = chs.filter(function(c) { return c.is_online === true; }).length;
+                var offline = chs.filter(function(c) { return c.is_online === false; }).length;
+                var label  = src.key === '__manual__' ? 'Manually Added' : src.key;
+                var shortLabel = label.length > 80 ? label.slice(0, 80) + '\u2026' : label;
+                var safeKey  = escapeHtml(src.key);
+                var safeLabel = escapeHtml(shortLabel);
+                var srcId = 'lsrc_' + srcIdx;
+                var metaParts = [
+                    total + ' channel' + (total !== 1 ? 's' : ''),
+                    online > 0  ? online  + ' \u25cf online'  : '',
+                    offline > 0 ? offline + ' \u25cb offline' : ''
+                ].filter(Boolean).join(' \u00b7 ');
+
+                var cardsHtml = '';
+                chs.forEach(function(ch) {
+                    var sc      = ch.is_online === true ? 'online' : ch.is_online === false ? 'offline' : 'unknown';
+                    var favIcon = ch.is_favorite ? '&#x2605;' : '&#x2606;';
+                    var favStyle = ch.is_favorite ? 'color:var(--accent-yellow);' : '';
+                    var logoHtml = ch.logo_url
+                        ? '<img class="live-ch-logo" src="' + escapeHtml(ch.logo_url) + '" alt="' + escapeHtml(ch.name) + '" onerror="this.outerHTML=\'<div class=live-ch-logo-placeholder>&#x1F4E1;</div>\'">'
+                        : '<div class="live-ch-logo-placeholder">&#x1F4E1;</div>';
+                    var groupHtml = ch.group_name ? '<div class="live-ch-group">' + escapeHtml(ch.group_name) + '</div>' : '';
+                    var playBtn = ch.stream_url
+                        ? '<button class="btn-icon" title="Preview in browser" onclick="playLiveChannel(\'' + escapeHtml(ch.stream_url).replace(/'/g, "\\'") + '\',\'' + escapeHtml(ch.name).replace(/'/g, "\\'") + '\')">&#x25B6;</button>'
+                        : '';
+                    cardsHtml += '<div class="live-ch-card" id="liveCard_' + ch.id + '">'
+                        + '<input type="checkbox" class="live-ch-select-cb" id="liveCb_' + ch.id + '" onclick="event.stopPropagation();toggleLiveChannelSelect(' + ch.id + ')">'
+                        + logoHtml
+                        + '<div class="live-ch-info">'
+                        +   '<div class="live-ch-name">' + escapeHtml(ch.name) + '</div>'
+                        +   groupHtml
+                        + '</div>'
+                        + '<div class="live-ch-status ' + sc + '" title="' + sc + '"></div>'
+                        + '<div class="live-ch-actions">'
+                        +   playBtn
+                        +   '<button class="btn-icon" style="' + favStyle + '" title="Favorite" onclick="toggleLiveChannelFavorite(' + ch.id + ')">' + favIcon + '</button>'
+                        +   '<button class="btn-icon btn-icon-danger" title="Remove" onclick="deleteLiveChannel(' + ch.id + ')">&#x1F5D1;</button>'
+                        + '</div>'
+                        + '</div>';
+                });
+
+                html += '<div class="live-src-group" id="' + srcId + '">'
+                    + '<div class="live-src-group-header" onclick="document.getElementById(\'' + srcId + '\').classList.toggle(\'collapsed\')">'
+                    +   '<span class="live-src-group-chevron">&#x25BC;</span>'
+                    +   '<div class="live-src-group-info">'
+                    +     '<div class="live-src-group-label" title="' + safeKey + '">' + safeLabel + '</div>'
+                    +     '<div class="live-src-group-meta">' + metaParts + '</div>'
+                    +   '</div>'
+                    +   '<div class="live-src-group-actions" onclick="event.stopPropagation()">'
+                    +     '<label class="live-src-sel-all-lbl">'
+                    +       '<input type="checkbox" class="live-src-sel-all-cb" style="accent-color:var(--accent-orange)" onclick="event.stopPropagation();selectLiveSourceGroup(\'' + safeKey.replace(/'/g, "\\'") + '\',this.checked)">'
+                    +       '<span>Select all</span>'
+                    +     '</label>'
+                    +     '<button class="live-src-group-del-btn" onclick="deleteLiveSourceGroupByUrl(\'' + safeKey.replace(/'/g, "\\'") + '\',\'' + safeLabel.replace(/'/g, "\\'") + '\',' + total + ')">&#x1F5D1; Delete Source</button>'
+                    +   '</div>'
+                    + '</div>'
+                    + '<div class="live-src-group-body live-ch-grid">' + cardsHtml + '</div>'
+                    + '</div>';
+            });
+
+            grid.innerHTML = html;
+
+            // Re-apply checked state after re-render
+            _liveSelectedIds.forEach(function(id) {
+                var card = document.getElementById('liveCard_' + id);
+                var cb   = document.getElementById('liveCb_' + id);
+                if (card) card.classList.add('live-ch-selected');
+                if (cb)   cb.checked = true;
+            });
+            _updateLiveBulkCount();
+        }
+
+        async function deleteLiveSourceGroupByUrl(sourceUrl, label, count) {
+            if (!confirm('Delete all ' + count + ' channel' + (count !== 1 ? 's' : '') + ' from "' + label + '"? This cannot be undone.')) return;
+            var ids = liveTvAllChannels.filter(function(ch) {
+                return (ch.source_m3u === sourceUrl) || (!ch.source_m3u && sourceUrl === '__manual__');
+            }).map(function(ch) { return ch.id; });
+            var deleted = 0;
+            for (var i = 0; i < ids.length; i++) {
+                try { var res = await fetch(API_BASE + '/live-tv/channels/' + ids[i], { method: 'DELETE' }); if (res.ok) deleted++; } catch(e) {}
+            }
+            log('Deleted ' + deleted + ' channels from "' + label + '"', 'success');
+            await loadLiveTv();
+        }
+
+        // ── Group order panel ──────────────────────────────────────────────────
+
+        function renderLiveTvGroups(groups) {
+            liveGrpOrder = groups.map(g => g.name);
+            const list  = document.getElementById('liveGrpList');
+            const count = document.getElementById('liveGrpCount');
+            if (!groups.length) {
+                list.innerHTML = '<div style="font-size:13px;color:var(--text-muted);padding:8px 0;">No groups yet.</div>';
+                count.textContent = '';
+                return;
+            }
+            count.textContent = `${groups.length} group${groups.length !== 1 ? 's' : ''}`;
+            _renderGrpRows(groups);
+        }
+
+        function _renderGrpRows(groups) {
+            const list = document.getElementById('liveGrpList');
+            list.innerHTML = groups.map((g, idx) => {
+                const gname = typeof g === 'string' ? g : g.name;
+                const meta  = typeof g === 'object' ? `${g.channel_count} ch · ${g.online_count} online` : '';
+                return `<div class="live-grp-row" data-idx="${idx}" draggable="true">
+                    <span class="live-grp-handle" title="Drag to reorder">&#x2630;</span>
+                    <div class="live-grp-name">${escapeHtml(gname)}</div>
+                    <div class="live-grp-meta">${meta}</div>
+                    <button class="live-grp-delete" title="Delete all channels in this group"
+                        onclick="deleteLiveTvGroup('${escapeHtml(gname).replace(/'/g,"\\'")}')">Delete Group</button>
+                </div>`;
+            }).join('');
+            _initGrpDrag();
+        }
+
+        function _initGrpDrag() {
+            const list = document.getElementById('liveGrpList');
+            if (!list) return;
+            var dragSrcIdx = null;
+
+            list.querySelectorAll('.live-grp-row').forEach(function(row) {
+                row.addEventListener('dragstart', function(e) {
+                    dragSrcIdx = parseInt(this.dataset.idx);
+                    this.classList.add('dragging');
+                    e.dataTransfer.effectAllowed = 'move';
+                    e.dataTransfer.setData('text/plain', String(dragSrcIdx));
+                });
+
+                row.addEventListener('dragend', function() {
+                    this.classList.remove('dragging');
+                    list.querySelectorAll('.live-grp-row').forEach(function(r) {
+                        r.style.borderTopColor = '';
+                        r.style.borderBottomColor = '';
+                        r.style.borderTopWidth = '';
+                        r.style.borderBottomWidth = '';
+                    });
+                    dragSrcIdx = null;
+                });
+
+                row.addEventListener('dragover', function(e) {
+                    e.preventDefault();
+                    e.dataTransfer.dropEffect = 'move';
+                    list.querySelectorAll('.live-grp-row').forEach(function(r) {
+                        r.style.borderTopColor = '';
+                        r.style.borderBottomColor = '';
+                        r.style.borderTopWidth = '';
+                        r.style.borderBottomWidth = '';
+                    });
+                    var rect = this.getBoundingClientRect();
+                    var midY = rect.top + rect.height / 2;
+                    if (e.clientY < midY) {
+                        this.style.borderTopColor = 'var(--accent-orange)';
+                        this.style.borderTopWidth = '2px';
+                    } else {
+                        this.style.borderBottomColor = 'var(--accent-orange)';
+                        this.style.borderBottomWidth = '2px';
+                    }
+                });
+
+                row.addEventListener('dragleave', function() {
+                    this.style.borderTopColor = '';
+                    this.style.borderBottomColor = '';
+                    this.style.borderTopWidth = '';
+                    this.style.borderBottomWidth = '';
+                });
+
+                row.addEventListener('drop', function(e) {
+                    e.preventDefault();
+                    var dropIdx = parseInt(this.dataset.idx);
+                    if (dragSrcIdx === null || dragSrcIdx === dropIdx) return;
+                    var rect = this.getBoundingClientRect();
+                    var midY = rect.top + rect.height / 2;
+                    var insertAfter = e.clientY >= midY;
+                    var moved = liveGrpOrder.splice(dragSrcIdx, 1)[0];
+                    var targetIdx = dropIdx > dragSrcIdx ? dropIdx - 1 : dropIdx;
+                    if (insertAfter) targetIdx += 1;
+                    liveGrpOrder.splice(targetIdx, 0, moved);
+                    _renderGrpRows(liveGrpOrder);
+                    saveGroupOrder();
+                });
+            });
+        }
+
+        function moveGrp(idx, dir) {
+            const newIdx = idx + dir;
+            if (newIdx < 0 || newIdx >= liveGrpOrder.length) return;
+            [liveGrpOrder[idx], liveGrpOrder[newIdx]] = [liveGrpOrder[newIdx], liveGrpOrder[idx]];
+            _renderGrpRows(liveGrpOrder);
+        }
+
+        async function saveGroupOrder() {
+            if (!liveGrpOrder.length) return;
+            try {
+                const res = await fetch(`${API_BASE}/live-tv/groups/reorder`, {
+                    method: 'PATCH',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ groups: liveGrpOrder }),
+                });
+                const data = await res.json();
+                if (!res.ok) { log(`Reorder failed: ${data.detail || 'error'}`, 'error'); return; }
+                log(`Group order saved — ${data.channels_updated} channels updated`, 'success');
+                await loadLiveTv();
+            } catch(e) { log(`Reorder failed: ${e.message}`, 'error'); }
+        }
+
+        async function deleteLiveTvGroup(groupName) {
+            const channels = liveTvAllChannels.filter(ch => (ch.group_name || 'Other') === groupName);
+            if (!confirm(`Delete all ${channels.length} channel${channels.length !== 1 ? 's' : ''} in group "${groupName}"? This cannot be undone.`)) return;
+            const encoded = groupName === 'Other' ? '__other__' : encodeURIComponent(groupName);
+            try {
+                const res = await fetch(`${API_BASE}/live-tv/groups/${encoded}`, { method: 'DELETE' });
+                const data = await res.json();
+                if (!res.ok) { log(`Delete group failed: ${data.detail || 'error'}`, 'error'); return; }
+                log(`Deleted group "${groupName}" — ${data.channels_deleted} channels removed`, 'success');
+                if (liveTvSourceFilter) clearLiveTvFilter();
+                await loadLiveTv();
+            } catch(e) { log(`Delete group failed: ${e.message}`, 'error'); }
+        }
+
+        // ── Channel actions ────────────────────────────────────────────────────
+
+        async function toggleLiveChannelFavorite(id) {
+            try {
+                const res = await fetch(`${API_BASE}/live-tv/channels/${id}/favorite`, { method: 'POST' });
+                const data = await res.json();
+                if (!res.ok) { log(`Favorite toggle failed: ${data.detail || 'error'}`, 'error'); return; }
+                // Update in cache and re-render without full reload
+                const ch = liveTvAllChannels.find(c => c.id === id);
+                if (ch) ch.is_favorite = data.is_favorite;
+                applyLiveTvFilter();
+                log(data.status === 'favorited' ? `⭐ Added to favorites` : `Removed from favorites`, 'info');
+            } catch(e) { log(`Favorite toggle failed: ${e.message}`, 'error'); }
+        }
+
+        async function importM3U() {
+            const urlInput   = document.getElementById('m3uUrlInput');
+            const labelInput = document.getElementById('m3uLabelInput');
+            const url        = urlInput.value.trim();
+            const label      = labelInput.value.trim() || null;
+            const btn        = document.querySelector('.live-tv-import .btn-primary');
+            btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
+            if (!url) { log('Enter an M3U URL.', 'warn'); btn.disabled = false; btn.innerHTML = 'Import'; return; }
+            try {
+                const res = await fetch(`${API_BASE}/live-tv/import-m3u`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url, label }),
+                });
+                const data = await res.json();
+                if (!res.ok) { log(`M3U import failed: ${data.detail || 'Unknown error (HTTP ' + res.status + ')'}`, 'error'); return; }
+                if (data.warning) {
                     log(`M3U: ${data.warning}`, 'warn');
                 } else {
-                    log(`M3U: ${data.imported} imported, ${data.skipped} skipped`,data.imported>0?'success':'info');
+                    log(`M3U: ${data.imported} imported, ${data.skipped} skipped`, data.imported > 0 ? 'success' : 'info');
                 }
-                input.value=''; await loadLiveTv();
-            } catch(e){log(`M3U import failed: ${e.message}`,'error');}
-            finally{btn.disabled=false;btn.innerHTML='Import';}
+                urlInput.value = ''; labelInput.value = '';
+                await loadLiveTv();
+            } catch(e) { log(`M3U import failed: ${e.message}`, 'error'); }
+            finally { btn.disabled = false; btn.innerHTML = 'Import'; }
         }
 
         async function triggerLiveTvProbe() {
-            try { const res=await fetch(`${API_BASE}/live-tv/health-check`,{method:'POST'}); const data=await res.json(); log(`Live TV probe: ${data.message}`,'info'); }
-            catch(e){log(`Health check failed: ${e.message}`,'error');}
+            try {
+                const res  = await fetch(`${API_BASE}/live-tv/health-check`, { method: 'POST' });
+                const data = await res.json();
+                log(`Live TV probe: ${data.message}`, 'info');
+                setTimeout(loadLiveTv, 3000);
+            } catch(e) { log(`Health check failed: ${e.message}`, 'error'); }
         }
 
         async function deleteLiveChannel(id) {
-            if(!confirm('Remove this channel?')) return;
-            try { await fetch(`${API_BASE}/live-tv/channels/${id}`,{method:'DELETE'}); await loadLiveTv(); }
-            catch(e){log(`Delete failed: ${e.message}`,'error');}
+            if (!confirm('Remove this channel?')) return;
+            try {
+                await fetch(`${API_BASE}/live-tv/channels/${id}`, { method: 'DELETE' });
+                await loadLiveTv();
+            } catch(e) { log(`Delete failed: ${e.message}`, 'error'); }
+        }
+
+        async function toggleLiveTvSource(id) {
+            try {
+                const res  = await fetch(`${API_BASE}/live-tv/sources/${id}/toggle`, { method: 'PATCH' });
+                const data = await res.json();
+                if (!res.ok) { log(`Toggle failed: ${data.detail || 'error'}`, 'error'); return; }
+                log(`Source ${data.status}`, 'info');
+                await loadLiveTv();
+            } catch(e) { log(`Toggle failed: ${e.message}`, 'error'); }
+        }
+
+        async function deleteLiveTvSource(id, label, channelCount) {
+            const msg = channelCount > 0
+                ? `Delete source "${label}" and all ${channelCount} of its channels? This cannot be undone.`
+                : `Delete source "${label}"?`;
+            if (!confirm(msg)) return;
+            try {
+                const res  = await fetch(`${API_BASE}/live-tv/sources/${id}`, { method: 'DELETE' });
+                const data = await res.json();
+                if (!res.ok) { log(`Delete source failed: ${data.detail || 'error'}`, 'error'); return; }
+                log(`Deleted source "${label}" — ${data.channels_deleted} channels removed`, 'success');
+                if (liveTvSourceFilter) clearLiveTvFilter();
+                await loadLiveTv();
+            } catch(e) { log(`Delete source failed: ${e.message}`, 'error'); }
         }
 
         // =====================================================================

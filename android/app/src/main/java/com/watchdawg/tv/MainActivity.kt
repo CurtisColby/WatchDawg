@@ -312,9 +312,10 @@ private fun WatchDawgRoot(onFinish: () -> Unit) {
             // ── Live TV — Milestone I ─────────────────────────────────────────
             // Tune-in routes directly to PLAYER_DIRECT — live HLS/MPEG-TS streams
             // need no resolve step; ExoPlayer handles both natively.
-            composable(Routes.LIVE_TV) {
+            composable(Routes.LIVE_TV) { liveTvEntry ->
                 LiveTvScreen(
-                    viewModel = liveTvViewModel,
+                    viewModel    = liveTvViewModel,
+                    currentEntry = liveTvEntry,
                     onTuneIn  = { streamUrl, channelName ->
                         navController.navigate(Routes.playerDirect(streamUrl, channelName))
                     },
