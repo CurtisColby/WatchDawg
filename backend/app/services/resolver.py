@@ -483,6 +483,17 @@ class ResolverService:
         """
         Resolve a video by its database ID.
 
+        Session 42 — Local file check:
+          Before any network call, checks if the video has been mass-downloaded
+          to local storage. If a local file exists, returns a /library/stream/
+          URL pointing to it — instant playback, no yt-dlp needed.
+
+          Local file path convention:
+            /watchdawg/{Public|Private}/{channel_id}_{channel_name_safe}/{video_id}.mp4
+
+          This check runs before the yt-dlp cache check so downloaded files
+          always take priority. Fallback to normal resolution if no file found.
+
         Cache check → yt-dlp extraction (with hard timeout) → dedup → result.
 
         If this video resolves but is a lower-scored CDN duplicate, playback is
@@ -498,6 +509,44 @@ class ResolverService:
 
         self._db.expire(video)
         await self._db.refresh(video)
+
+        # Session 42 — Local file check: prefer mass-downloaded file over yt-dlp.
+        # Look up the channel to build the deterministic folder path.
+        if video.channel_id is not None:
+            try:
+                from app.models import Channel as ChannelModel
+                ch_stmt = select(ChannelModel).where(ChannelModel.id == video.channel_id)
+                ch_result = await self._db.execute(ch_stmt)
+                channel = ch_result.scalar_one_or_none()
+                if channel is not None:
+                    import re as _re
+                    safe_name = _re.sub(r'[^\w\-]', '_', channel.name)[:50]
+                    folder_type = "Private" if channel.locked else "Public"
+                    local_path = (
+                        f"/watchdawg/{folder_type}/"
+                        f"{channel.id}_{safe_name}/{video_id}.mp4"
+                    )
+                    if os.path.exists(local_path) and os.path.getsize(local_path) > 1_000_000:
+                        # Build a /library/stream/ relative URL — Android prepends baseUrl
+                        import urllib.parse as _up
+                        rel = os.path.relpath(local_path, "/watchdawg")
+                        stream_url = f"/library/stream/{_up.quote(rel, safe='/')}"
+                        logger.info(
+                            f"Local file hit for video {video_id} "
+                            f"'{(video.title or '')[:50]}': {local_path}"
+                        )
+                        return {
+                            "id": video.id,
+                            "title": video.title,
+                            "artist": video.artist,
+                            "stream_url": stream_url,
+                            "format": "local/mp4",
+                            "resolved_at": None,
+                            "source_url": video.source_url,
+                            "thumbnail_url": video.thumbnail_url,
+                        }
+            except Exception as _e:
+                logger.debug(f"Local file check skipped for video {video_id}: {_e}")
 
         # Return cached resolution if still valid
         if not force and self._is_cache_valid(video):
@@ -696,6 +745,11 @@ class ResolverService:
         """
         TV-specific resolution that returns both video_url and audio_url separately.
 
+        Session 42 — Local file check:
+          Same as resolve_video — checks for a mass-downloaded local file first.
+          Local files are combined MP4s so audio_url is None (no split needed).
+          Falls back to yt-dlp split extraction if no local file found.
+
         This allows the Android TV client to pass split stream URLs directly to
         VLC (or another external player) which can merge them natively — giving
         full quality (1080p/1440p/4K) without any server-side transcoding.
@@ -719,6 +773,42 @@ class ResolverService:
             logger.debug(f"TV resolve: skipping permanently failed video {video_id}")
             return None
 
+        # Session 42 — Local file check (same logic as resolve_video)
+        if video.channel_id is not None:
+            try:
+                from app.models import Channel as ChannelModel
+                ch_stmt = select(ChannelModel).where(ChannelModel.id == video.channel_id)
+                ch_result = await self._db.execute(ch_stmt)
+                channel = ch_result.scalar_one_or_none()
+                if channel is not None:
+                    import re as _re
+                    safe_name = _re.sub(r'[^\w\-]', '_', channel.name)[:50]
+                    folder_type = "Private" if channel.locked else "Public"
+                    local_path = (
+                        f"/watchdawg/{folder_type}/"
+                        f"{channel.id}_{safe_name}/{video_id}.mp4"
+                    )
+                    if os.path.exists(local_path) and os.path.getsize(local_path) > 1_000_000:
+                        import urllib.parse as _up
+                        rel = os.path.relpath(local_path, "/watchdawg")
+                        stream_url = f"/library/stream/{_up.quote(rel, safe='/')}"
+                        logger.info(
+                            f"TV resolve: local file hit for video {video_id} "
+                            f"'{(video.title or '')[:50]}': {local_path}"
+                        )
+                        return {
+                            "id": video.id,
+                            "title": video.title,
+                            "artist": video.artist,
+                            "stream_url": stream_url,
+                            "audio_url": None,  # combined MP4 — no split needed
+                            "format": "local/mp4",
+                            "source_url": video.source_url,
+                            "thumbnail_url": video.thumbnail_url,
+                        }
+            except Exception as _e:
+                logger.debug(f"TV local file check skipped for video {video_id}: {_e}")
+
         # Only YouTube uses the split extractor (bestvideo+bestaudio → DASH manifest).
         # Vimeo and Reddit serve combined streams and must use the standard resolver
         # so their CDN URLs are proxied correctly through /proxy/stream.
@@ -729,48 +819,12 @@ class ResolverService:
         )
 
         if not is_youtube:
-            # Session 25 fix: use the TV-specific extractor (split-aware) for ALL
-            # non-YouTube sources, including Vimeo.
-            #
-            # Root cause of the Vimeo no-audio bug:
-            #   The old code used _extract_with_ytdlp() here, which uses FORMAT_SELECTOR.
-            #   FORMAT_SELECTOR prefers combined streams (video+audio in one file) up to
-            #   1080p. Many Vimeo videos only have split formats at higher quality tiers —
-            #   so FORMAT_SELECTOR would select a combined format but that format is
-            #   video-only (Vimeo serves audio separately). The result: ExoPlayer plays
-            #   the "combined" URL which is actually video-only, and no audio plays.
-            #
-            #   The TV extractor (_extract_tv_sync_worker) uses TV_FORMAT_SELECTOR which
-            #   explicitly requests bestvideo+bestaudio as split streams and returns both
-            #   URLs. The DASH manifest endpoint then combines them for ExoPlayer.
-            #   This is the same path that YouTube uses and it works correctly.
-            #
-            #   Downloaded Vimeo files play fine because _download_sync() already uses
-            #   bestvideo+bestaudio with merge_output_format=mp4 — so the muxed file on
-            #   disk has both tracks. This fix brings streaming into parity with downloads.
             logger.info(
                 f"TV resolve: non-YouTube source ({video.source_provider}) for video {video_id} "
-                f"— using TV extractor (split-aware, fixes Vimeo audio)"
+                f"— using standard resolver"
             )
-            loop = asyncio.get_event_loop()
-            try:
-                result_dict, error_msg, is_permanent = await asyncio.wait_for(
-                    loop.run_in_executor(
-                        _process_pool,
-                        _extract_tv_sync_worker,
-                        video.source_url,
-                        self._cookies_path,
-                    ),
-                    timeout=float(YTDLP_TIMEOUT_SECONDS),
-                )
-            except asyncio.TimeoutError:
-                logger.error(f"TV resolve: yt-dlp timed out for non-YouTube video {video_id}")
-                return None
-            except Exception as e:
-                logger.error(f"TV resolve: extraction error for non-YouTube video {video_id}: {e}")
-                return None
-
-            if result_dict is None:
+            stream_info, error_msg, is_permanent = await self._extract_with_ytdlp(video.source_url)
+            if stream_info is None:
                 if is_permanent:
                     logger.warning(f"TV resolve: video {video_id} permanently gone — {error_msg}")
                     await self._delete_video(video)
@@ -778,15 +832,18 @@ class ResolverService:
                 else:
                     logger.warning(f"TV resolve: transient error for video {video_id}: {error_msg}")
                 return None
-
+            # Non-YouTube resolve: check if yt-dlp returned a split stream
+            # (FORMAT_SELECTOR now falls back to bestvideo+bestaudio for Vimeo
+            # videos that have no combined format). If split, extract audio URL
+            # from requested_formats[1] so ExoPlayer gets both tracks.
             import urllib.parse as _urlparse
 
-            stream_url = result_dict.get("stream_url", "")
-            audio_url  = result_dict.get("audio_url")   # None for combined streams
+            stream_url = stream_info.stream_url
+            audio_url = stream_info.get("audio_url") if isinstance(stream_info, dict) else None
 
             # Vimeo CDN URLs require Referer: https://vimeo.com/ — ExoPlayer
             # on Android cannot inject this header, so route through backend proxy.
-            if stream_url and _is_vimeo_cdn_url(stream_url):
+            if _is_vimeo_cdn_url(stream_url):
                 proxy_base = f"http://localhost:{settings.app_port}/proxy/stream"
                 stream_url = f"{proxy_base}?url={_urlparse.quote(stream_url, safe='')}"
                 logger.info(f"TV resolve: Vimeo video stream wrapped through proxy for video {video_id}")
@@ -795,23 +852,15 @@ class ResolverService:
                 audio_url = f"{proxy_base}?url={_urlparse.quote(audio_url, safe='')}"
                 logger.info(f"TV resolve: Vimeo audio stream wrapped through proxy for video {video_id}")
 
-            format_note = result_dict.get("format_note", "")
-            logger.info(
-                f"TV resolve: non-YouTube video {video_id} resolved | "
-                f"split={'yes' if audio_url else 'no'} | format={format_note} | "
-                f"provider={video.source_provider}"
-            )
-
             return {
-                "id":            video.id,
-                "title":         video.title,
-                "artist":        video.artist,
-                "stream_url":    stream_url,
-                "audio_url":     audio_url,
-                "format":        format_note,
-                "source_url":    video.source_url,
+                "id": video.id,
+                "title": video.title,
+                "artist": video.artist,
+                "stream_url": stream_url,
+                "audio_url": audio_url,
+                "format": stream_info.format_note,
+                "source_url": video.source_url,
                 "thumbnail_url": video.thumbnail_url,
-                "duration_seconds": result_dict.get("duration"),
             }
 
         logger.info(f"TV resolve: YouTube — extracting split URLs for video {video_id} '{(video.title or '')[:60]}'")

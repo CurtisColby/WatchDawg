@@ -261,6 +261,23 @@ async def _run_migrations():
             """))
             logger.info("Migration checked: epg_tv_pointers table")
 
+            # Session 42: epg_movie_pointers table
+            # Tracks which movie index each channel left off at across rebuilds
+            # so the full library is cycled through before repeating.
+            # pointer_index is the position in the sorted library list (by ratingKey
+            # ascending) where the next schedule build should start pulling from.
+            # ----------------------------------------------------------------
+            await db.execute(text("""
+                CREATE TABLE IF NOT EXISTS epg_movie_pointers (
+                    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                    epg_channel_id    INTEGER NOT NULL UNIQUE,
+                    pointer_index     INTEGER NOT NULL DEFAULT 0,
+                    library_size      INTEGER NOT NULL DEFAULT 0,
+                    updated_at        DATETIME NOT NULL
+                )
+            """))
+            logger.info("Migration checked: epg_movie_pointers table")
+
             await db.commit()
             logger.info("All migrations complete.")
 

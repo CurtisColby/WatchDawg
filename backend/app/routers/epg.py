@@ -1027,8 +1027,8 @@ async def preview_channel_queue(
             "title": row[0],
             "subtitle": row[1],
             "thumbnail_url": row[2],
-            "start_time": row[3].isoformat() if row[3] else None,
-            "end_time": row[4].isoformat() if row[4] else None,
+            "start_time": row[3].isoformat() if row[3] and hasattr(row[3], "isoformat") else str(row[3]) if row[3] else None,
+            "end_time": row[4].isoformat() if row[4] and hasattr(row[4], "isoformat") else str(row[4]) if row[4] else None,
             "duration_seconds": row[5],
         }
         for row in result.fetchall()

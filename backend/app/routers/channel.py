@@ -4,15 +4,11 @@ Channel Management API Router.
 Endpoints:
 - GET    /channel                    — List all channels.
 - POST   /channel                    — Add a new channel (auto-detects type from URL).
-                                       For YouTube @handle or /channel/ID URLs, attempts
-                                       full playlist enumeration and creates one Channel
-                                       per discovered playlist (Session 38).
 - DELETE /channel/{id}               — Remove a channel.
 - PATCH  /channel/{id}               — Toggle enabled/disabled.
 - PATCH  /channel/{id}/lock          — Toggle locked/unlocked (PIN gate).
 - PATCH  /channel/{id}/category      — Set channel category.
 - PATCH  /channel/{id}/genre_tags    — Set genre tags (Milestone R-1).
-- PATCH  /channel/{id}/rename        — Rename a channel.
 - POST   /channel/{id}/scrape        — Scrape a single channel on demand.
 - DELETE /channel/{id}/videos        — Clear all videos from a channel.
 
@@ -21,21 +17,12 @@ PATCH /channel/{id}/category endpoint.
 
 Milestone R-1: added genre_tags field to ChannelAddRequest and channel
 serializer; new PATCH /channel/{id}/genre_tags endpoint.
-
-Session 38: YouTube full-channel playlist enumeration.
-When a YouTube @handle or /channel/ID URL is added, enumerate_channel_playlists()
-runs yt-dlp in flat-playlist mode against the channel's /playlists page and
-creates one ytdlp_playlist Channel row per discovered playlist, each linked back
-to a root channel record via parent_channel_id.  Falls back to the original
-single /videos channel if enumeration returns zero playlists or times out.
 """
 
-import asyncio
 import datetime
 import logging
-import os
 import re
-from typing import Optional, List
+from typing import Optional
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Header
@@ -51,11 +38,6 @@ from app.routers.auth import is_unlocked
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/channel", tags=["channel"])
-
-# Timeout (seconds) for the yt-dlp playlist enumeration call.
-# Channels with hundreds of playlists can take a while; 60s is generous
-# but keeps the HTTP request from hanging forever.
-_ENUM_TIMEOUT_SECONDS = 60
 
 
 # --- Request/Response Models ---
@@ -90,10 +72,6 @@ class ChannelGenreTagsRequest(BaseModel):
     )
 
 
-class ChannelRenameRequest(BaseModel):
-    name: str = Field(..., min_length=1, max_length=200, description="New display name")
-
-
 # --- Auto-Detection Logic ---
 
 def detect_channel_type(url: str) -> dict:
@@ -105,8 +83,6 @@ def detect_channel_type(url: str) -> dict:
       - url: The normalized URL
       - name: A suggested display name
       - unique_key: A dedup key
-      - is_yt_channel_root: True when the URL is a YouTube @handle or /channel/ID
-                            that should trigger playlist enumeration (Session 38)
 
     Raises ValueError if the URL format is not recognized.
     """
@@ -123,7 +99,6 @@ def detect_channel_type(url: str) -> dict:
             "url": f"https://www.reddit.com/r/{subreddit}",
             "name": f"r/{subreddit}",
             "unique_key": f"reddit_subreddit:{subreddit.lower()}",
-            "is_yt_channel_root": False,
         }
 
     # --- Vimeo channel ---
@@ -139,7 +114,6 @@ def detect_channel_type(url: str) -> dict:
             "url": f"https://vimeo.com/channels/{channel_slug}",
             "name": f"Vimeo: {channel_slug}",
             "unique_key": f"vimeo_channel:{channel_slug.lower()}",
-            "is_yt_channel_root": False,
         }
 
     # --- Vimeo group ---
@@ -154,7 +128,6 @@ def detect_channel_type(url: str) -> dict:
             "url": f"https://vimeo.com/groups/{group_slug}",
             "name": f"Vimeo Group: {group_slug}",
             "unique_key": f"vimeo_group:{group_slug.lower()}",
-            "is_yt_channel_root": False,
         }
 
     # --- Vimeo user ---
@@ -174,10 +147,9 @@ def detect_channel_type(url: str) -> dict:
                 "url": f"https://vimeo.com/{username}",
                 "name": f"Vimeo: {username}",
                 "unique_key": f"vimeo_user:{username.lower()}",
-                "is_yt_channel_root": False,
             }
 
-    # --- YouTube playlist (explicit list=... URL — never enumerate) ---
+    # --- YouTube playlist ---
     yt_playlist_match = re.match(
         r"https?://(?:www\.)?youtube\.com/playlist\?list=([A-Za-z0-9_-]+)",
         url,
@@ -189,29 +161,23 @@ def detect_channel_type(url: str) -> dict:
             "url": f"https://www.youtube.com/playlist?list={playlist_id}",
             "name": f"YT Playlist: {playlist_id[:20]}",
             "unique_key": f"youtube_playlist:{playlist_id}",
-            "is_yt_channel_root": False,
         }
 
-    # --- YouTube channel (@handle or /channel/ID) — enumerate playlists ---
+    # --- YouTube channel (@handle or /channel/ID) ---
     yt_channel_match = re.match(
-        r"https?://(?:www\.)?youtube\.com/(@[A-Za-z0-9_.-]+|channel/[A-Za-z0-9_-]+)(?:/(?:videos|playlists)?)?/?",
+        r"https?://(?:www\.)?youtube\.com/(@[A-Za-z0-9_-]+|channel/[A-Za-z0-9_-]+)(?:/videos)?/?",
         url,
     )
     if yt_channel_match:
         channel_path = yt_channel_match.group(1)
-        # Normalise: strip trailing /videos or /playlists — we want the bare handle
-        channel_path = channel_path.rstrip("/")
         return {
             "channel_type": "ytdlp_playlist",
-            # Root record points at /videos as its fallback scrape URL
             "url": f"https://www.youtube.com/{channel_path}/videos",
             "name": f"YouTube: {channel_path}",
             "unique_key": f"youtube_channel:{channel_path.lower()}",
-            "is_yt_channel_root": True,          # triggers enumeration in add_channel
-            "channel_path": channel_path,         # used to build the /playlists URL
         }
 
-    # --- Generic URL fallback (no enumeration) ---
+    # --- Generic URL fallback ---
     parsed = urlparse(url)
     if parsed.scheme in ("http", "https") and parsed.netloc:
         domain = parsed.netloc.replace("www.", "")
@@ -221,7 +187,6 @@ def detect_channel_type(url: str) -> dict:
             "url": url,
             "name": f"{domain}: {path_slug}" if path_slug else domain,
             "unique_key": f"playlist:{domain}:{path_slug}".lower(),
-            "is_yt_channel_root": False,
         }
 
     raise ValueError(
@@ -232,102 +197,6 @@ def detect_channel_type(url: str) -> dict:
         "  - YouTube: https://youtube.com/playlist?list=... or https://youtube.com/@channel\n"
         "  - Any other yt-dlp-compatible playlist URL"
     )
-
-
-# --- YouTube playlist enumeration (Session 38) ---
-
-def _enumerate_channel_playlists_sync(channel_path: str, cookies_path: Optional[str]) -> List[dict]:
-    """
-    Synchronous inner function — runs inside a thread executor.
-
-    Uses yt-dlp flat-playlist mode against the channel's /playlists page to
-    discover all public playlists without downloading any video data.
-
-    Returns a list of dicts, each with:
-      - playlist_id:  str
-      - playlist_url: str
-      - title:        str
-    Returns [] on any error or if no playlists found.
-    """
-    import yt_dlp
-
-    playlists_url = f"https://www.youtube.com/{channel_path}/playlists"
-
-    ydl_opts = {
-        "extract_flat": "in_playlist",
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "ignoreerrors": True,
-        "socket_timeout": 30,
-        "retries": 2,
-    }
-
-    if cookies_path and os.path.isfile(cookies_path):
-        ydl_opts["cookiefile"] = cookies_path
-        logger.debug(f"[enum] Using cookies from {cookies_path}")
-
-    discovered = []
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(playlists_url, download=False)
-            if not info:
-                logger.warning(f"[enum] yt-dlp returned nothing for {playlists_url}")
-                return []
-
-            entries = info.get("entries") or []
-            for entry in entries:
-                if not entry:
-                    continue
-                pid = entry.get("id") or entry.get("playlist_id")
-                title = entry.get("title") or entry.get("playlist_title") or pid
-                if not pid:
-                    continue
-                # Skip auto-generated "Videos" pseudo-playlist entries that some
-                # channels expose — yt-dlp sometimes returns the uploads feed as
-                # a playlist entry under the /playlists tab.
-                if title and title.strip().lower() in ("videos", "shorts", "streams", "live"):
-                    continue
-                discovered.append({
-                    "playlist_id": pid,
-                    "playlist_url": f"https://www.youtube.com/playlist?list={pid}",
-                    "title": title.strip() if title else pid,
-                })
-    except Exception as exc:
-        logger.warning(f"[enum] yt-dlp enumeration error for {playlists_url}: {exc}")
-
-    logger.info(f"[enum] {channel_path}: found {len(discovered)} playlist(s)")
-    return discovered
-
-
-async def enumerate_channel_playlists(channel_path: str, cookies_path: Optional[str]) -> List[dict]:
-    """
-    Async wrapper — runs _enumerate_channel_playlists_sync in a thread executor
-    with a timeout so it never blocks the event loop indefinitely.
-
-    Returns [] on timeout or any error.
-    """
-    loop = asyncio.get_event_loop()
-    try:
-        result = await asyncio.wait_for(
-            loop.run_in_executor(
-                None,
-                _enumerate_channel_playlists_sync,
-                channel_path,
-                cookies_path,
-            ),
-            timeout=_ENUM_TIMEOUT_SECONDS,
-        )
-        return result
-    except asyncio.TimeoutError:
-        logger.warning(
-            f"[enum] Playlist enumeration timed out after {_ENUM_TIMEOUT_SECONDS}s "
-            f"for channel path: {channel_path}. Falling back to single /videos source."
-        )
-        return []
-    except Exception as exc:
-        logger.warning(f"[enum] Unexpected error during enumeration: {exc}")
-        return []
 
 
 # --- Helper to get the right provider for a channel ---
@@ -392,7 +261,6 @@ def _serialize_channel(ch: Channel, video_count: int = 0) -> dict:
         "locked": ch.locked,
         "category": ch.category,
         "genre_tags": ch.genre_tags or "",
-        "parent_channel_id": ch.parent_channel_id,
         "last_scraped_at": ch.last_scraped_at.isoformat() if ch.last_scraped_at else None,
         "last_scrape_count": ch.last_scrape_count,
         "video_count": video_count,
@@ -440,20 +308,6 @@ async def add_channel(
 
     Auto-detects channel type from the URL.
     Accepts an optional category (defaults to 'general') and optional genre_tags.
-
-    Session 38 — YouTube full-channel enumeration:
-    When the URL is a YouTube @handle or /channel/ID, the backend enumerates all
-    public playlists on that channel and creates one Channel row per playlist,
-    all linked back to a root channel record via parent_channel_id.
-
-    Response shapes:
-      Single channel added:   {"status": "added",    "channel": {...}}
-      Playlists enumerated:   {"status": "expanded",  "root_channel": {...},
-                               "playlists_created": N, "channels": [...]}
-      Root already exists,
-      new playlists found:    {"status": "expanded",  "root_channel": {...},
-                               "playlists_created": N, "channels": [...]}
-      Already exists (exact): 409 Conflict
     """
     try:
         detected = detect_channel_type(request.url)
@@ -468,112 +322,6 @@ async def add_channel(
             detail=f"Invalid category '{category}'. Must be one of: {', '.join(VALID_CATEGORIES)}"
         )
 
-    genre_tags = _normalise_genre_tags(request.genre_tags or "")
-
-    # -------------------------------------------------------------------------
-    # YouTube channel root — attempt playlist enumeration (Session 38)
-    # -------------------------------------------------------------------------
-    if detected.get("is_yt_channel_root"):
-        channel_path = detected["channel_path"]
-        root_unique_key = detected["unique_key"]
-        display_name = request.name if request.name else detected["name"]
-
-        # Check whether this root channel already exists
-        existing_root_result = await db.execute(
-            select(Channel).where(Channel.unique_key == root_unique_key)
-        )
-        existing_root = existing_root_result.scalar_one_or_none()
-
-        if existing_root is None:
-            # Create the root record (always created; acts as the parent anchor)
-            # Auto-lock if category is adult (Session 38)
-            root_locked = (category == "adult")
-            root_channel = Channel(
-                name=display_name,
-                channel_type="ytdlp_playlist",
-                url=detected["url"],         # points at /videos as fallback
-                unique_key=root_unique_key,
-                enabled=True,
-                locked=root_locked,
-                category=category,
-                genre_tags=genre_tags,
-                parent_channel_id=None,      # root has no parent
-            )
-            db.add(root_channel)
-            await db.commit()
-            await db.refresh(root_channel)
-            logger.info(f"Created YouTube root channel: {root_channel.name} (id={root_channel.id})")
-        else:
-            root_channel = existing_root
-            logger.info(f"YouTube root channel already exists: {root_channel.name} (id={root_channel.id})")
-
-        # Discover playlists (runs yt-dlp in a thread with a timeout)
-        cookies_path = os.environ.get("YTDLP_COOKIES_PATH", "/app/cookies.txt")
-        playlists = await enumerate_channel_playlists(channel_path, cookies_path)
-
-        if not playlists:
-            # Enumeration returned nothing — keep just the root /videos channel
-            logger.info(
-                f"[enum] No playlists found for {channel_path}; "
-                f"root /videos channel kept as sole source."
-            )
-            return {
-                "status": "added",
-                "channel": _serialize_channel(root_channel),
-                "note": "No public playlists found; added as single /videos source.",
-            }
-
-        # Create one child Channel per discovered playlist, skipping duplicates
-        created_channels = []
-        skipped = 0
-        for pl in playlists:
-            child_unique_key = f"youtube_playlist:{pl['playlist_id']}"
-
-            existing = await db.execute(
-                select(Channel).where(Channel.unique_key == child_unique_key)
-            )
-            if existing.scalar_one_or_none() is not None:
-                skipped += 1
-                continue
-
-            child_name = f"{display_name} — {pl['title']}"
-            child = Channel(
-                name=child_name,
-                channel_type="ytdlp_playlist",
-                url=pl["playlist_url"],
-                unique_key=child_unique_key,
-                enabled=True,
-                locked=(category == "adult"),   # auto-lock if adult category (Session 38)
-                category=category,
-                genre_tags=genre_tags,
-                parent_channel_id=root_channel.id,
-            )
-            db.add(child)
-            created_channels.append(child)
-
-        await db.commit()
-
-        # Refresh all new children to populate their IDs
-        for child in created_channels:
-            await db.refresh(child)
-
-        logger.info(
-            f"[enum] {channel_path}: created {len(created_channels)} playlist channel(s), "
-            f"skipped {skipped} duplicate(s)."
-        )
-
-        return {
-            "status": "expanded",
-            "root_channel": _serialize_channel(root_channel),
-            "playlists_found": len(playlists),
-            "playlists_created": len(created_channels),
-            "playlists_skipped": skipped,
-            "channels": [_serialize_channel(ch) for ch in created_channels],
-        }
-
-    # -------------------------------------------------------------------------
-    # All other channel types — single channel, existing behaviour
-    # -------------------------------------------------------------------------
     existing = await db.execute(
         select(Channel).where(Channel.unique_key == detected["unique_key"])
     )
@@ -584,6 +332,7 @@ async def add_channel(
         )
 
     display_name = request.name if request.name else detected["name"]
+    genre_tags = _normalise_genre_tags(request.genre_tags or "")
 
     channel = Channel(
         name=display_name,
@@ -591,10 +340,9 @@ async def add_channel(
         url=detected["url"],
         unique_key=detected["unique_key"],
         enabled=True,
-        locked=(category == "adult"),   # auto-lock if adult category (Session 38)
+        locked=False,
         category=category,
         genre_tags=genre_tags,
-        parent_channel_id=None,
     )
     db.add(channel)
     await db.commit()
@@ -783,33 +531,6 @@ async def set_channel_genre_tags(
     }
 
 
-@router.patch("/{channel_id}/rename")
-async def rename_channel(
-    channel_id: int,
-    request: ChannelRenameRequest,
-    db: AsyncSession = Depends(get_db_session),
-):
-    """Rename a channel."""
-    stmt = select(Channel).where(Channel.id == channel_id)
-    result = await db.execute(stmt)
-    channel = result.scalar_one_or_none()
-
-    if channel is None:
-        raise HTTPException(status_code=404, detail="Channel not found")
-
-    old_name = channel.name
-    channel.name = request.name.strip()
-    await db.commit()
-
-    logger.info(f"Renamed channel {channel_id}: '{old_name}' -> '{channel.name}'")
-    return {
-        "status": "renamed",
-        "channel_id": channel_id,
-        "old_name": old_name,
-        "name": channel.name,
-    }
-
-
 @router.delete("/{channel_id}/videos")
 async def clear_channel_videos(
     channel_id: int,
@@ -917,3 +638,190 @@ async def scrape_channel(
         "channel_type": channel.channel_type,
         "result": scrape_result.to_dict(),
     }
+
+
+@router.post("/{channel_id}/mass-download")
+async def mass_download_channel(
+    channel_id: int,
+    quality: str = Query(
+        "720",
+        description="Max download quality: '720', '1080', or 'best'",
+        regex="^(720|1080|best)$",
+    ),
+    db: AsyncSession = Depends(get_db_session),
+):
+    """
+    Session 42 — Mass download all videos from a channel to local storage.
+
+    Downloads every video in the channel to:
+      /watchdawg/Public/{channel_id}_{channel_name_safe}/   — unlocked channels
+      /watchdawg/Private/{channel_id}_{channel_name_safe}/  — locked channels
+
+    Files are named {video_id}.mp4 so the resolver can find them by video_id
+    without any DB lookup — just a predictable path check.
+
+    Uses yt-dlp with quality cap. Skips videos already downloaded.
+    Runs as a background task — returns immediately with a job status.
+    Downloads are queued; a separate status endpoint is not provided —
+    check the logs or the download folder directly.
+
+    The resolver automatically prefers local files over yt-dlp resolution,
+    so downloaded videos play instantly from any pill, screen, or EPG channel
+    that includes this source.
+    """
+    import asyncio
+
+    stmt = select(Channel).where(Channel.id == channel_id)
+    result = await db.execute(stmt)
+    channel = result.scalar_one_or_none()
+
+    if channel is None:
+        raise HTTPException(status_code=404, detail="Channel not found")
+
+    # Pull all video IDs + source URLs for this channel
+    vid_stmt = select(Video.id, Video.source_url, Video.title).where(
+        Video.channel_id == channel_id,
+        Video.resolution_status != "failed",
+        Video.source_url.isnot(None),
+    )
+    vid_result = await db.execute(vid_stmt)
+    videos = vid_result.fetchall()
+
+    if not videos:
+        return {
+            "status": "nothing_to_download",
+            "channel": channel.name,
+            "message": "No videos found for this channel.",
+        }
+
+    # Build safe folder name: {channel_id}_{sanitized_name}
+    safe_name = re.sub(r'[^\w\-]', '_', channel.name)[:50]
+    folder_type = "Private" if channel.locked else "Public"
+    download_dir = f"/watchdawg/{folder_type}/{channel_id}_{safe_name}"
+
+    # Quality format string
+    if quality == "720":
+        fmt = "best[height<=720][ext=mp4]/best[height<=720]/best[ext=mp4]/best"
+    elif quality == "1080":
+        fmt = "best[height<=1080][ext=mp4]/best[height<=1080]/best[ext=mp4]/best"
+    else:
+        fmt = "best[ext=mp4]/best"
+
+    total = len(videos)
+    logger.info(
+        f"Mass download: channel {channel_id} '{channel.name}' — "
+        f"{total} videos → {download_dir} (quality={quality})"
+    )
+
+    # Fire background task — don't block the request
+    asyncio.ensure_future(
+        _run_mass_download(videos, download_dir, fmt, channel_id, channel.name)
+    )
+
+    return {
+        "status": "started",
+        "channel": channel.name,
+        "channel_id": channel_id,
+        "download_dir": download_dir,
+        "total_videos": total,
+        "quality": quality,
+        "message": (
+            f"Downloading {total} videos to {download_dir} in the background. "
+            f"Files named {{video_id}}.mp4. Check logs for progress."
+        ),
+    }
+
+
+async def _run_mass_download(
+    videos: list,
+    download_dir: str,
+    fmt: str,
+    channel_id: int,
+    channel_name: str,
+) -> None:
+    """
+    Background mass downloader. Downloads each video sequentially using yt-dlp.
+    Skips files already present and >1MB. Logs progress per video.
+    """
+    import asyncio
+    import os
+
+    os.makedirs(download_dir, exist_ok=True)
+
+    cookies_path = "/config/cookies.txt"
+    completed = 0
+    skipped = 0
+    failed = 0
+    total = len(videos)
+
+    for video_id, source_url, title in videos:
+        out_path = os.path.join(download_dir, f"{video_id}.mp4")
+
+        # Skip already downloaded
+        if os.path.exists(out_path) and os.path.getsize(out_path) > 1_000_000:
+            skipped += 1
+            continue
+
+        logger.info(
+            f"Mass download [{channel_name}] {completed + skipped + failed + 1}/{total}: "
+            f"video {video_id} '{(title or '')[:50]}'"
+        )
+
+        cmd = [
+            "yt-dlp",
+            "-f", fmt,
+            "--no-playlist",
+            "--no-warnings",
+            "--quiet",
+            "-o", out_path,
+        ]
+        if cookies_path and os.path.isfile(cookies_path):
+            cmd += ["--cookies", cookies_path]
+        cmd.append(source_url)
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                _, stderr = await asyncio.wait_for(proc.communicate(), timeout=1800)
+                if proc.returncode == 0 and os.path.exists(out_path):
+                    size_mb = os.path.getsize(out_path) // 1_000_000
+                    logger.info(
+                        f"Mass download [{channel_name}]: video {video_id} "
+                        f"complete — {size_mb}MB"
+                    )
+                    completed += 1
+                else:
+                    err = stderr.decode(errors="ignore")[:200] if stderr else "unknown"
+                    logger.warning(
+                        f"Mass download [{channel_name}]: video {video_id} "
+                        f"failed (rc={proc.returncode}) — {err}"
+                    )
+                    failed += 1
+                    if os.path.exists(out_path):
+                        os.remove(out_path)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"Mass download [{channel_name}]: video {video_id} timed out"
+                )
+                proc.kill()
+                failed += 1
+                if os.path.exists(out_path):
+                    os.remove(out_path)
+        except Exception as e:
+            logger.warning(
+                f"Mass download [{channel_name}]: video {video_id} error — {e}"
+            )
+            failed += 1
+
+        # Brief pause between downloads to avoid hammering the source
+        await asyncio.sleep(0.5)
+
+    logger.info(
+        f"Mass download [{channel_name}] complete: "
+        f"{completed} downloaded, {skipped} already existed, {failed} failed "
+        f"out of {total} total"
+    )

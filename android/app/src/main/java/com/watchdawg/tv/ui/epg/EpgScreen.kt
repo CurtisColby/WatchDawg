@@ -49,6 +49,7 @@ import com.watchdawg.tv.data.api.EpgChannelScheduleDto
 import com.watchdawg.tv.data.api.EpgSlotDto
 import com.watchdawg.tv.ui.theme.WatchDawgColors
 import com.watchdawg.tv.ui.theme.focusGlow
+import com.watchdawg.tv.ui.theme.focusGlowCard
 import kotlinx.coroutines.delay
 
 /**
@@ -92,7 +93,15 @@ fun EpgScreen(
 
     BackHandler { onBack() }
 
+    // Session 42: smart reload on entry.
+    // Only reload if channels are empty (first launch) or data is older than
+    // 5 minutes. Returning from the player skips the reload entirely so the
+    // grid stays rendered and focus restores cleanly without a loading flash.
     LaunchedEffect(Unit) {
+        val channels = viewModel.state.value.channels
+        val lastRefresh = viewModel.state.value.lastRefreshedAt
+        val stale = channels.isEmpty() || lastRefresh == null
+        if (stale) viewModel.load()
         delay(80)
         try { firstRowFocus.requestFocus() } catch (_: Exception) {}
     }
@@ -154,10 +163,11 @@ fun EpgScreen(
                 }
                 else -> {
                     EpgGuideGrid(
-                        channels       = state.channels,
-                        viewModel      = viewModel,
-                        firstRowFocus  = firstRowFocus,
-                        onPlaySlot     = { slot, channelId, offsetSeconds ->
+                        channels            = state.channels,
+                        viewModel           = viewModel,
+                        firstRowFocus       = firstRowFocus,
+                        initialFocusedRow   = viewModel.activeChannelIndex.coerceAtLeast(0),
+                        onPlaySlot          = { slot, channelId, offsetSeconds ->
                             // Session 40: WatchDawg slots have a videoId — resolve
                             // fresh in HLS mode (no popup, always HLS for EPG).
                             // Store slot startTime so PlayerViewModel can recompute
@@ -228,119 +238,47 @@ private fun EpgGuideGrid(
     channels: List<EpgChannelScheduleDto>,
     viewModel: EpgViewModel,
     firstRowFocus: FocusRequester,
+    initialFocusedRow: Int = 0,
     onPlaySlot: (slot: EpgSlotDto, channelId: Int, offsetSeconds: Long) -> Unit,
 ) {
-    val channelColumnWidth = 130.dp
-    val rowHeight          = 76.dp
-    val slotMinWidth       = 200.dp
-    val listState          = rememberLazyListState()
+    val rowHeight    = 76.dp
+    val slotMinWidth = 200.dp
+    val listState    = rememberLazyListState()
 
-    // Session 40 — Scroll fix:
-    // Track which channel row currently has D-pad focus. Each EpgChannelRow
-    // reports focus changes via onRowFocused. When focusedRowIndex changes,
-    // we animate the shared listState to keep the focused row in view.
-    // scrollOffset = 0 means the item is at the very top of the viewport;
-    // using scrollOffset keeps focused rows near the top for comfortable viewing.
-    var focusedRowIndex by remember { mutableIntStateOf(0) }
+    // Session 42: initialise focusedRowIndex to the last-watched channel so
+    // returning from the player restores position instead of always snapping to row 0.
+    var focusedRowIndex by remember { mutableIntStateOf(initialFocusedRow.coerceIn(0, (channels.size - 1).coerceAtLeast(0))) }
 
     LaunchedEffect(focusedRowIndex) {
-        // animateScrollToItem is safe to call even if the index is already visible.
-        // scrollOffset = 0 keeps the focused row at the top of the visible area,
-        // which matches standard TV guide scroll behaviour.
-        listState.animateScrollToItem(focusedRowIndex)
+        listState.animateScrollToItem(focusedRowIndex, scrollOffset = 0)
     }
 
-    Row(modifier = Modifier.fillMaxSize()) {
-
-        // ── Channel name column (fixed left) ──────────────────────────────────
-        LazyColumn(
-            state            = listState,
-            modifier         = Modifier
-                .width(channelColumnWidth)
-                .fillMaxHeight()
-                .background(WatchDawgColors.SurfaceElevated),
-            contentPadding   = PaddingValues(vertical = 0.dp),
-            userScrollEnabled = false, // synced with slot rows via shared listState
-        ) {
-            itemsIndexed(channels) { _, channel ->
-                ChannelNameCell(
-                    channelNumber = channel.channelNumber,
-                    channelName   = channel.channelName,
-                    channelLogo   = channel.channelLogo,
-                    rowHeight     = rowHeight,
-                )
-            }
-        }
-
-        // ── Time slot rows (scrollable horizontally per row) ──────────────────
-        // userScrollEnabled is false here too — scrolling is driven programmatically
-        // by the LaunchedEffect above when focusedRowIndex changes, which keeps both
-        // LazyColumns in lockstep without requiring the user to scroll manually.
-        LazyColumn(
-            state          = listState,
-            modifier       = Modifier
-                .weight(1f)
-                .fillMaxHeight(),
-            contentPadding = PaddingValues(vertical = 0.dp),
-            userScrollEnabled = false,
-        ) {
-            itemsIndexed(channels) { rowIndex, channel ->
-                val rowFocusRequester = if (rowIndex == 0) firstRowFocus else remember { FocusRequester() }
-                EpgChannelRow(
-                    channel           = channel,
-                    rowHeight         = rowHeight,
-                    slotMinWidth      = slotMinWidth,
-                    rowFocusRequester = rowFocusRequester,
-                    onRowFocused      = { focusedRowIndex = rowIndex },
-                    onPlaySlot        = { slot ->
-                        viewModel.setActiveChannel(channel.channelId)
-                        val offset = viewModel.getCurrentSlotOffsetSeconds(slot)
-                        onPlaySlot(slot, channel.channelId, offset)
-                    },
-                )
-                // Separator between channel rows
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(1.dp)
-                        .background(Color(0x22FFFFFF)),
-                )
-            }
-        }
-    }
-}
-
-// ── Channel name cell (left column) ──────────────────────────────────────────
-
-@Composable
-private fun ChannelNameCell(
-    channelNumber: Int,
-    channelName: String,
-    channelLogo: String?,
-    rowHeight: androidx.compose.ui.unit.Dp,
-) {
-    Box(
-        modifier = Modifier
-            .width(130.dp)
-            .height(rowHeight)
-            .background(WatchDawgColors.SurfaceElevated)
-            .padding(horizontal = 12.dp, vertical = 8.dp),
-        contentAlignment = Alignment.CenterStart,
+    LazyColumn(
+        state             = listState,
+        modifier          = Modifier.fillMaxSize(),
+        contentPadding    = PaddingValues(top = 4.dp, bottom = 0.dp),
+        userScrollEnabled = false,
     ) {
-        Column {
-            Text(
-                "CH $channelNumber",
-                style = MaterialTheme.typography.labelSmall,
-                color = WatchDawgColors.Orange,
-                maxLines = 1,
+        itemsIndexed(channels) { rowIndex, channel ->
+            val rowFocusRequester = if (rowIndex == 0) firstRowFocus else remember { FocusRequester() }
+            EpgChannelRow(
+                channel           = channel,
+                rowHeight         = rowHeight,
+                slotMinWidth      = slotMinWidth,
+                rowFocusRequester = rowFocusRequester,
+                onRowFocused      = { focusedRowIndex = rowIndex },
+                onPlaySlot        = { slot ->
+                    viewModel.setActiveChannel(channel.channelId)
+                    val offset = viewModel.getCurrentSlotOffsetSeconds(slot)
+                    onPlaySlot(slot, channel.channelId, offset)
+                },
             )
-            Spacer(Modifier.height(2.dp))
-            Text(
-                channelName,
-                style = MaterialTheme.typography.bodySmall,
-                color = WatchDawgColors.TextPrimary,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
+            // Separator between channel rows
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(1.dp)
+                    .background(Color(0x22FFFFFF)),
             )
         }
     }
@@ -359,6 +297,8 @@ private fun EpgChannelRow(
     onRowFocused: () -> Unit,
     onPlaySlot: (EpgSlotDto) -> Unit,
 ) {
+    // Session 41: channel number passed through to each slot cell for badge rendering.
+    val channelNumber = channel.channelNumber
     if (channel.slots.isEmpty()) {
         // Empty row placeholder
         Box(
@@ -386,7 +326,8 @@ private fun EpgChannelRow(
         modifier       = Modifier
             .fillMaxWidth()
             .height(rowHeight)
-            .focusRequester(rowFocusRequester),
+            .focusRequester(rowFocusRequester)
+            .onFocusChanged { fs -> if (!fs.hasFocus) focusedSlotIndex = -1 },
         contentPadding = PaddingValues(horizontal = 6.dp, vertical = 6.dp),
         horizontalArrangement = Arrangement.spacedBy(4.dp),
     ) {
@@ -400,16 +341,17 @@ private fun EpgChannelRow(
                 .dp
 
             EpgSlotCell(
-                slot      = slot,
-                width     = slotWidth,
-                height    = rowHeight - 12.dp,
-                isFocused = isFocused,
-                onFocus   = {
+                slot          = slot,
+                width         = slotWidth,
+                height        = rowHeight - 12.dp,
+                isFocused     = isFocused,
+                channelNumber = channelNumber,
+                onFocus       = {
                     focusedSlotIndex = slotIndex
                     // Notify parent grid that this row has focus so it can scroll
                     onRowFocused()
                 },
-                onClick   = { onPlaySlot(slot) },
+                onClick       = { onPlaySlot(slot) },
             )
         }
     }
@@ -423,6 +365,7 @@ private fun EpgSlotCell(
     width: androidx.compose.ui.unit.Dp,
     height: androidx.compose.ui.unit.Dp,
     isFocused: Boolean,
+    channelNumber: Int,
     onFocus: () -> Unit,
     onClick: () -> Unit,
 ) {
@@ -442,11 +385,11 @@ private fun EpgSlotCell(
         modifier = Modifier
             .width(width)
             .height(height)
-            .onFocusChanged { if (it.isFocused) onFocus() }
-            .focusGlow(),
+            .onFocusChanged { fs -> if (fs.isFocused) onFocus() }
+            .focusGlowCard(isFocused, glowRadius = 10.dp, alpha = 0.25f),
         colors = androidx.tv.material3.CardDefaults.colors(
             containerColor        = bgColor,
-            focusedContainerColor = WatchDawgColors.OrangeDim,
+            focusedContainerColor = bgColor,
         ),
         shape = androidx.tv.material3.CardDefaults.shape(
             shape        = RoundedCornerShape(6.dp),
@@ -502,6 +445,26 @@ private fun EpgSlotCell(
                 ) {
                     Text("NOW", fontSize = 8.sp, color = Color.Black)
                 }
+            }
+
+            // Session 41: CH number badge — bottom-right of every slot pill.
+            // Replaces the removed left channel column as the channel identifier.
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(4.dp)
+                    .background(
+                        color = if (isFocused) WatchDawgColors.Orange.copy(alpha = 0.25f)
+                                else Color(0x44000000),
+                        shape = RoundedCornerShape(3.dp),
+                    )
+                    .padding(horizontal = 4.dp, vertical = 1.dp),
+            ) {
+                Text(
+                    text      = "CH $channelNumber",
+                    fontSize  = 7.sp,
+                    color     = if (isFocused) WatchDawgColors.Orange else WatchDawgColors.TextTertiary,
+                )
             }
         }
     }

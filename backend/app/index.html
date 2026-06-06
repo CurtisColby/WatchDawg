@@ -1173,6 +1173,51 @@
                             <div id="genreTagHint" style="font-size:10px;color:var(--text-muted);padding-left:2px;"></div>
                         </div>
                     </div>
+                    <!-- Plex Library Add Section -->
+                    <div class="channel-add-form" id="plexLibraryAddForm" style="margin-top:12px;border-color:var(--accent-orange);display:none;">
+                        <div style="font-size:11px;font-weight:700;color:var(--accent-orange);text-transform:uppercase;letter-spacing:0.08em;margin-bottom:4px;">&#x1F7E0; Add Plex Library as Channel</div>
+                        <!-- Row 1: Library picker -->
+                        <div class="channel-add-row">
+                            <select id="plexLibrarySelect" style="flex:1;" onchange="onPlexLibraryChange()">
+                                <option value="">Loading Plex libraries...</option>
+                            </select>
+                        </div>
+                        <!-- Row 2: Genre picker (populated dynamically) -->
+                        <div class="channel-add-row">
+                            <select id="plexLibGenreSelect" style="flex:1;" onchange="onPlexGenreChange()">
+                                <option value="">— All Genres —</option>
+                            </select>
+                        </div>
+                        <!-- Row 3: Name, Category, Add button -->
+                        <div class="channel-add-row">
+                            <input type="text" id="plexLibNameInput"
+                                placeholder="Friendly name (auto-filled from library + genre)..."
+                                onkeydown="if(event.key==='Enter') addPlexLibraryChannel()">
+                            <select id="plexLibCatInput">
+                                <option value="general">General</option>
+                                <option value="music">Music</option>
+                                <option value="ccm">CCM</option>
+                                <option value="chill">Chill</option>
+                                <option value="nature">Nature</option>
+                                <option value="movies" selected>Movies</option>
+                                <option value="tv">TV</option>
+                                <option value="vimeo">Vimeo</option>
+                                <option value="sexy">Sexy</option>
+                                <option value="adult">Adult</option>
+                                <option value="live_tv">Live TV</option>
+                            </select>
+                            <button class="btn btn-primary" id="btnAddPlexLib" onclick="addPlexLibraryChannel()">&#x2795; Add Library</button>
+                        </div>
+                        <!-- Row 4: Android genre tags -->
+                        <div class="channel-add-row">
+                            <input type="text" id="plexLibTagsInput"
+                                placeholder="Android genre tags — comma separated, e.g. Plex, Movies"
+                                style="flex:1;padding:6px 12px;background:var(--bg-surface);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);color:var(--text-primary);font-size:12px;font-family:'Outfit',sans-serif;outline:none;transition:border-color 0.2s;"
+                                onfocus="this.style.borderColor='var(--accent-orange)'"
+                                onblur="this.style.borderColor='var(--border-subtle)'"
+                                onkeydown="if(event.key==='Enter') addPlexLibraryChannel()">
+                        </div>
+                    </div>
                     <div id="channelList"></div>
                 </div>
             </div>
@@ -1527,6 +1572,7 @@
                 const visible = currentChannels.filter(ch => ch.enabled && (_isUnlocked || !ch.locked));
                 buildFeedSidebar(_activeCat ? visible.filter(ch => ch.category === _activeCat) : visible, !!_activeCat);
             } catch (e) { log(`Failed to load channels: ${e.message}`, 'error'); }
+            loadPlexLibraryDropdown();
         }
 
         function renderChannels(channels) {
@@ -1664,6 +1710,7 @@
                     <button class="btn-icon btn-icon-warn" id="scrapeBtn_${ch.id}" onclick="scrapeChannel(${ch.id},'${escapeHtml(ch.name).replace(/'/g,"\\'")}')">&#x1F504;</button>
                     <button class="btn-icon btn-icon-blue" id="upgradeBtn_${ch.id}" onclick="upgradeChannel(${ch.id},'${escapeHtml(ch.name).replace(/'/g,"\\'")}')">&#x2B06;</button>
                     <button class="btn-icon btn-icon-warn" onclick="clearChannelVideos(${ch.id},'${escapeHtml(ch.name).replace(/'/g,"\\'")}')">&#x1F9F9;</button>
+                    <button class="btn-icon ${ch.locked?'btn-icon-danger':'btn-icon-blue'}" id="dlBtn_${ch.id}" onclick="massDownloadChannel(${ch.id},'${escapeHtml(ch.name).replace(/'/g,"\\'")}',${ch.locked})" title="Mass download all videos to local storage">&#x1F4E5;</button>
                     <button class="lock-toggle-btn ${ch.locked?'locked':''}" onclick="toggleChannelLock(${ch.id},${ch.locked})">${ch.locked?'&#x1F512;':'&#x1F513;'}</button>
                     <button class="toggle-switch ${ch.enabled?'active':''}" onclick="toggleChannel(${ch.id},${!ch.enabled})" title="${ch.enabled?'Disable':'Enable'}"></button>
                     <button class="btn-icon btn-icon-danger" onclick="deleteChannel(${ch.id},'${escapeHtml(ch.name).replace(/'/g,"\\'")}')">&#x1F5D1;</button>
@@ -1815,6 +1862,119 @@
             finally { btn.disabled=false; btn.innerHTML='&#x2795; Add Channel'; }
         }
 
+        // -----------------------------------------------------------------------
+        // Plex Library Channel Add
+        // -----------------------------------------------------------------------
+        // Cache of loaded Plex libraries keyed by library key -> {title, type}
+        const _plexLibMeta = {};
+
+        async function loadPlexLibraryDropdown() {
+            const form = document.getElementById('plexLibraryAddForm');
+            const sel = document.getElementById('plexLibrarySelect');
+            if (!form || !sel) return;
+            try {
+                const res = await fetch('/plex/libraries');
+                if (!res.ok) { form.style.display = 'none'; return; }
+                const data = await res.json();
+                // Show ALL library types — movie, show, music, photo, etc.
+                const libs = data.libraries || [];
+                if (!libs.length) { form.style.display = 'none'; return; }
+                libs.forEach(l => { _plexLibMeta[l.key] = { title: l.title, type: l.type }; });
+                const typeLabel = { movie: 'Movies', show: 'TV', music: 'Music', photo: 'Photos', artist: 'Music' };
+                sel.innerHTML = libs.map(l =>
+                    `<option value="${l.key}" data-title="${escapeHtml(l.title)}" data-type="${l.type}">` +
+                    `${escapeHtml(l.title)} (${typeLabel[l.type] || l.type} · ${l.count} items)</option>`
+                ).join('');
+                form.style.display = 'block';
+                // Load genres for the initially selected library
+                await onPlexLibraryChange();
+            } catch (e) {
+                form.style.display = 'none';
+            }
+        }
+
+        async function onPlexLibraryChange() {
+            const sel = document.getElementById('plexLibrarySelect');
+            const genreSel = document.getElementById('plexLibGenreSelect');
+            const nameInput = document.getElementById('plexLibNameInput');
+            if (!sel || !genreSel) return;
+            const key = sel.value;
+            if (!key) return;
+            const meta = _plexLibMeta[key] || {};
+            // Auto-set category based on library type
+            const catInput = document.getElementById('plexLibCatInput');
+            if (catInput) {
+                if (meta.type === 'show') catInput.value = 'tv';
+                else if (meta.type === 'movie') catInput.value = 'movies';
+                else if (meta.type === 'music' || meta.type === 'artist') catInput.value = 'music';
+                else catInput.value = 'general';
+            }
+            // Reset name and genre
+            if (nameInput) nameInput.value = '';
+            genreSel.innerHTML = '<option value="">Loading genres...</option>';
+            try {
+                const res = await fetch(`/plex/libraries/${encodeURIComponent(key)}/genres`);
+                if (!res.ok) { genreSel.innerHTML = '<option value="">— All Genres —</option>'; return; }
+                const data = await res.json();
+                const genres = data.genres || [];
+                genreSel.innerHTML = '<option value="">— All Genres —</option>' +
+                    genres.map(g => `<option value="${g.id}" data-title="${escapeHtml(g.title)}">${escapeHtml(g.title)} (${g.count})</option>`).join('');
+                // Auto-fill name with library title (no genre yet)
+                if (nameInput && !nameInput.value) nameInput.value = meta.title || '';
+            } catch (e) {
+                genreSel.innerHTML = '<option value="">— All Genres —</option>';
+            }
+        }
+
+        function onPlexGenreChange() {
+            const sel = document.getElementById('plexLibrarySelect');
+            const genreSel = document.getElementById('plexLibGenreSelect');
+            const nameInput = document.getElementById('plexLibNameInput');
+            if (!sel || !genreSel || !nameInput) return;
+            const meta = _plexLibMeta[sel.value] || {};
+            const libTitle = meta.title || sel.value;
+            // Use data-title for display name since value is now the numeric genre id
+            const selectedOpt = genreSel.options[genreSel.selectedIndex];
+            const genreTitle = selectedOpt ? (selectedOpt.getAttribute('data-title') || selectedOpt.text.split(' (')[0]) : '';
+            nameInput.value = genreTitle ? `${libTitle} — ${genreTitle}` : libTitle;
+        }
+
+        async function addPlexLibraryChannel() {
+            const sel = document.getElementById('plexLibrarySelect');
+            const genreSel = document.getElementById('plexLibGenreSelect');
+            const nameInput = document.getElementById('plexLibNameInput');
+            const catInput = document.getElementById('plexLibCatInput');
+            const tagsInput = document.getElementById('plexLibTagsInput');
+            const btn = document.getElementById('btnAddPlexLib');
+            if (!sel || !sel.value) { log('Select a Plex library first.', 'warn'); return; }
+            const selectedOpt = sel.options[sel.selectedIndex];
+            const libraryKey = sel.value;
+            const libraryTitle = selectedOpt.getAttribute('data-title') || sel.value;
+            const genreOpt = genreSel ? genreSel.options[genreSel.selectedIndex] : null;
+            const genre_filter = genreSel && genreSel.value ? genreSel.value : null;
+            const genre_filter_title = genreOpt && genreSel.value ? (genreOpt.getAttribute('data-title') || genreOpt.text.split(' (')[0]) : null;
+            const name = nameInput ? nameInput.value.trim() : '';
+            const category = catInput ? catInput.value : 'general';
+            const genre_tags = tagsInput ? tagsInput.value.trim() : 'Plex';
+            btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Adding...';
+            try {
+                const res = await fetch(`${API_BASE}/channel/plex-library`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ library_key: libraryKey, library_title: libraryTitle, genre_filter, genre_filter_title, name: name || null, category, genre_tags })
+                });
+                if (!res.ok) { const err = await res.json(); throw new Error(err.detail || 'Add failed'); }
+                const data = await res.json();
+                log(`Added Plex library: ${data.channel.name} (${data.channel.category})`, 'success');
+                // Reset genre + name but keep library selection for easy multi-genre adds
+                if (genreSel) genreSel.value = '';
+                if (nameInput) nameInput.value = _plexLibMeta[libraryKey] ? _plexLibMeta[libraryKey].title : '';
+                if (tagsInput) tagsInput.value = '';
+                await loadChannels();
+            } catch (e) { log(`Failed to add Plex library: ${e.message}`, 'error'); }
+            finally { btn.disabled = false; btn.innerHTML = '&#x2795; Add Library'; }
+        }
+
         async function deleteChannel(channelId, name) {
             if (!confirm(`Delete channel "${name}" and all its videos?`)) return;
             try {
@@ -1849,6 +2009,32 @@
                 const res=await fetch(`${API_BASE}/resolve/upgrade?channel_ids=${channelId}&chunk_size=25`,{method:'POST',...opts});
                 const data=await res.json(); log(`Upgrade '${name}': ${data.message||'complete'}`, 'success');
             } catch(e){log(`Upgrade failed: ${e.message}`,'error');}
+            finally{if(btn){btn.classList.remove('spinning');btn.disabled=false;}}
+        }
+
+        async function massDownloadChannel(channelId, name, locked) {
+            // Session 42: mass download all videos for a channel to local storage.
+            // Locked channels → /watchdawg/Private/{id}_{name}/
+            // Unlocked channels → /watchdawg/Public/{id}_{name}/
+            const quality = prompt(
+                `Download all videos from "${name}" to local storage.\n\n` +
+                `Quality (enter one):\n  720 — up to 720p (recommended, faster)\n  1080 — up to 1080p\n  best — highest available\n\n` +
+                `Files go to ${locked ? 'Private' : 'Public'}/{id}_{name}/ on your NAS.\n` +
+                `Downloads run in background — check logs for progress.\n\nQuality:`,
+                '720'
+            );
+            if (!quality || !['720','1080','best'].includes(quality.trim())) {
+                if (quality !== null) log('Invalid quality. Use 720, 1080, or best.', 'warn');
+                return;
+            }
+            const btn=document.getElementById(`dlBtn_${channelId}`);
+            if(btn){btn.classList.add('spinning');btn.disabled=true;}
+            try {
+                const res=await fetch(`${API_BASE}/channel/${channelId}/mass-download?quality=${quality.trim()}`,{method:'POST'});
+                if(!res.ok){const err=await res.json();throw new Error(err.detail||'Failed');}
+                const data=await res.json();
+                log(`Mass download started for "${name}": ${data.total_videos} videos → ${data.download_dir}`, 'success');
+            } catch(e){log(`Mass download failed: ${e.message}`,'error');}
             finally{if(btn){btn.classList.remove('spinning');btn.disabled=false;}}
         }
 
@@ -3636,7 +3822,7 @@
                 <button class="btn btn-sm" onclick="previewEpgChannel(${ch.id})" title="Preview schedule">&#x1F441;</button>
                 <button class="btn btn-sm" onclick="toggleEpgChannel(${ch.id}, ${ch.enabled})" title="${ch.enabled ? 'Pause' : 'Enable'}">${ch.enabled ? '&#x23F8;' : '&#x25B6;'}</button>
                 <button class="btn btn-sm" onclick="editEpgChannel(${ch.id})" title="Edit">&#x270F;</button>
-                <button class="btn btn-sm" style="color:var(--error-red);" onclick="deleteEpgChannel(${ch.id}, '${ch.name.replace(/'/g,"\'")}')">&#x1F5D1;</button>
+                <button class="btn btn-sm" style="color:var(--error-red);" onclick="deleteEpgChannel(${ch.id})">&#x1F5D1;</button>
             </div>
         </div>`;
     }
@@ -3833,7 +4019,7 @@
             const data = await res.json();
             genreSel.innerHTML = '<option value="">All Genres</option>' +
                 (data.genres || []).map(g =>
-                    `<option value="${g.title}">${g.title} (${g.count})</option>`
+                    `<option value="${g.id}" data-title="${escapeHtml(g.title)}">${escapeHtml(g.title)} (${g.count})</option>`
                 ).join('');
         } catch(e) {
             genreSel.innerHTML = '<option value="">All Genres</option>';
@@ -3890,10 +4076,17 @@
         loadEpgChannels(epgCurrentTab);
     }
 
-    async function deleteEpgChannel(channelId, name) {
+    async function deleteEpgChannel(channelId) {
+        const ch = epgChannels.find(c => c.id === channelId);
+        const name = ch ? ch.name : ('Channel ' + channelId);
         if (!confirm(`Delete EPG channel "${name}"? This also deletes its schedule. Use the pause button to temporarily disable instead.`)) return;
-        await fetch(`/epg/channels/${channelId}`, { method: 'DELETE' });
-        if (typeof logMessage === 'function') logMessage('EPG channel deleted: ' + name, 'info');
+        const res = await fetch(`/epg/channels/${channelId}`, { method: 'DELETE' });
+        if (res.ok) {
+            log('EPG channel deleted: ' + name, 'success');
+        } else {
+            const err = await res.json().catch(() => ({}));
+            alert('Delete failed: ' + (err.detail || res.status));
+        }
         loadEpgChannels(epgCurrentTab);
     }
 

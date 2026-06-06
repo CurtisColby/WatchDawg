@@ -68,6 +68,9 @@ PRIMETIME_UTC_END = 5     # 5 AM UTC
 # Plex API timeout — local network, should be fast
 PLEX_TIMEOUT = 15
 
+# Plex requires Accept: application/json or it returns XML by default
+PLEX_HEADERS = {"Accept": "application/json"}
+
 # Minimum video duration to include in schedule (seconds)
 MIN_DURATION_SECONDS = 30
 
@@ -266,8 +269,20 @@ async def _build_plex_movie_schedule(
     """
     Pull movies from Plex and pack them into time slots.
 
-    Applies genre filter if set. Falls back to all movies in the library if not.
+    Session 42 — Round-robin pointer:
+      Instead of random shuffle (which repeats movies before the full library
+      is seen), tracks a per-channel pointer in epg_movie_pointers. Each rebuild
+      starts from where the last one left off, ensuring all movies are scheduled
+      before any repeat. The pointer wraps around when the full library is cycled.
+
+      For channels with rotation_style='shuffle', the library slice pulled for
+      this window is shuffled within itself — so the order within a window is
+      random but coverage across windows is complete.
+
+      primetime_boost still applies within the selected slice.
     """
+    from sqlalchemy import text as sa_text
+
     creds = await _get_plex_creds(db)
     if not creds:
         logger.warning(f"EPG Plex: no Plex credentials configured — channel {channel['id']} skipped.")
@@ -275,19 +290,20 @@ async def _build_plex_movie_schedule(
 
     library_key = channel.get("plex_library_key")
     genre_filter = channel.get("genre_filter", "")
+    channel_id = channel["id"]
 
     url = f"{creds['url'].rstrip('/')}/library/sections/{library_key}/all"
     params = {
         "X-Plex-Token": creds["token"],
         "type": 1,  # movies
-        "sort": "audienceRating:desc",
+        "sort": "titleSort:asc",  # stable sort so pointer index is consistent
     }
     if genre_filter:
         params["genre"] = genre_filter
 
     try:
         async with httpx.AsyncClient(timeout=PLEX_TIMEOUT, verify=False) as client:
-            resp = await client.get(url, params=params)
+            resp = await client.get(url, params=params, headers=PLEX_HEADERS)
             resp.raise_for_status()
             data = resp.json()
     except Exception as e:
@@ -301,34 +317,94 @@ async def _build_plex_movie_schedule(
         logger.warning(f"EPG Plex movie: no movies found in library {library_key} (genre={genre_filter})")
         return []
 
-    items = []
     plex_base = creds["url"].rstrip("/")
+    all_items = []
     for item in metadata:
         duration_ms = item.get("duration", 0)
         duration_s  = duration_ms // 1000
         if duration_s < MIN_DURATION_SECONDS:
             continue
-
         thumb = item.get("thumb", "")
         stream_url = _plex_stream_url(item, creds)
         if not stream_url:
             continue
-
-        items.append({
-            "title":          item.get("title", "Untitled"),
-            "subtitle":       item.get("tagline", ""),
-            "description":    item.get("summary", ""),
-            "thumbnail_url":  f"{plex_base}{thumb}?X-Plex-Token={creds['token']}" if thumb else "",
-            "stream_url":     stream_url,
-            "source_type":    "plex_movie",
-            "source_id":      str(item.get("ratingKey", "")),
+        all_items.append({
+            "title":            item.get("title", "Untitled"),
+            "subtitle":         item.get("tagline", ""),
+            "description":      item.get("summary", ""),
+            "thumbnail_url":    f"{plex_base}{thumb}?X-Plex-Token={creds['token']}" if thumb else "",
+            "stream_url":       stream_url,
+            "source_type":      "plex_movie",
+            "source_id":        str(item.get("ratingKey", "")),
             "duration_seconds": duration_s,
-            "rating":         float(item.get("audienceRating", 0) or 0),
+            "rating":           float(item.get("audienceRating", 0) or 0),
         })
 
-    if not items:
+    if not all_items:
         return []
 
+    total = len(all_items)
+
+    # Load current pointer for this channel
+    ptr_result = await db.execute(sa_text("""
+        SELECT pointer_index, library_size FROM epg_movie_pointers
+        WHERE epg_channel_id = :ch
+    """), {"ch": channel_id})
+    ptr_row = ptr_result.fetchone()
+    pointer = ptr_row[0] if ptr_row else 0
+
+    # If library size changed significantly (>10%), reset pointer to avoid
+    # stale index pointing past end of list
+    if ptr_row and abs(ptr_row[1] - total) > max(10, total * 0.1):
+        pointer = 0
+        logger.info(
+            f"EPG movie pointer: channel {channel_id} library size changed "
+            f"({ptr_row[1]} → {total}) — resetting pointer"
+        )
+
+    pointer = pointer % total  # safety wrap
+
+    # Build the ordered slice starting from pointer, wrapping around
+    ordered = all_items[pointer:] + all_items[:pointer]
+
+    # Estimate how many movies we need to fill the schedule window.
+    # Average duration of first 20 items as a heuristic.
+    sample = ordered[:20]
+    avg_duration = sum(i["duration_seconds"] for i in sample) / len(sample)
+    window_seconds = (schedule_end - build_from).total_seconds()
+    movies_needed = int(window_seconds / avg_duration) + 5  # +5 buffer
+
+    # Take the slice we need, looping if necessary
+    items = []
+    idx = 0
+    while len(items) < movies_needed:
+        items.append(ordered[idx % len(ordered)])
+        idx += 1
+
+    # Advance pointer by however many unique movies we consumed this window
+    # (capped at total to avoid multi-wrap in one rebuild)
+    consumed = min(movies_needed, total)
+    new_pointer = (pointer + consumed) % total
+
+    try:
+        await db.execute(sa_text("""
+            INSERT INTO epg_movie_pointers
+                (epg_channel_id, pointer_index, library_size, updated_at)
+            VALUES (:ch, :ptr, :size, :now)
+            ON CONFLICT(epg_channel_id)
+            DO UPDATE SET pointer_index = :ptr, library_size = :size, updated_at = :now
+        """), {
+            "ch": channel_id,
+            "ptr": new_pointer,
+            "size": total,
+            "now": datetime.datetime.utcnow(),
+        })
+        await db.commit()
+    except Exception as e:
+        logger.warning(f"EPG movie pointer: failed to save for channel {channel_id}: {e}")
+
+    # Within this window's slice, shuffle if requested (variety within window,
+    # but full-library coverage guaranteed across windows)
     if channel["rotation_style"] == "shuffle":
         random.shuffle(items)
 
@@ -336,8 +412,8 @@ async def _build_plex_movie_schedule(
         items = _apply_primetime_boost(items, build_from)
 
     logger.info(
-        f"EPG Plex movie: channel {channel['id']} — {len(items)} movies available "
-        f"(genre: {genre_filter or 'all'})"
+        f"EPG Plex movie: channel {channel_id} — {total} movies total, "
+        f"pointer={pointer}→{new_pointer}, genre={genre_filter or 'all'}"
     )
     return _pack_time_slots(items, build_from, schedule_end, channel)
 
@@ -378,7 +454,7 @@ async def _build_plex_tv_schedule(
 
     try:
         async with httpx.AsyncClient(timeout=PLEX_TIMEOUT, verify=False) as client:
-            resp = await client.get(url, params=params)
+            resp = await client.get(url, params=params, headers=PLEX_HEADERS)
             resp.raise_for_status()
             data = resp.json()
     except Exception as e:
@@ -409,7 +485,7 @@ async def _build_plex_tv_schedule(
         ep_url = f"{plex_base}/library/metadata/{show_key}/allLeaves"
         try:
             async with httpx.AsyncClient(timeout=PLEX_TIMEOUT, verify=False) as client:
-                ep_resp = await client.get(ep_url, params={"X-Plex-Token": creds["token"]})
+                ep_resp = await client.get(ep_url, params={"X-Plex-Token": creds["token"]}, headers=PLEX_HEADERS)
                 ep_resp.raise_for_status()
                 ep_data = ep_resp.json()
         except Exception as e:
@@ -470,7 +546,7 @@ async def _build_plex_tv_schedule(
         f"EPG TV: channel {channel['id']} — {len(shows)} shows, "
         f"{len(all_episodes)} episodes selected (budget={budget_per_series}/series)"
     )
-    return all_episodes
+    return _pack_time_slots(all_episodes, build_from, schedule_end, channel)
 
 
 # ---------------------------------------------------------------------------

@@ -86,15 +86,17 @@ fun AdultScreen(
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val adultState      by viewModel.adultState.collectAsStateWithLifecycle()
-    val genreState      by viewModel.genreState.collectAsStateWithLifecycle()
-    val selectedPill    by viewModel.selectedPill.collectAsStateWithLifecycle()
-    val lockedFavorites by viewModel.lockedFavorites.collectAsStateWithLifecycle()
-    val removingFavIds  by viewModel.removingFavIds.collectAsStateWithLifecycle()
-    val privateFiles    by viewModel.privateFiles.collectAsStateWithLifecycle()
-    val removingPaths   by viewModel.removingPaths.collectAsStateWithLifecycle()
-    val pendingIdQueue  by viewModel.pendingIdQueue.collectAsStateWithLifecycle()
-    val pendingUrlQueue by viewModel.pendingUrlQueue.collectAsStateWithLifecycle()
+    val adultState          by viewModel.adultState.collectAsStateWithLifecycle()
+    val genreState          by viewModel.genreState.collectAsStateWithLifecycle()
+    val selectedPill        by viewModel.selectedPill.collectAsStateWithLifecycle()
+    val lockedFavorites     by viewModel.lockedFavorites.collectAsStateWithLifecycle()
+    val removingFavIds      by viewModel.removingFavIds.collectAsStateWithLifecycle()
+    val privateFiles        by viewModel.privateFiles.collectAsStateWithLifecycle()
+    val removingPaths       by viewModel.removingPaths.collectAsStateWithLifecycle()
+    val pendingIdQueue      by viewModel.pendingIdQueue.collectAsStateWithLifecycle()
+    val pendingUrlQueue     by viewModel.pendingUrlQueue.collectAsStateWithLifecycle()
+    // Session 42: subfolder multi-select filter for Local pill
+    val localSubfolderFilter by viewModel.localSubfolderFilter.collectAsStateWithLifecycle()
 
     val gridState = rememberLazyGridState()
 
@@ -260,6 +262,43 @@ fun AdultScreen(
                 onSelectPill  = { viewModel.selectPill(it) },
             )
 
+            // ── Session 42: Subfolder filter row (Local pill only) ────────────
+            // Shows when Local is selected and there are multiple subfolders.
+            // Multi-select: tap to toggle, "All" clears selection.
+            if (selectedPill == AdultViewModel.LOCAL_PILL) {
+                // Session 42: compute subfolders inline from collected state
+                val subfolders = privateFiles
+                    .mapNotNull { file ->
+                        val parts = (file.relativePath ?: "").split("/")
+                        val folderRaw = if (parts.size >= 2) parts[1] else ""
+                        folderRaw.replaceFirst(Regex("^\\d+_"), "").ifBlank { folderRaw }.takeIf { it.isNotBlank() }
+                    }
+                    .distinct()
+                    .sorted()
+                if (subfolders.size > 1) {
+                    Spacer(Modifier.height(8.dp))
+                    LazyRow(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        contentPadding        = PaddingValues(horizontal = 2.dp),
+                    ) {
+                        item {
+                            AdultSubfolderPill(
+                                label      = "All",
+                                isSelected = localSubfolderFilter.isEmpty(),
+                                onClick    = { viewModel.clearLocalSubfolderFilter() },
+                            )
+                        }
+                        items(subfolders) { name ->
+                            AdultSubfolderPill(
+                                label      = name,
+                                isSelected = name in localSubfolderFilter,
+                                onClick    = { viewModel.toggleLocalSubfolder(name) },
+                            )
+                        }
+                    }
+                }
+            }
+
             Spacer(Modifier.height(12.dp))
 
             // ── Content ───────────────────────────────────────────────────────
@@ -302,11 +341,31 @@ fun AdultScreen(
                     }
                 }
 
-                // ── Local pill — vertical list with Remove + delete confirm ───
+                // ── Local pill — subfolder-filtered vertical list with Remove ─
                 AdultViewModel.LOCAL_PILL -> {
-                    if (privateFiles.isEmpty()) {
+                    // Session 42: compute filtered list from collected state so
+                    // Compose recomposes when localSubfolderFilter changes.
+                    // Empty filter = all files. Strip {id}_ prefix to match pill labels.
+                    val displayFiles = if (localSubfolderFilter.isEmpty()) {
+                        privateFiles
+                    } else {
+                        privateFiles.filter { file ->
+                            val parts = (file.relativePath ?: "").split("/")
+                            val folderRaw = if (parts.size >= 2) parts[1] else ""
+                            val folderDisplay = folderRaw.replaceFirst(Regex("^\\d+_"), "").ifBlank { folderRaw }
+                            folderDisplay in localSubfolderFilter
+                        }
+                    }
+                    if (displayFiles.isEmpty()) {
                         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                            Text("No local adult files downloaded yet.", style = MaterialTheme.typography.titleLarge, color = WatchDawgColors.TextTertiary)
+                            Text(
+                                if (localSubfolderFilter.isNotEmpty())
+                                    "No files in selected folders."
+                                else
+                                    "No local adult files downloaded yet.",
+                                style = MaterialTheme.typography.titleLarge,
+                                color = WatchDawgColors.TextTertiary,
+                            )
                         }
                     } else {
                         LazyColumn(
@@ -314,8 +373,8 @@ fun AdultScreen(
                             contentPadding      = PaddingValues(bottom = 48.dp),
                             modifier            = Modifier.fillMaxSize(),
                         ) {
-                            items(privateFiles, key = { it.relativePath ?: it.filename ?: it.hashCode().toString() }) { file ->
-                                val idx = privateFiles.indexOf(file)
+                            items(displayFiles, key = { it.relativePath ?: it.filename ?: it.hashCode().toString() }) { file ->
+                                val idx = displayFiles.indexOf(file)
                                 AdultLocalRow(
                                     file       = file,
                                     isRemoving = removingPaths.contains(file.relativePath),
@@ -467,6 +526,30 @@ private fun AdultPill(
             focusedContentColor   = WatchDawgColors.Background,
         ),
         modifier = modifier.focusGlow(),
+    ) {
+        Text(text = label, style = MaterialTheme.typography.labelLarge)
+    }
+}
+
+// ── Session 42: Subfolder filter pill ────────────────────────────────────────
+// Visually distinct from main genre pills — uses Surface base so it reads as
+// a secondary filter row rather than a primary navigation element.
+
+@Composable
+private fun AdultSubfolderPill(
+    label: String,
+    isSelected: Boolean,
+    onClick: () -> Unit,
+) {
+    Button(
+        onClick  = onClick,
+        colors   = ButtonDefaults.colors(
+            containerColor        = if (isSelected) WatchDawgColors.Orange else WatchDawgColors.Surface,
+            contentColor          = if (isSelected) WatchDawgColors.Background else WatchDawgColors.TextSecondary,
+            focusedContainerColor = WatchDawgColors.OrangeDim,
+            focusedContentColor   = WatchDawgColors.Orange,
+        ),
+        modifier = Modifier.focusGlow(),
     ) {
         Text(text = label, style = MaterialTheme.typography.labelLarge)
     }

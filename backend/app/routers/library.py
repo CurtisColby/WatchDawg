@@ -100,6 +100,7 @@ def _generate_thumb_sync(video_path: str, thumb_path: str) -> bool:
 
 @router.get("")
 async def list_library(
+    genre: Optional[str] = Query(None, description="Filter by genre tag (case-insensitive, partial match)"),
     x_watchdawg_token: Optional[str] = Header(None),
     db: AsyncSession = Depends(get_db_session),
 ):
@@ -151,6 +152,16 @@ async def list_library(
         if fav.local_file_path:
             known_files[fav.local_file_path] = (fav, video)
 
+    # Session 42: build channel genre_tags lookup so Local tab can filter by pill.
+    # Keys: channel_id → genre_tags string
+    from app.models import Channel as ChannelModel
+    from sqlalchemy import select as sa_select
+    ch_result = await db.execute(sa_select(ChannelModel.id, ChannelModel.genre_tags, ChannelModel.name))
+    channel_info: dict[int, dict] = {
+        row[0]: {"genre_tags": row[1] or "", "name": row[2]}
+        for row in ch_result.fetchall()
+    }
+
     files = []
 
     for dirpath, _dirnames, filenames in os.walk(scan_dir):
@@ -186,17 +197,30 @@ async def list_library(
                 thumbnail_url = video.thumbnail_url
                 favorite_id = fav.id
                 video_id = video.id
+                # Session 42: include channel genre_tags for pill filtering
+                ch = channel_info.get(video.channel_id) if video.channel_id else None
+                genre_tags = ch["genre_tags"] if ch else ""
+                channel_name = ch["name"] if ch else ""
             else:
                 title = os.path.splitext(filename)[0]
                 artist = None
                 favorite_id = None
                 video_id = None
+                genre_tags = ""
+                channel_name = ""
                 thumb_path = _thumb_path_for(full_path)
                 if os.path.isfile(thumb_path):
                     thumb_rel = os.path.relpath(thumb_path, downloads_dir)
                     thumbnail_url = f"/library/thumb/{urllib.parse.quote(thumb_rel, safe='/')}"
                 else:
                     thumbnail_url = None
+
+            # Session 42: apply genre filter if provided
+            if genre and genre_tags:
+                if genre.lower() not in genre_tags.lower():
+                    continue
+            elif genre and not genre_tags:
+                continue  # no tags → doesn't match any genre filter
 
             files.append({
                 "filename": filename,
@@ -211,13 +235,15 @@ async def list_library(
                 "stream_url": f"/library/stream/{urllib.parse.quote(relative_path, safe='/')}",
                 "favorite_id": favorite_id,
                 "video_id": video_id,
+                "genre_tags": genre_tags,
+                "channel_name": channel_name,
             })
 
     files.sort(key=lambda f: f["modified_at"], reverse=True)
 
     logger.info(
         f"Library scan: {len(files)} video files in {scan_dir} "
-        f"(unlocked={unlocked})"
+        f"(unlocked={unlocked}, genre={genre or 'all'})"
     )
     return {
         "total": len(files),
@@ -225,6 +251,60 @@ async def list_library(
         "files": files,
         "locked_hidden": False,
     }
+
+
+@router.get("/genres")
+async def list_library_genres(
+    x_watchdawg_token: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db_session),
+):
+    """
+    Session 42 — Return distinct genre tags available in the local library.
+
+    Scans all videos in the library, joins to their channels, and returns
+    a deduplicated sorted list of genre tags for pill filter UI.
+
+    PIN-aware: locked channel genres only returned when unlocked.
+    """
+    unlocked = is_unlocked(x_watchdawg_token)
+
+    from app.models import Channel as ChannelModel
+    from sqlalchemy import select as sa_select
+
+    stmt = (
+        sa_select(Favorite, Video)
+        .join(Video, Favorite.video_id == Video.id)
+        .where(Favorite.local_file_path.isnot(None))
+    )
+    result = await db.execute(stmt)
+    rows = result.all()
+
+    # Collect channel IDs from known files
+    channel_ids = set()
+    for fav, video in rows:
+        if video.channel_id:
+            channel_ids.add(video.channel_id)
+
+    if not channel_ids:
+        return {"genres": [], "total": 0}
+
+    ch_stmt = sa_select(ChannelModel.genre_tags, ChannelModel.locked).where(
+        ChannelModel.id.in_(list(channel_ids))
+    )
+    ch_result = await db.execute(ch_stmt)
+
+    tags = set()
+    for genre_tags, locked in ch_result.fetchall():
+        if locked and not unlocked:
+            continue
+        if genre_tags:
+            for tag in genre_tags.split(","):
+                tag = tag.strip()
+                if tag:
+                    tags.add(tag)
+
+    sorted_tags = sorted(tags)
+    return {"genres": sorted_tags, "total": len(sorted_tags)}
 
 
 @router.post("/generate-thumbnails")

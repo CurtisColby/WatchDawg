@@ -430,28 +430,46 @@ private fun WatchDawgRoot(onFinish: () -> Unit) {
                 EpgScreen(
                     viewModel = epgViewModel,
                     onPlaySlot = { slot, channelId, offsetSeconds ->
-                        // Plex / IPTV slots — play direct URL queue as before.
-                        // WatchDawg slots are handled by onPlayById below.
-                        epgViewModel.setActiveChannel(channelId)
-                        val channels = epgViewModel.state.value.channels
-                        val allUrls = channels.mapNotNull { ch ->
-                            epgViewModel.getCurrentSlot(ch)?.streamUrl?.takeIf { it.isNotBlank() }
+                        // Session 42 fix: route based on slot type.
+                        //
+                        // WatchDawg slots have videoId set and streamUrl blank —
+                        // the old URL queue approach dropped these from allUrls
+                        // (takeIf { isNotBlank } filtered them out) causing index
+                        // fallback to 0 which played whichever channel happened to
+                        // be first in the URL list regardless of what was tapped.
+                        //
+                        // Fix: check videoId first. If set, route through onPlayById
+                        // exactly as EpgScreen's internal handler does. Otherwise
+                        // play direct URL as a single-item queue (no cross-channel
+                        // queue needed — surfing handles adjacent channels itself).
+                        if (slot.videoId != null) {
+                            epgViewModel.setActiveChannel(channelId)
+                            com.watchdawg.tv.data.prefs.QueueHolder.epgSlotStartTimeUtc = slot.startTime
+                            QueueHolder.setIdQueue(listOf(slot.videoId), 0, hls = true)
+                            QueueHolder.resumePositionMs = offsetSeconds * 1000L
+                            QueueHolder.epgChannelNumber = slot.channelNumber
+                            QueueHolder.epgChannelName   = slot.channelName
+                            QueueHolder.epgSlotTitle     = slot.title
+                            navController.navigate(Routes.player(slot.videoId, 0))
+                        } else {
+                            epgViewModel.setActiveChannel(channelId)
+                            val tappedUrl = slot.streamUrl ?: ""
+                            if (tappedUrl.isBlank()) return@EpgScreen
+                            QueueHolder.setUrlQueue(listOf(tappedUrl), 0, isEpg = true, resumeMs = offsetSeconds * 1000L)
+                            QueueHolder.epgChannelNumber = slot.channelNumber
+                            QueueHolder.epgChannelName   = slot.channelName
+                            QueueHolder.epgSlotTitle     = slot.title
+                            navController.navigate(Routes.playerDirectQueue(0))
                         }
-                        val tappedUrl = slot.streamUrl ?: ""
-                        val startIdx = allUrls.indexOf(tappedUrl).takeIf { it >= 0 } ?: 0
-                        val queue = allUrls.ifEmpty { listOfNotNull(tappedUrl.takeIf { it.isNotBlank() }) }
-                        QueueHolder.setUrlQueue(queue, startIdx, isEpg = true, resumeMs = offsetSeconds * 1000L)
-                        navController.navigate(Routes.playerDirectQueue(startIdx))
                     },
                     onPlayById = { videoId, hlsMode, offsetSeconds ->
-                        // Session 40: WatchDawg EPG slots — resolve fresh via normal
-                        // feed path. Store slot startTime so PlayerViewModel can
-                        // recompute the offset after yt-dlp finishes (corrects for
-                        // the 10-20s resolve delay that makes tap-time offset stale).
+                        // Session 40: WatchDawg EPG slots routed here from EpgScreen
+                        // internal handler (slot.videoId != null path).
+                        // Session 42: this path is now also used by onPlaySlot above
+                        // for direct taps so both paths are consistent.
                         epgViewModel.setActiveChannel(videoId)
                         QueueHolder.setIdQueue(listOf(videoId), 0, hls = hlsMode)
                         QueueHolder.resumePositionMs = offsetSeconds * 1000L
-                        // epgSlotStartTimeUtc is set by EpgScreen via the slot object
                         navController.navigate(Routes.player(videoId, 0))
                     },
                     onBack = { navController.popBackStack() },
@@ -544,41 +562,54 @@ private fun WatchDawgRoot(onFinish: () -> Unit) {
                         navController.popBackStack()
                     },
                     // Session 38 — EPG channel surfing:
-                    // When launched from the EPG, onSurfNext/Prev call epgViewModel
-                    // to get the adjacent channel's current slot, update the queue in
-                    // QueueHolder, and re-navigate so the player loads the new stream.
-                    // For all non-EPG direct queues these are null → queue surfing used.
+                    // Session 42 fix: surf lambdas now route each slot individually
+                    // based on slot type (streamUrl vs videoId) instead of building
+                    // a URL queue across all channels. The old URL queue approach
+                    // silently dropped watchdawg slots (streamUrl is blank for those)
+                    // causing index fallback to 0 which played the wrong channel.
                     onSurfNext = if (isEpg) ({
                         val slot = epgViewModel.getAdjacentSlot(+1)
-                        if (slot != null && !slot.streamUrl.isNullOrBlank()) {
-                            val channels = epgViewModel.state.value.channels
-                            val allUrls = channels.mapNotNull { ch ->
-                                epgViewModel.getCurrentSlot(ch)?.streamUrl?.takeIf { it.isNotBlank() }
-                            }
-                            val newIdx = allUrls.indexOf(slot.streamUrl).takeIf { it >= 0 } ?: 0
-                            val queue = allUrls.ifEmpty { listOf(slot.streamUrl) }
-                            QueueHolder.setUrlQueue(queue, newIdx, isEpg = true)
-                            // Session 38 fix: popUpTo replaces the current player entry
-                            // instead of pushing a new one — prevents back-stack buildup
-                            // where each surf adds an extra Back press to get back to EPG.
-                            navController.navigate(Routes.playerDirectQueue(newIdx)) {
-                                popUpTo(Routes.PLAYER_DIRECT_QUEUE) { inclusive = true }
+                        if (slot != null) {
+                            QueueHolder.epgChannelNumber = slot.channelNumber
+                            QueueHolder.epgChannelName   = slot.channelName
+                            QueueHolder.epgSlotTitle     = slot.title
+                            if (slot.videoId != null) {
+                                // WatchDawg slot — resolve fresh
+                                com.watchdawg.tv.data.prefs.QueueHolder.epgSlotStartTimeUtc = slot.startTime
+                                QueueHolder.setIdQueue(listOf(slot.videoId), 0, hls = true)
+                                QueueHolder.resumePositionMs = (slot.progressSeconds ?: 0).toLong() * 1000L
+                                navController.navigate(Routes.player(slot.videoId, 0)) {
+                                    popUpTo(Routes.EPG) { inclusive = false }
+                                }
+                            } else if (!slot.streamUrl.isNullOrBlank()) {
+                                // Plex / IPTV slot — play direct URL
+                                QueueHolder.setUrlQueue(listOf(slot.streamUrl), 0, isEpg = true)
+                                navController.navigate(Routes.playerDirectQueue(0)) {
+                                    popUpTo(Routes.EPG) { inclusive = false }
+                                }
                             }
                         }
                     }) else null,
                     onSurfPrev = if (isEpg) ({
                         val slot = epgViewModel.getAdjacentSlot(-1)
-                        if (slot != null && !slot.streamUrl.isNullOrBlank()) {
-                            val channels = epgViewModel.state.value.channels
-                            val allUrls = channels.mapNotNull { ch ->
-                                epgViewModel.getCurrentSlot(ch)?.streamUrl?.takeIf { it.isNotBlank() }
-                            }
-                            val newIdx = allUrls.indexOf(slot.streamUrl).takeIf { it >= 0 } ?: 0
-                            val queue = allUrls.ifEmpty { listOf(slot.streamUrl) }
-                            QueueHolder.setUrlQueue(queue, newIdx, isEpg = true)
-                            // Session 38 fix: same popUpTo pattern as onSurfNext.
-                            navController.navigate(Routes.playerDirectQueue(newIdx)) {
-                                popUpTo(Routes.PLAYER_DIRECT_QUEUE) { inclusive = true }
+                        if (slot != null) {
+                            QueueHolder.epgChannelNumber = slot.channelNumber
+                            QueueHolder.epgChannelName   = slot.channelName
+                            QueueHolder.epgSlotTitle     = slot.title
+                            if (slot.videoId != null) {
+                                // WatchDawg slot — resolve fresh
+                                com.watchdawg.tv.data.prefs.QueueHolder.epgSlotStartTimeUtc = slot.startTime
+                                QueueHolder.setIdQueue(listOf(slot.videoId), 0, hls = true)
+                                QueueHolder.resumePositionMs = (slot.progressSeconds ?: 0).toLong() * 1000L
+                                navController.navigate(Routes.player(slot.videoId, 0)) {
+                                    popUpTo(Routes.EPG) { inclusive = false }
+                                }
+                            } else if (!slot.streamUrl.isNullOrBlank()) {
+                                // Plex / IPTV slot — play direct URL
+                                QueueHolder.setUrlQueue(listOf(slot.streamUrl), 0, isEpg = true)
+                                navController.navigate(Routes.playerDirectQueue(0)) {
+                                    popUpTo(Routes.EPG) { inclusive = false }
+                                }
                             }
                         }
                     }) else null,

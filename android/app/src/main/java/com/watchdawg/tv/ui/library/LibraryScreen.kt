@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
@@ -52,20 +53,17 @@ import com.watchdawg.tv.ui.theme.focusGlow
 import com.watchdawg.tv.ui.theme.focusGlowCard
 
 /**
- * Library / Local screen — R-4 rebuild.
+ * Library / Local screen — Session 42 genre pill filter added.
  *
  * Content model (R-4):
  *   Shows ONLY Public subfolder files. Private files live on Adult → Local pill.
  *   PIN-agnostic — content is always the same regardless of lock state.
- *   No subfolder label shown — it's always Public, no need to say so.
  *
- * Layout: vertical LazyColumn rows matching Favorites screen style.
- *   Each row: thumbnail | title + size | [Remove] button
- *   Remove shows a confirmation dialog ("This will delete the file from disc.
- *   Are you sure?") before executing DELETE /library/file.
- *
- * Play All / Shuffle All buttons in header.
- * Refresh button to re-scan after new downloads arrive.
+ * Session 42 additions:
+ *   Genre pill row below the action buttons. "All" pill shows everything.
+ *   Selecting a genre pill reloads the list filtered server-side via
+ *   GET /library?genre=X. Pill list fetched from GET /library/genres.
+ *   Channel name shown in orange under each file title.
  */
 @Composable
 fun LibraryScreen(
@@ -75,14 +73,9 @@ fun LibraryScreen(
     modifier: Modifier = Modifier,
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
-
-    // Path pending confirmation dialog
     var pendingRemovePath by remember { mutableStateOf<String?>(null) }
 
-    // Refresh on every screen entry so new downloads are visible immediately
-    LaunchedEffect(Unit) {
-        viewModel.refresh()
-    }
+    LaunchedEffect(Unit) { viewModel.refresh() }
 
     LaunchedEffect(state.pendingQueue) {
         val q = state.pendingQueue ?: return@LaunchedEffect
@@ -93,7 +86,6 @@ fun LibraryScreen(
     }
 
     Box(modifier = modifier.fillMaxSize()) {
-
         Column(modifier = Modifier.fillMaxSize().padding(end = 32.dp, top = 28.dp)) {
 
             Text(
@@ -110,6 +102,7 @@ fun LibraryScreen(
 
             Spacer(Modifier.height(12.dp))
 
+            // ── Action buttons ────────────────────────────────────────────────
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 Button(
                     onClick  = { viewModel.playAll() },
@@ -145,12 +138,39 @@ fun LibraryScreen(
                 ) { Text("⟳  Refresh", style = MaterialTheme.typography.titleSmall) }
             }
 
+            // ── Session 42: Genre pill filter row ─────────────────────────────
+            if (state.genres.isNotEmpty()) {
+                Spacer(Modifier.height(10.dp))
+                LazyRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    contentPadding        = PaddingValues(horizontal = 2.dp),
+                ) {
+                    item {
+                        GenrePill(
+                            label      = "All",
+                            isSelected = state.selectedGenre == null,
+                            onClick    = { viewModel.selectGenre(null) },
+                        )
+                    }
+                    items(state.genres) { genre ->
+                        GenrePill(
+                            label      = genre,
+                            isSelected = state.selectedGenre == genre,
+                            onClick    = { viewModel.selectGenre(genre) },
+                        )
+                    }
+                }
+            }
+
             Spacer(Modifier.height(12.dp))
 
             if (state.files.isEmpty() && !state.loading) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     Text(
-                        text  = "No downloaded files yet.",
+                        text  = if (state.selectedGenre != null)
+                            "No files found for \"${state.selectedGenre}\"."
+                        else
+                            "No downloaded files yet.",
                         style = MaterialTheme.typography.titleLarge,
                         color = WatchDawgColors.TextSecondary,
                     )
@@ -175,26 +195,42 @@ fun LibraryScreen(
                                     onPlayStreamUrl(url, file.title ?: file.filename ?: "Now Playing")
                                 }
                             },
-                            onRemove = {
-                                pendingRemovePath = file.relativePath
-                            },
+                            onRemove = { pendingRemovePath = file.relativePath },
                         )
                     }
                 }
             }
         }
 
-        // ── Remove confirmation dialog ─────────────────────────────────────────
         if (pendingRemovePath != null) {
             val path = pendingRemovePath!!
             RemoveFileConfirmDialog(
-                onConfirm = {
-                    pendingRemovePath = null
-                    viewModel.removeFile(path)
-                },
+                onConfirm = { pendingRemovePath = null; viewModel.removeFile(path) },
                 onDismiss = { pendingRemovePath = null },
             )
         }
+    }
+}
+
+// ── Genre pill ────────────────────────────────────────────────────────────────
+
+@Composable
+private fun GenrePill(
+    label: String,
+    isSelected: Boolean,
+    onClick: () -> Unit,
+) {
+    Button(
+        onClick = onClick,
+        colors  = ButtonDefaults.colors(
+            containerColor        = if (isSelected) WatchDawgColors.Orange else WatchDawgColors.Surface,
+            contentColor          = if (isSelected) WatchDawgColors.Background else WatchDawgColors.TextSecondary,
+            focusedContainerColor = WatchDawgColors.OrangeDim,
+            focusedContentColor   = WatchDawgColors.Orange,
+        ),
+        modifier = Modifier.focusGlow(),
+    ) {
+        Text(label, style = MaterialTheme.typography.labelLarge)
     }
 }
 
@@ -230,7 +266,6 @@ private fun LibraryRow(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier          = Modifier.padding(8.dp),
             ) {
-                // Thumbnail — 16:9 like Favorites rows
                 Box(
                     modifier = Modifier
                         .width(160.dp)
@@ -255,6 +290,15 @@ private fun LibraryRow(
                         maxLines = 2,
                         overflow = TextOverflow.Ellipsis,
                     )
+                    if (!file.channelName.isNullOrBlank()) {
+                        Text(
+                            text     = file.channelName,
+                            style    = MaterialTheme.typography.bodySmall,
+                            color    = WatchDawgColors.Orange,
+                            maxLines = 1,
+                            modifier = Modifier.padding(top = 2.dp),
+                        )
+                    }
                     if (!file.sizeHuman.isNullOrBlank()) {
                         Text(
                             text     = file.sizeHuman,
@@ -268,7 +312,6 @@ private fun LibraryRow(
             }
         }
 
-        // Remove button — matches Favorites remove style
         Button(
             onClick  = { if (!isRemoving) onRemove() },
             colors   = ButtonDefaults.colors(
@@ -277,9 +320,7 @@ private fun LibraryRow(
                 focusedContainerColor = WatchDawgColors.SurfaceFocused,
                 focusedContentColor   = WatchDawgColors.FailedBadge,
             ),
-            modifier = Modifier
-                .width(110.dp)
-                .focusGlow(),
+            modifier = Modifier.width(110.dp).focusGlow(),
         ) {
             Text(
                 text  = if (isRemoving) "…" else "✕  Remove",
@@ -321,11 +362,7 @@ private fun RemoveFileConfirmDialog(
                 .background(WatchDawgColors.Surface, RoundedCornerShape(16.dp))
                 .padding(horizontal = 56.dp, vertical = 40.dp),
         ) {
-            Text(
-                text  = "🗑  Delete File?",
-                style = MaterialTheme.typography.titleLarge,
-                color = WatchDawgColors.TextPrimary,
-            )
+            Text("🗑  Delete File?", style = MaterialTheme.typography.titleLarge, color = WatchDawgColors.TextPrimary)
             Text(
                 text  = "This will permanently delete the file from disc.\nAre you sure?",
                 style = MaterialTheme.typography.bodyMedium,
@@ -341,9 +378,7 @@ private fun RemoveFileConfirmDialog(
                         focusedContentColor   = WatchDawgColors.TextPrimary,
                     ),
                     modifier = Modifier.width(140.dp).focusRequester(cancelFocus).focusGlow(),
-                ) {
-                    Text("Cancel", style = MaterialTheme.typography.titleSmall)
-                }
+                ) { Text("Cancel", style = MaterialTheme.typography.titleSmall) }
                 Button(
                     onClick  = onConfirm,
                     colors   = ButtonDefaults.colors(
@@ -353,9 +388,7 @@ private fun RemoveFileConfirmDialog(
                         focusedContentColor   = Color.White,
                     ),
                     modifier = Modifier.width(140.dp).focusRequester(confirmFocus).focusGlow(),
-                ) {
-                    Text("Delete", style = MaterialTheme.typography.titleSmall)
-                }
+                ) { Text("Delete", style = MaterialTheme.typography.titleSmall) }
             }
         }
     }

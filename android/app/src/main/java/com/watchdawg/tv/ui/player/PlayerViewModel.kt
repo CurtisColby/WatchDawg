@@ -241,7 +241,9 @@ class PlayerViewModel(
             _state.value = _state.value.copy(loading = false, ended = true)
             return
         }
-        emitDirect(url, "Now Playing", "")
+        // Session 42: use the EPG slot title if available, otherwise fall back to "Now Playing".
+        val title = QueueHolder.epgSlotTitle.ifBlank { "Now Playing" }
+        emitDirect(url, title, "")
     }
 
     private fun emitDirect(url: String, title: String, artist: String) {

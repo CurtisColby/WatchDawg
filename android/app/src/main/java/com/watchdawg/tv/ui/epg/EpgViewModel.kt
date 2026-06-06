@@ -44,7 +44,9 @@ class EpgViewModel : ViewModel() {
 
     // Which channel index is currently being watched in EPG surf mode.
     // -1 = not in EPG surf mode.
+    // Session 42: exposed as val so EpgScreen can restore scroll/focus on return.
     private var _currentChannelIndex: Int = -1
+    val activeChannelIndex: Int get() = _currentChannelIndex
 
     init {
         load()

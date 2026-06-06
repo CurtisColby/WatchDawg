@@ -2,6 +2,7 @@ package com.watchdawg.tv.ui.library
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.watchdawg.tv.Graph
 import com.watchdawg.tv.data.api.LibraryFileDto
 import com.watchdawg.tv.data.auth.TokenHolder
 import com.watchdawg.tv.data.repo.WatchDawgRepository
@@ -13,32 +14,23 @@ import kotlinx.coroutines.launch
 /**
  * Loads the local library and supports Play All / Shuffle All / Remove.
  *
- * R-4 content model change:
- *   Local screen now shows ONLY Public subfolder files regardless of PIN state.
- *   Private subfolder files live exclusively on the Adult screen → Local pill.
+ * Session 42: Genre pill filtering added.
+ *   - Fetches available genre tags from GET /library/genres on load.
+ *   - Selected genre pill calls GET /library?genre=X to filter server-side.
+ *   - "All" pill clears the filter and loads all files.
+ *   - Pill selection state lives in ViewModel so it survives recomposition.
  *
- *   The backend already enforces the token gate (locked → Public/ scan only,
- *   unlocked → both). We add a client-side filter to subfolder == "Public" so
- *   that even when unlocked, Private files stay off this screen entirely.
- *
- *   This means Local is now PIN-agnostic — it always shows the same content
- *   (public downloads) regardless of whether the PIN has been entered.
- *
- * Token awareness kept:
- *   Still subscribes to TokenHolder.tokenFlow and refreshes, because the
- *   backend scan root changes on lock/unlock and we want the file list to
- *   stay current. The filter ensures only Public files ever appear here.
- *
- * Remove:
- *   Calls DELETE /library/file?relative_path=X which deletes the physical file,
- *   cleans up the DB favorite record, and adds to the skip list.
- *   Shows a confirmation dialog in LibraryScreen before executing.
+ * R-4 content model:
+ *   Shows ONLY Public subfolder files. Private files live on Adult → Local pill.
+ *   PIN-agnostic — content is always the same regardless of lock state.
  */
 class LibraryViewModel(private val repo: WatchDawgRepository) : ViewModel() {
 
     data class UiState(
         val loading: Boolean = true,
         val files: List<LibraryFileDto> = emptyList(),
+        val genres: List<String> = emptyList(),
+        val selectedGenre: String? = null,
         val error: String? = null,
         val pendingQueue: List<String>? = null,
         val removingPaths: Set<String> = emptySet(),
@@ -55,12 +47,19 @@ class LibraryViewModel(private val repo: WatchDawgRepository) : ViewModel() {
     }
 
     fun refresh() {
+        val genre = _state.value.selectedGenre
         viewModelScope.launch {
             _state.value = _state.value.copy(loading = true, error = null)
-            repo.getLibrary()
+
+            // Fetch genres on first load (or if empty)
+            if (_state.value.genres.isEmpty()) {
+                repo.getLibraryGenres()
+                    .onSuccess { tags -> _state.value = _state.value.copy(genres = tags) }
+            }
+
+            repo.getLibrary(genre = genre)
                 .onSuccess { response ->
                     // R-4: filter to Public subfolder only.
-                    // Private files are shown exclusively on Adult → Local pill.
                     val publicFiles = response.files.filter { it.subfolder == "Public" }
                     _state.value = _state.value.copy(
                         loading = false,
@@ -77,9 +76,16 @@ class LibraryViewModel(private val repo: WatchDawgRepository) : ViewModel() {
     }
 
     /**
+     * Session 42: Select a genre pill to filter the library.
+     * null = show all files.
+     */
+    fun selectGenre(genre: String?) {
+        _state.value = _state.value.copy(selectedGenre = genre)
+        refresh()
+    }
+
+    /**
      * Delete a file from the NAS via DELETE /library/file?relative_path=X.
-     * The backend handles: physical file deletion, DB cleanup, skip list entry.
-     * Optimistically removes from the list immediately; refreshes on completion.
      */
     fun removeFile(relativePath: String) {
         if (_state.value.removingPaths.contains(relativePath)) return

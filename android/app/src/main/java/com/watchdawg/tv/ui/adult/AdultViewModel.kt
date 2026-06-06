@@ -197,6 +197,10 @@ class AdultViewModel(private val repo: WatchDawgRepository) : ViewModel() {
         // the played Set so the clear is harmless for them.
         if (pill != _selectedPill.value) {
             playedIds.clear()
+            // Session 42: clear subfolder filter when leaving Local pill
+            if (_selectedPill.value == LOCAL_PILL) {
+                _localSubfolderFilter.value = emptySet()
+            }
         }
         _selectedPill.value = pill
         if (pill != FAVORITES_PILL && pill != LOCAL_PILL) {
@@ -249,7 +253,62 @@ class AdultViewModel(private val repo: WatchDawgRepository) : ViewModel() {
         }
     }
 
-    // ── Mark played (Smart Shuffle callback) ──────────────────────────────────
+    // ── Local subfolder filter (Session 42) ──────────────────────────────────
+    // Multi-select: empty set = show all private files.
+    // Each entry is the display name (id prefix stripped) of a Private subfolder.
+    // Toggling a name adds/removes it; selecting "All" clears the set.
+
+    private val _localSubfolderFilter = MutableStateFlow<Set<String>>(emptySet())
+    val localSubfolderFilter: StateFlow<Set<String>> = _localSubfolderFilter
+
+    /**
+     * Toggle a subfolder name in the filter set.
+     * If the name is already selected, remove it. Otherwise add it.
+     */
+    fun toggleLocalSubfolder(name: String) {
+        val current = _localSubfolderFilter.value
+        _localSubfolderFilter.value = if (name in current) current - name else current + name
+    }
+
+    /** Clear all subfolder filters — show everything in Local. */
+    fun clearLocalSubfolderFilter() {
+        _localSubfolderFilter.value = emptySet()
+    }
+
+    /**
+     * Returns the private files filtered by the current subfolder selection.
+     * Empty filter = all files. Used by AdultScreen instead of privateFiles directly.
+     */
+    fun filteredPrivateFiles(): List<LibraryFileDto> {
+        val filter = _localSubfolderFilter.value
+        if (filter.isEmpty()) return _privateFiles.value
+        return _privateFiles.value.filter { file ->
+            val folderDisplayName = subfolderDisplayName(file.relativePath)
+            folderDisplayName != null && folderDisplayName in filter
+        }
+    }
+
+    /**
+     * Returns unique subfolder display names from the private files list.
+     * Strips the {channel_id}_ prefix: "123_Shuffle Kings" → "Shuffle Kings".
+     * Used to populate the secondary pill row in AdultScreen.
+     */
+    fun privateSubfolders(): List<String> {
+        return _privateFiles.value
+            .mapNotNull { subfolderDisplayName(it.relativePath) }
+            .distinct()
+            .sorted()
+    }
+
+    private fun subfolderDisplayName(relativePath: String?): String? {
+        if (relativePath.isNullOrBlank()) return null
+        // relativePath: "Private/123_Shuffle Kings/video.mp4"
+        val parts = relativePath.split("/")
+        if (parts.size < 2) return null
+        val folder = parts[1] // e.g. "123_Shuffle Kings"
+        // Strip leading "{digits}_" prefix
+        return folder.replaceFirst(Regex("^\\d+_"), "").ifBlank { folder }
+    }
 
     /**
      * Called by QueueHolder.onVideoPlayed when PlayerViewModel successfully
@@ -274,7 +333,7 @@ class AdultViewModel(private val repo: WatchDawgRepository) : ViewModel() {
                 }
             }
             LOCAL_PILL -> {
-                val urls = _privateFiles.value.mapNotNull { it.streamUrl?.takeIf { u -> u.isNotBlank() } }
+                val urls = filteredPrivateFiles().mapNotNull { it.streamUrl?.takeIf { u -> u.isNotBlank() } }
                 if (urls.isNotEmpty()) _pendingUrlQueue.value = urls
             }
             else -> {
@@ -314,7 +373,7 @@ class AdultViewModel(private val repo: WatchDawgRepository) : ViewModel() {
                 }
             }
             LOCAL_PILL -> {
-                val urls = _privateFiles.value
+                val urls = filteredPrivateFiles()
                     .mapNotNull { it.streamUrl?.takeIf { u -> u.isNotBlank() } }
                     .shuffled()
                 if (urls.isNotEmpty()) _pendingUrlQueue.value = urls

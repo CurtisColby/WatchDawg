@@ -74,8 +74,10 @@ import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import coil.request.SuccessResult
 import com.watchdawg.tv.Graph
+import com.watchdawg.tv.data.prefs.QueueHolder
 import com.watchdawg.tv.ui.theme.WatchDawgColors
 import com.watchdawg.tv.ui.theme.focusGlow
+import androidx.compose.foundation.shape.RoundedCornerShape
 import kotlinx.coroutines.delay
 
 // ── Player start mode ─────────────────────────────────────────────────────────
@@ -144,6 +146,14 @@ fun PlayerScreen(
     var okDownTime         by remember { mutableLongStateOf(0L) }
     val longPressMs  = 500L
     val autoHideMs   = 7_000L
+
+    // Session 42 — EPG info banner.
+    // Captured once at composition time from QueueHolder. If epgChannelNumber > 0
+    // this is an EPG session and the banner prefix shows "CH N • ChannelName".
+    // For all non-EPG sessions epgChannelNumber == -1 and the banner shows title only.
+    val epgChannelNumber: Int    = remember { QueueHolder.epgChannelNumber }
+    val epgChannelName: String   = remember { QueueHolder.epgChannelName }
+    var infoBannerVisible by remember { mutableStateOf(false) }
 
     // Milestone E: speed menu visibility (separate from main controls)
     var speedMenuVisible by remember { mutableStateOf(false) }
@@ -226,6 +236,23 @@ fun PlayerScreen(
     LaunchedEffect(speedBubble)       { if (speedBubble != null)       { delay(1200); speedBubble = null } }
     LaunchedEffect(channelSurfBubble) { if (channelSurfBubble != null) { delay(800);  channelSurfBubble = null } }
     LaunchedEffect(state.ended)  { if (state.ended) onStop() }
+
+    // Session 42 — Info banner auto-show: fires every time a new stream starts
+    // (playToken increments). Auto-dismisses after 4 seconds.
+    LaunchedEffect(state.playToken) {
+        if (state.playToken > 0) {
+            infoBannerVisible = true
+            delay(4_000L)
+            infoBannerVisible = false
+        }
+    }
+    // Auto-dismiss when banner is manually re-triggered via long-press OK.
+    LaunchedEffect(infoBannerVisible) {
+        if (infoBannerVisible) {
+            delay(4_000L)
+            infoBannerVisible = false
+        }
+    }
 
     // ── Dynamic Tinting: extract dominant muted colour from thumbnail ─────────
     // Fires whenever the thumbnail URL changes (i.e. on each new video).
@@ -446,7 +473,11 @@ fun PlayerScreen(
                         Key.DirectionCenter, Key.Enter -> {
                             val held = System.currentTimeMillis() - okDownTime
                             okDownTime = 0L
-                            if (held >= longPressMs) { viewModel.favoriteCurrent(); favBubble = true }
+                            // Session 42: long-press OK shows the info banner (channel + title).
+                            // Works in all modes — EPG shows "CH N • ChannelName", everything
+                            // else shows title only. Replaces the old favoriteCurrent() long-press;
+                            // use the control bar Fav button to favorite intentionally.
+                            if (held >= longPressMs) { infoBannerVisible = true }
                             else showControls()
                             true
                         }
@@ -530,6 +561,23 @@ fun PlayerScreen(
                 thumbnailUrl    = state.thumbnailUrl,
                 baseUrl         = baseUrl,
                 title           = state.title,
+            )
+        }
+
+        // ── Session 42: Info banner ───────────────────────────────────────────
+        // Auto-shown for 4s on every new stream start. Re-triggered by long-press OK.
+        // EPG: shows "CH N  •  ChannelName" header above the slot title.
+        // Non-EPG: shows title only — epgChannelNumber == -1 suppresses the header.
+        AnimatedVisibility(
+            visible  = infoBannerVisible && !controlsVisible,
+            enter    = fadeIn(animationSpec = tween(300)),
+            exit     = fadeOut(animationSpec = tween(500)),
+            modifier = Modifier.align(Alignment.TopStart),
+        ) {
+            InfoBanner(
+                channelNumber = epgChannelNumber,
+                channelName   = epgChannelName,
+                title         = state.title,
             )
         }
 
@@ -922,6 +970,57 @@ private fun ScrubOverlay(
                 style    = MaterialTheme.typography.bodyLarge,
                 color    = WatchDawgColors.TextSecondary,
                 maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+}
+
+// ── Session 42: Info banner ───────────────────────────────────────────────────
+
+/**
+ * Overlay banner shown for 4 seconds at the start of each new stream and
+ * on long-press OK. Positioned top-left in TV convention style.
+ *
+ * EPG sessions (channelNumber > 0):
+ *   CH 101  •  Horror Channel
+ *   Movie Title Here
+ *
+ * Non-EPG sessions (channelNumber == -1):
+ *   Movie Title Here
+ *   (no channel line)
+ */
+@Composable
+private fun InfoBanner(
+    channelNumber: Int,
+    channelName: String,
+    title: String,
+) {
+    Box(
+        modifier = Modifier
+            .padding(start = 48.dp, top = 40.dp)
+            .background(
+                brush = Brush.horizontalGradient(
+                    listOf(Color(0xDD000000), Color.Transparent)
+                ),
+                shape = RoundedCornerShape(8.dp),
+            )
+            .padding(horizontal = 28.dp, vertical = 20.dp),
+    ) {
+        Column {
+            if (channelNumber > 0) {
+                Text(
+                    text  = "CH $channelNumber  •  $channelName",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = WatchDawgColors.Orange,
+                )
+                Spacer(Modifier.height(6.dp))
+            }
+            Text(
+                text     = title,
+                fontSize = 34.sp,
+                color    = Color.White,
+                maxLines = 2,
                 overflow = TextOverflow.Ellipsis,
             )
         }
