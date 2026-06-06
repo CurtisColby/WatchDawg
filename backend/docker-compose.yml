@@ -41,4 +41,8 @@ services:
       - LIBVA_DRIVERS_PATH=/usr/lib/x86_64-linux-gnu/dri
       # Explicitly pass TMDb API key — env_file alone doesn't guarantee
       # all keys reach the container when an environment: block also exists.
-      - TMDB_API_KEY=c1b957165d2c293ad1831558b6730b80
+      - TMDB_API_KEY=${TMDB_API_KEY}
+      # LAN address Android TV uses to reach the backend.
+      # Used by epg.py to build manifest.mpd URLs that the TV can actually reach.
+      # Change this if your PlexServer IP changes.
+      - WATCHDAWG_BASE_URL=http://192.168.50.42:6868

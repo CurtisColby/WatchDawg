@@ -411,6 +411,25 @@
         /* Genre tag hints label */
         .genre-tag-hint { font-size: 10px; color: var(--text-muted); width: 100%; margin-top: 2px; }
 
+        /* Add to EPG button on channel cards (Session 40) */
+        .btn-epg { padding: 3px 8px; background: none; border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); font-size: 11px; font-weight: 600; cursor: pointer; color: var(--accent-blue); border-color: var(--accent-blue); transition: all 0.15s; white-space: nowrap; }
+        .btn-epg:hover { background: var(--accent-blue-dim); }
+        .btn-epg.adult { color: var(--accent-orange); border-color: var(--accent-orange); }
+        .btn-epg.adult:hover { background: var(--accent-orange-dim); }
+        .btn-epg.added { color: var(--accent-green); border-color: var(--accent-green); cursor: default; }
+
+        /* Add to EPG mini-modal overlay (Session 40) */
+        .epg-quick-modal-overlay { display:none; position:fixed; top:0; left:0; right:0; bottom:0; background:rgba(0,0,0,0.65); z-index:2000; align-items:center; justify-content:center; }
+        .epg-quick-modal-overlay.active { display:flex; }
+        .epg-quick-modal { background:var(--bg-card); border:1px solid var(--border-focus); border-radius:var(--radius); padding:20px; width:380px; max-width:90vw; display:flex; flex-direction:column; gap:12px; }
+        .epg-quick-modal h4 { font-size:14px; font-weight:700; margin:0; color:var(--text-primary); }
+        .epg-quick-modal .epg-qm-meta { font-size:11px; color:var(--text-muted); margin-top:-6px; }
+        .epg-quick-modal label { font-size:11px; color:var(--text-muted); text-transform:uppercase; letter-spacing:0.5px; display:block; margin-bottom:4px; }
+        .epg-quick-modal input[type=number], .epg-quick-modal select { width:100%; padding:7px 10px; background:var(--bg-surface); border:1px solid var(--border-subtle); border-radius:var(--radius-sm); color:var(--text-primary); font-size:13px; font-family:'Outfit',sans-serif; outline:none; }
+        .epg-quick-modal input[type=number]:focus, .epg-quick-modal select:focus { border-color:var(--accent-orange); }
+        .epg-quick-modal .epg-qm-check-row { display:flex; align-items:center; gap:8px; }
+        .epg-quick-modal .epg-qm-actions { display:flex; gap:8px; justify-content:flex-end; margin-top:4px; }
+
         /* YouTube parent channel root row (Session 38) */
         .ch-yt-parent-group { margin-bottom: 8px; }
         .ch-yt-parent-header { display: flex; align-items: center; gap: 10px; padding: 8px 12px; background: var(--bg-surface); border: 1px solid var(--accent-orange); border-radius: var(--radius); cursor: pointer; user-select: none; transition: border-color 0.15s; }
@@ -1044,6 +1063,15 @@
                             </select>
                         </div>
 
+                        <!-- WatchDawg Source Picker (shown for watchdawg source type) — Session 40 -->
+                        <div id="epgModalWatchdawgSourceRow" style="display:none;">
+                            <label style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;">Source Channel <span style="font-weight:400;">(leave on All Sources to use genre filter)</span></label>
+                            <select id="epgModalWatchdawgSource" onchange="onWatchdawgSourceChange()" style="width:100%;margin-top:4px;padding:7px 10px;background:var(--bg-surface);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);color:var(--text-primary);font-size:13px;font-family:'Outfit',sans-serif;outline:none;">
+                                <option value="">All Sources</option>
+                            </select>
+                            <div style="font-size:11px;color:var(--text-muted);margin-top:4px;">Pin this EPG channel to one specific WatchDawg source, or leave on All Sources and use the Genre Filter below to pull from multiple sources at once.</div>
+                        </div>
+
                         <!-- Genre Filter -->
                         <div id="epgModalGenreRow">
                             <label style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;">Genre Filter <span style="font-weight:400;">(leave empty = all genres)</span></label>
@@ -1639,6 +1667,15 @@
                     <button class="lock-toggle-btn ${ch.locked?'locked':''}" onclick="toggleChannelLock(${ch.id},${ch.locked})">${ch.locked?'&#x1F512;':'&#x1F513;'}</button>
                     <button class="toggle-switch ${ch.enabled?'active':''}" onclick="toggleChannel(${ch.id},${!ch.enabled})" title="${ch.enabled?'Disable':'Enable'}"></button>
                     <button class="btn-icon btn-icon-danger" onclick="deleteChannel(${ch.id},'${escapeHtml(ch.name).replace(/'/g,"\\'")}')">&#x1F5D1;</button>
+                    <button class="btn-epg ${ch.locked?'adult':''}"
+                        title="${ch.locked?'Add to Adult EPG (PIN required)':'Add to Main EPG'}"
+                        data-chid="${ch.id}"
+                        data-chname="${escapeHtml(ch.name)}"
+                        data-genres="${escapeHtml(ch.genre_tags||'')}"
+                        data-locked="${ch.locked?'true':'false'}"
+                        onclick="openEpgQuickModalFromBtn(this)">
+                        ${ch.locked?'&#x1F512; Adult EPG':'&#x1F4FA; EPG'}
+                    </button>
                 </div>
             </div>`;
         }
@@ -3651,6 +3688,29 @@
         onEpgSourceTypeChange();
         await populatePlexLibraryDropdown();
 
+        if (ch.source_type === 'watchdawg') {
+            // loadWatchdawgSources is already called by onEpgSourceTypeChange above.
+            // After sources load, restore the pinned source selection if one was set.
+            if (ch.watchdawg_source_id) {
+                // Give the async load a moment then set the value
+                setTimeout(() => {
+                    const sel = document.getElementById('epgModalWatchdawgSource');
+                    sel.value = String(ch.watchdawg_source_id);
+                    // Reload genre tags for the selected source
+                    loadWatchdawgGenres(ch.watchdawg_source_id).then(() => {
+                        if (ch.genre_filter) {
+                            document.getElementById('epgModalGenre').value = ch.genre_filter;
+                        }
+                    });
+                }, 800);
+            } else if (ch.genre_filter) {
+                // All Sources selected — set genre after genres load
+                setTimeout(() => {
+                    document.getElementById('epgModalGenre').value = ch.genre_filter;
+                }, 800);
+            }
+        }
+
         if (ch.plex_library_key) {
             document.getElementById('epgModalPlexLibrary').value = ch.plex_library_key;
             await loadEpgModalGenres();
@@ -3667,19 +3727,86 @@
     }
 
     function onEpgTypeChange() {
-        // No field visibility change needed for type — all fields apply to both
+        // When epg type changes, reload the WatchDawg source list if that source type is active
+        const sourceType = document.getElementById('epgModalSourceType').value;
+        if (sourceType === 'watchdawg') {
+            loadWatchdawgSources();
+        }
     }
 
     function onEpgSourceTypeChange() {
         const sourceType = document.getElementById('epgModalSourceType').value;
         const isPlexType = sourceType === 'plex_movie' || sourceType === 'plex_tv';
+        const isWatchdawg = sourceType === 'watchdawg';
         const isTv = sourceType === 'plex_tv';
         const isIptv = sourceType === 'iptv_favorites';
 
         document.getElementById('epgModalPlexLibraryRow').style.display = isPlexType ? 'block' : 'none';
+        // Session 40: show WatchDawg source picker only for watchdawg type
+        document.getElementById('epgModalWatchdawgSourceRow').style.display = isWatchdawg ? 'block' : 'none';
         document.getElementById('epgModalGenreRow').style.display = isIptv ? 'none' : 'block';
         document.getElementById('epgModalEpBudgetRow').style.display = isTv ? 'block' : 'none';
         document.getElementById('epgModalRotationRow').style.display = isIptv ? 'none' : 'block';
+
+        // Load WatchDawg sources and genres when switching to watchdawg type
+        if (isWatchdawg) {
+            loadWatchdawgSources();
+        }
+        // Reset genre dropdown when switching away from watchdawg or plex
+        if (!isPlexType && !isWatchdawg) {
+            document.getElementById('epgModalGenre').innerHTML = '<option value="">All Genres</option>';
+        }
+    }
+
+    // Session 40: load WatchDawg source channels into the picker dropdown
+    async function loadWatchdawgSources() {
+        const epgType = document.getElementById('epgModalType').value;
+        const sel = document.getElementById('epgModalWatchdawgSource');
+        sel.innerHTML = '<option value="">Loading sources...</option>';
+        try {
+            const res = await fetch(`/epg/watchdawg-sources?epg_type=${epgType}`);
+            const data = await res.json();
+            const sources = data.sources || [];
+            if (sources.length === 0) {
+                sel.innerHTML = '<option value="">No sources with resolved videos found</option>';
+            } else {
+                sel.innerHTML = '<option value="">All Sources</option>' +
+                    sources.map(s =>
+                        `<option value="${s.id}">${s.name} (${s.video_count} videos${s.genre_tags ? ' · ' + s.genre_tags : ''})</option>`
+                    ).join('');
+            }
+        } catch(e) {
+            sel.innerHTML = '<option value="">All Sources</option>';
+        }
+        // After loading sources, load genres for the "All Sources" selection
+        await loadWatchdawgGenres(null);
+    }
+
+    // Session 40: called when the user changes the WatchDawg source picker
+    async function onWatchdawgSourceChange() {
+        const sourceId = document.getElementById('epgModalWatchdawgSource').value;
+        await loadWatchdawgGenres(sourceId || null);
+    }
+
+    // Session 40: populate genre dropdown from WatchDawg channel genre_tags
+    async function loadWatchdawgGenres(sourceId) {
+        const epgType = document.getElementById('epgModalType').value;
+        const genreSel = document.getElementById('epgModalGenre');
+        let url = `/epg/watchdawg-genres?epg_type=${epgType}`;
+        if (sourceId) url += `&source_id=${sourceId}`;
+        try {
+            const res = await fetch(url);
+            const data = await res.json();
+            const genres = data.genres || [];
+            if (genres.length === 0) {
+                genreSel.innerHTML = '<option value="">All Genres (no tags found)</option>';
+            } else {
+                genreSel.innerHTML = '<option value="">All Genres</option>' +
+                    genres.map(g => `<option value="${g}">${g}</option>`).join('');
+            }
+        } catch(e) {
+            genreSel.innerHTML = '<option value="">All Genres</option>';
+        }
     }
 
     async function populatePlexLibraryDropdown() {
@@ -3717,6 +3844,8 @@
         const channelId = document.getElementById('epgModalChannelId').value;
         const isEdit = !!channelId;
 
+        const watchdawgSourceRaw = document.getElementById('epgModalWatchdawgSource').value;
+
         const payload = {
             channel_number: parseInt(document.getElementById('epgModalNumber').value),
             name: document.getElementById('epgModalName').value.trim(),
@@ -3729,6 +3858,8 @@
             primetime_boost: document.getElementById('epgModalPrimetime').checked,
             logo_url: document.getElementById('epgModalLogo').value.trim() || null,
             enabled: true,
+            // Session 40: include watchdawg_source_id (null = all sources)
+            watchdawg_source_id: watchdawgSourceRaw ? parseInt(watchdawgSourceRaw) : null,
         };
 
         if (!payload.name) { alert('Channel name is required.'); return; }
@@ -3812,6 +3943,153 @@ Click "Rebuild Schedules" to generate.`);
             setTimeout(loadEpgPage, 100);
         }
     });
+    </script>
+
+    <!-- ================================================================
+         Add to EPG Quick Modal — Session 40
+         Triggered from channel card "📺 EPG" / "🔒 Adult EPG" buttons.
+         Unlocked channels → Main EPG. Locked channels → Adult EPG (PIN gated).
+         ================================================================ -->
+    <div class="epg-quick-modal-overlay" id="epgQuickModalOverlay" onclick="if(event.target===this)closeEpgQuickModal()">
+        <div class="epg-quick-modal">
+            <h4 id="epgQmTitle">📺 Add to EPG</h4>
+            <div class="epg-qm-meta" id="epgQmMeta"></div>
+
+            <input type="hidden" id="epgQmChannelId">
+            <input type="hidden" id="epgQmEpgType">
+            <input type="hidden" id="epgQmGenreTags">
+
+            <div>
+                <label>Channel Number</label>
+                <input type="number" id="epgQmNumber" min="1" max="9999" placeholder="101">
+            </div>
+
+            <div>
+                <label>Rotation Style</label>
+                <select id="epgQmRotation">
+                    <option value="shuffle">Shuffle — random order, reshuffled each loop</option>
+                    <option value="sequential">Sequential — plays in order, loops at end</option>
+                </select>
+            </div>
+
+            <div class="epg-qm-check-row">
+                <input type="checkbox" id="epgQmPrimetime" style="accent-color:var(--accent-orange);width:16px;height:16px;">
+                <div>
+                    <label for="epgQmPrimetime" style="text-transform:none;letter-spacing:0;font-size:13px;cursor:pointer;margin:0;">Primetime Boost (7–11 PM)</label>
+                    <div style="font-size:11px;color:var(--text-muted);">Fills evening slots with highest-rated content.</div>
+                </div>
+            </div>
+
+            <div class="epg-qm-actions">
+                <button class="btn btn-sm" onclick="closeEpgQuickModal()">Cancel</button>
+                <button class="btn btn-primary" onclick="confirmAddToEpg()">Add to EPG</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+    // ================================================================
+    // Add to EPG — Quick Modal JS (Session 40)
+    // ================================================================
+
+    // Wrapper called from channel card button — reads channel info from data
+    // attributes so apostrophes and special chars in names never break JS syntax.
+    function openEpgQuickModalFromBtn(btn) {
+        const channelId  = parseInt(btn.dataset.chid);
+        const channelName = btn.dataset.chname || '';
+        const genreTags  = btn.dataset.genres || '';
+        const locked     = btn.dataset.locked === 'true';
+        openEpgQuickModal(channelId, channelName, genreTags, locked);
+    }
+
+    // Open the mini-modal for a specific channel card.
+    // locked=true  → Adult EPG (orange header, CH# starts at 901)
+    // locked=false → Main EPG  (blue header, CH# starts at 101)
+    async function openEpgQuickModal(channelId, channelName, genreTags, locked) {
+        // Adult EPG requires PIN to be unlocked
+        if (locked && !_isUnlocked) {
+            alert('Unlock with your PIN first to add content to the Adult EPG.');
+            return;
+        }
+
+        const epgType = locked ? 'adult' : 'main';
+        const icon    = locked ? '🔒' : '📺';
+
+        document.getElementById('epgQmChannelId').value  = channelId;
+        document.getElementById('epgQmEpgType').value    = epgType;
+        document.getElementById('epgQmGenreTags').value  = genreTags || '';
+        document.getElementById('epgQmTitle').textContent = `${icon} Add to ${locked ? 'Adult ' : ''}EPG`;
+        document.getElementById('epgQmMeta').textContent  = channelName + (genreTags ? '  ·  ' + genreTags : '');
+        document.getElementById('epgQmPrimetime').checked = false;
+        document.getElementById('epgQmRotation').value    = 'shuffle';
+
+        // Auto-suggest next available channel number for this EPG type
+        try {
+            const res  = await fetch(`/epg/next-channel-number?epg_type=${epgType}`);
+            const data = await res.json();
+            document.getElementById('epgQmNumber').value = data.next_channel_number;
+        } catch(e) {
+            document.getElementById('epgQmNumber').value = locked ? 901 : 101;
+        }
+
+        document.getElementById('epgQuickModalOverlay').classList.add('active');
+    }
+
+    function closeEpgQuickModal() {
+        document.getElementById('epgQuickModalOverlay').classList.remove('active');
+    }
+
+    async function confirmAddToEpg() {
+        const channelId  = parseInt(document.getElementById('epgQmChannelId').value);
+        const epgType    = document.getElementById('epgQmEpgType').value;
+        const genreTags  = document.getElementById('epgQmGenreTags').value.trim();
+        const chNumber   = parseInt(document.getElementById('epgQmNumber').value);
+        const rotation   = document.getElementById('epgQmRotation').value;
+        const primetime  = document.getElementById('epgQmPrimetime').checked;
+
+        if (!chNumber || chNumber < 1) { alert('Enter a valid channel number.'); return; }
+
+        // Derive a display name from the channel card — stored in epgQmMeta
+        // Format: "Channel Name  ·  genre tags"  — take the part before the ·
+        const meta = document.getElementById('epgQmMeta').textContent;
+        const channelName = meta.split('·')[0].trim() || 'EPG Channel';
+
+        const payload = {
+            channel_number:      chNumber,
+            name:                channelName,
+            epg_type:            epgType,
+            source_type:         'watchdawg',
+            watchdawg_source_id: channelId,
+            genre_filter:        genreTags || null,
+            rotation_style:      rotation,
+            primetime_boost:     primetime,
+            episodes_per_day:    2,
+            enabled:             true,
+            logo_url:            null,
+            plex_library_key:    null,
+        };
+
+        try {
+            const res  = await fetch('/epg/channels', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+            });
+            const data = await res.json();
+            if (!res.ok) { alert('Error: ' + (data.detail || res.statusText)); return; }
+
+            if (typeof logMessage === 'function') {
+                logMessage(`CH ${chNumber} "${channelName}" added to ${epgType === 'adult' ? 'Adult ' : ''}EPG — schedule building in background.`, 'success');
+            }
+            closeEpgQuickModal();
+
+            // If the EPG page is currently visible, refresh it
+            if (document.getElementById('page-epg') &&
+                document.getElementById('page-epg').classList.contains('active')) {
+                if (typeof loadEpgChannels === 'function') loadEpgChannels(epgType);
+            }
+        } catch(e) { alert('Error: ' + e.message); }
+    }
     </script>
 </body>
 </html>

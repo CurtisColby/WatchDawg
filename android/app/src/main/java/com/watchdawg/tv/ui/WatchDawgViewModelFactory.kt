@@ -6,16 +6,17 @@ import com.watchdawg.tv.Graph
 import com.watchdawg.tv.ui.auth.PinViewModel
 import com.watchdawg.tv.ui.continuewatching.ContinueWatchingViewModel
 import com.watchdawg.tv.ui.home.HomeViewModel
-import com.watchdawg.tv.ui.adult.AdultViewModel
-import com.watchdawg.tv.ui.livetv.LiveTvViewModel
 import com.watchdawg.tv.ui.movies.MoviesViewModel
 import com.watchdawg.tv.ui.library.FavoritesViewModel
-import com.watchdawg.tv.ui.music.MusicViewModel
 import com.watchdawg.tv.ui.library.LibraryViewModel
+import com.watchdawg.tv.ui.epg.EpgViewModel
 import com.watchdawg.tv.ui.movies.MovieDetailViewModel
 import com.watchdawg.tv.ui.player.PlayerViewModel
 import com.watchdawg.tv.ui.series.SeriesViewModel
 import com.watchdawg.tv.ui.tv.TVViewModel
+import com.watchdawg.tv.ui.adult.AdultViewModel
+import com.watchdawg.tv.ui.livetv.LiveTvViewModel
+import com.watchdawg.tv.ui.music.MusicViewModel
 import com.watchdawg.tv.ui.watchlater.WatchLaterViewModel
 
 /**
@@ -27,10 +28,6 @@ import com.watchdawg.tv.ui.watchlater.WatchLaterViewModel
  * SeriesViewModel is hoisted at WatchDawgRoot level (created once, shared by
  * TVScreen and EpisodeListScreen) so series grid state survives genre pill
  * switches without reloading from the network.
- *
- * Milestone I (Session 34):
- * Added: LiveTvViewModel (Live TV screen — hoisted at WatchDawgRoot level so
- *        channel list survives Back → re-enter without reloading).
  */
 class WatchDawgViewModelFactory : ViewModelProvider.Factory {
 
@@ -43,12 +40,6 @@ class WatchDawgViewModelFactory : ViewModelProvider.Factory {
                 MoviesViewModel(Graph.repository) as T
             modelClass.isAssignableFrom(TVViewModel::class.java) ->
                 TVViewModel(Graph.repository) as T
-            modelClass.isAssignableFrom(LiveTvViewModel::class.java) ->
-                LiveTvViewModel(Graph.repository) as T
-            modelClass.isAssignableFrom(MusicViewModel::class.java) ->
-                MusicViewModel(Graph.repository) as T
-            modelClass.isAssignableFrom(AdultViewModel::class.java) ->
-                AdultViewModel(Graph.repository) as T
             modelClass.isAssignableFrom(PlayerViewModel::class.java) ->
                 PlayerViewModel(
                     Graph.repository,
@@ -68,6 +59,14 @@ class WatchDawgViewModelFactory : ViewModelProvider.Factory {
                 SeriesViewModel(Graph.repository) as T
             modelClass.isAssignableFrom(MovieDetailViewModel::class.java) ->
                 MovieDetailViewModel(Graph.repository) as T
+            modelClass.isAssignableFrom(MusicViewModel::class.java) ->
+                MusicViewModel(Graph.repository) as T
+            modelClass.isAssignableFrom(AdultViewModel::class.java) ->
+                AdultViewModel(Graph.repository) as T
+            modelClass.isAssignableFrom(LiveTvViewModel::class.java) ->
+                LiveTvViewModel(Graph.repository) as T
+            modelClass.isAssignableFrom(EpgViewModel::class.java) ->
+                EpgViewModel() as T
             else -> throw IllegalArgumentException("Unknown ViewModel: ${modelClass.name}")
         }
     }

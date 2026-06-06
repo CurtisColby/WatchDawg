@@ -31,6 +31,12 @@ Session 35 additions:
                                Migration: ALTER TABLE live_tv_channels ADD COLUMN is_favorite INTEGER DEFAULT 0
 - LiveTvChannel.sort_order   — group sort priority (lower = shown first in sidebar/grid).
                                Migration: ALTER TABLE live_tv_channels ADD COLUMN sort_order INTEGER DEFAULT 999
+
+Session 38 additions:
+- Channel.parent_channel_id  — links playlist child channels back to the YouTube channel
+                               root that spawned them during full-channel enumeration.
+                               NULL for all standalone channels (all existing data unaffected).
+                               Migration: ALTER TABLE channels ADD COLUMN parent_channel_id INTEGER DEFAULT NULL
 """
 
 import datetime
@@ -83,6 +89,12 @@ class Channel(Base):
     locked = Column(Boolean, nullable=False, default=False)
     category = Column(String(50), nullable=False, default="general")
     genre_tags = Column(Text, nullable=False, default="")
+
+    # Session 38: links a playlist child back to the YouTube root channel that
+    # enumerated it.  NULL for all standalone channels and all pre-existing rows.
+    # Migration: ALTER TABLE channels ADD COLUMN parent_channel_id INTEGER DEFAULT NULL
+    parent_channel_id = Column(Integer, nullable=True, default=None)
+
     last_scraped_at = Column(DateTime, nullable=True)
     last_scrape_count = Column(Integer, nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
@@ -91,7 +103,8 @@ class Channel(Base):
         return (
             f"<Channel id={self.id} name='{self.name}' "
             f"type={self.channel_type} category={self.category} "
-            f"tags='{self.genre_tags}' enabled={self.enabled} locked={self.locked}>"
+            f"tags='{self.genre_tags}' enabled={self.enabled} locked={self.locked} "
+            f"parent={self.parent_channel_id}>"
         )
 
 

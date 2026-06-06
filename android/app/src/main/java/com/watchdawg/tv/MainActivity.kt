@@ -62,6 +62,8 @@ import com.watchdawg.tv.ui.home.HomeViewModel
 import com.watchdawg.tv.ui.library.FavoritesViewModel
 import com.watchdawg.tv.ui.library.LibraryScreen
 import com.watchdawg.tv.ui.library.LibraryViewModel
+import com.watchdawg.tv.ui.epg.EpgScreen
+import com.watchdawg.tv.ui.epg.EpgViewModel
 import com.watchdawg.tv.ui.livetv.LiveTvScreen
 import com.watchdawg.tv.ui.livetv.LiveTvViewModel
 import com.watchdawg.tv.ui.movies.MovieDetailScreen
@@ -153,6 +155,8 @@ private fun WatchDawgRoot(onFinish: () -> Unit) {
     val adultViewModel:   AdultViewModel   = viewModel(factory = factory)
     // Milestone I — Live TV: hoisted so channel list survives Back → re-enter
     val liveTvViewModel:  LiveTvViewModel  = viewModel(factory = factory)
+    // Session 39 — EPG: hoisted so channel index survives player → back → surf
+    val epgViewModel:     EpgViewModel     = viewModel(factory = factory)
 
     var showPinPad     by remember { mutableStateOf(false) }
     var showExitDialog by remember { mutableStateOf(false) }
@@ -421,6 +425,39 @@ private fun WatchDawgRoot(onFinish: () -> Unit) {
                 )
             }
 
+            // ── EPG ──────────────────────────────────────────────────────────
+            composable(Routes.EPG) {
+                EpgScreen(
+                    viewModel = epgViewModel,
+                    onPlaySlot = { slot, channelId, offsetSeconds ->
+                        // Plex / IPTV slots — play direct URL queue as before.
+                        // WatchDawg slots are handled by onPlayById below.
+                        epgViewModel.setActiveChannel(channelId)
+                        val channels = epgViewModel.state.value.channels
+                        val allUrls = channels.mapNotNull { ch ->
+                            epgViewModel.getCurrentSlot(ch)?.streamUrl?.takeIf { it.isNotBlank() }
+                        }
+                        val tappedUrl = slot.streamUrl ?: ""
+                        val startIdx = allUrls.indexOf(tappedUrl).takeIf { it >= 0 } ?: 0
+                        val queue = allUrls.ifEmpty { listOfNotNull(tappedUrl.takeIf { it.isNotBlank() }) }
+                        QueueHolder.setUrlQueue(queue, startIdx, isEpg = true, resumeMs = offsetSeconds * 1000L)
+                        navController.navigate(Routes.playerDirectQueue(startIdx))
+                    },
+                    onPlayById = { videoId, hlsMode, offsetSeconds ->
+                        // Session 40: WatchDawg EPG slots — resolve fresh via normal
+                        // feed path. Store slot startTime so PlayerViewModel can
+                        // recompute the offset after yt-dlp finishes (corrects for
+                        // the 10-20s resolve delay that makes tap-time offset stale).
+                        epgViewModel.setActiveChannel(videoId)
+                        QueueHolder.setIdQueue(listOf(videoId), 0, hls = hlsMode)
+                        QueueHolder.resumePositionMs = offsetSeconds * 1000L
+                        // epgSlotStartTimeUtc is set by EpgScreen via the slot object
+                        navController.navigate(Routes.player(videoId, 0))
+                    },
+                    onBack = { navController.popBackStack() },
+                )
+            }
+
             // ── Settings ──────────────────────────────────────────────────────
             composable(Routes.SETTINGS) {
                 SettingsScreen()
@@ -490,10 +527,14 @@ private fun WatchDawgRoot(onFinish: () -> Unit) {
             ) { entry ->
                 val startIndex = entry.arguments?.getInt("startIndex") ?: 0
                 val urls = QueueHolder.urlQueue
+                val isEpg = QueueHolder.isEpgQueue
+                // Session 38: read resume position set by EPG onPlaySlot (offsetSeconds).
+                // For non-EPG direct queues this is always 0L — no change in behaviour.
+                val resumeMs = QueueHolder.resumePositionMs.also { QueueHolder.resumePositionMs = 0L }
                 val vm: PlayerViewModel = viewModel(factory = factory)
                 PlayerScreen(
                     viewModel = vm,
-                    startMode = PlayerStartMode.DirectQueue(urls, startIndex),
+                    startMode = PlayerStartMode.DirectQueue(urls, startIndex, resumeMs),
                     onExit  = {
                         Graph.playerManager(context).pause()
                         navController.popBackStack()
@@ -502,6 +543,45 @@ private fun WatchDawgRoot(onFinish: () -> Unit) {
                         Graph.playerManager(context).pause()
                         navController.popBackStack()
                     },
+                    // Session 38 — EPG channel surfing:
+                    // When launched from the EPG, onSurfNext/Prev call epgViewModel
+                    // to get the adjacent channel's current slot, update the queue in
+                    // QueueHolder, and re-navigate so the player loads the new stream.
+                    // For all non-EPG direct queues these are null → queue surfing used.
+                    onSurfNext = if (isEpg) ({
+                        val slot = epgViewModel.getAdjacentSlot(+1)
+                        if (slot != null && !slot.streamUrl.isNullOrBlank()) {
+                            val channels = epgViewModel.state.value.channels
+                            val allUrls = channels.mapNotNull { ch ->
+                                epgViewModel.getCurrentSlot(ch)?.streamUrl?.takeIf { it.isNotBlank() }
+                            }
+                            val newIdx = allUrls.indexOf(slot.streamUrl).takeIf { it >= 0 } ?: 0
+                            val queue = allUrls.ifEmpty { listOf(slot.streamUrl) }
+                            QueueHolder.setUrlQueue(queue, newIdx, isEpg = true)
+                            // Session 38 fix: popUpTo replaces the current player entry
+                            // instead of pushing a new one — prevents back-stack buildup
+                            // where each surf adds an extra Back press to get back to EPG.
+                            navController.navigate(Routes.playerDirectQueue(newIdx)) {
+                                popUpTo(Routes.PLAYER_DIRECT_QUEUE) { inclusive = true }
+                            }
+                        }
+                    }) else null,
+                    onSurfPrev = if (isEpg) ({
+                        val slot = epgViewModel.getAdjacentSlot(-1)
+                        if (slot != null && !slot.streamUrl.isNullOrBlank()) {
+                            val channels = epgViewModel.state.value.channels
+                            val allUrls = channels.mapNotNull { ch ->
+                                epgViewModel.getCurrentSlot(ch)?.streamUrl?.takeIf { it.isNotBlank() }
+                            }
+                            val newIdx = allUrls.indexOf(slot.streamUrl).takeIf { it >= 0 } ?: 0
+                            val queue = allUrls.ifEmpty { listOf(slot.streamUrl) }
+                            QueueHolder.setUrlQueue(queue, newIdx, isEpg = true)
+                            // Session 38 fix: same popUpTo pattern as onSurfNext.
+                            navController.navigate(Routes.playerDirectQueue(newIdx)) {
+                                popUpTo(Routes.PLAYER_DIRECT_QUEUE) { inclusive = true }
+                            }
+                        }
+                    }) else null,
                 )
             }
         }

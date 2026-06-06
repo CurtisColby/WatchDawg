@@ -16,7 +16,7 @@ from fastapi.responses import HTMLResponse
 router = APIRouter(tags=["web_ui"])
 
 # Path to the templates directory
-TEMPLATE_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "templates")
+TEMPLATE_DIR = os.path.dirname(os.path.dirname(__file__))
 
 
 @router.get("/", response_class=HTMLResponse)

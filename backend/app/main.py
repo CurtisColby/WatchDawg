@@ -173,6 +173,94 @@ async def _run_migrations():
             """))
             logger.info("Migration checked: live_tv_sources table")
 
+            # ----------------------------------------------------------------
+            # Session 39: plex_config table
+            # ----------------------------------------------------------------
+            await db.execute(text("""
+                CREATE TABLE IF NOT EXISTS plex_config (
+                    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                    plex_url_encrypted  TEXT NOT NULL,
+                    token_encrypted     TEXT NOT NULL,
+                    server_name         TEXT,
+                    connected_at        DATETIME NOT NULL,
+                    last_verified_at    DATETIME
+                )
+            """))
+            logger.info("Migration checked: plex_config table")
+
+            # ----------------------------------------------------------------
+            # Session 39: epg_channels table
+            # ----------------------------------------------------------------
+            await db.execute(text("""
+                CREATE TABLE IF NOT EXISTS epg_channels (
+                    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                    channel_number    INTEGER NOT NULL UNIQUE,
+                    name              TEXT NOT NULL,
+                    epg_type          TEXT NOT NULL DEFAULT 'main',
+                    source_type       TEXT NOT NULL,
+                    plex_library_key  TEXT,
+                    genre_filter      TEXT,
+                    episodes_per_day  INTEGER NOT NULL DEFAULT 2,
+                    rotation_style    TEXT NOT NULL DEFAULT 'shuffle',
+                    primetime_boost   INTEGER NOT NULL DEFAULT 0,
+                    logo_url          TEXT,
+                    enabled           INTEGER NOT NULL DEFAULT 1,
+                    sort_order        INTEGER NOT NULL DEFAULT 101,
+                    created_at        DATETIME NOT NULL
+                )
+            """))
+            await db.execute(text("""
+                CREATE INDEX IF NOT EXISTS ix_epg_channels_epg_type
+                ON epg_channels (epg_type)
+            """))
+            await db.execute(text("""
+                CREATE INDEX IF NOT EXISTS ix_epg_channels_number
+                ON epg_channels (channel_number)
+            """))
+            logger.info("Migration checked: epg_channels table")
+
+            # ----------------------------------------------------------------
+            # Session 39: epg_schedules table
+            # ----------------------------------------------------------------
+            await db.execute(text("""
+                CREATE TABLE IF NOT EXISTS epg_schedules (
+                    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                    epg_channel_id    INTEGER NOT NULL REFERENCES epg_channels(id) ON DELETE CASCADE,
+                    title             TEXT NOT NULL DEFAULT '',
+                    subtitle          TEXT DEFAULT '',
+                    description       TEXT DEFAULT '',
+                    thumbnail_url     TEXT DEFAULT '',
+                    stream_url        TEXT NOT NULL DEFAULT '',
+                    source_type       TEXT NOT NULL DEFAULT '',
+                    source_id         TEXT DEFAULT '',
+                    start_time        DATETIME NOT NULL,
+                    end_time          DATETIME NOT NULL,
+                    duration_seconds  INTEGER NOT NULL DEFAULT 0,
+                    created_at        DATETIME NOT NULL
+                )
+            """))
+            await db.execute(text("""
+                CREATE INDEX IF NOT EXISTS ix_epg_schedules_channel_time
+                ON epg_schedules (epg_channel_id, start_time, end_time)
+            """))
+            logger.info("Migration checked: epg_schedules table")
+
+            # ----------------------------------------------------------------
+            # Session 39: epg_tv_pointers table
+            # Tracks episode advancement per (channel, show) across rebuilds
+            # ----------------------------------------------------------------
+            await db.execute(text("""
+                CREATE TABLE IF NOT EXISTS epg_tv_pointers (
+                    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                    epg_channel_id    INTEGER NOT NULL,
+                    show_rating_key   TEXT NOT NULL,
+                    episode_index     INTEGER NOT NULL DEFAULT 0,
+                    updated_at        DATETIME NOT NULL,
+                    UNIQUE(epg_channel_id, show_rating_key)
+                )
+            """))
+            logger.info("Migration checked: epg_tv_pointers table")
+
             await db.commit()
             logger.info("All migrations complete.")
 
@@ -297,6 +385,8 @@ from app.routers.proxy import router as proxy_router            # noqa: E402
 from app.routers.watchlist import router as watchlist_router    # noqa: E402
 from app.routers.history import router as history_router        # noqa: E402
 from app.routers.live_tv import router as live_tv_router        # noqa: E402
+from app.routers.plex import router as plex_router              # noqa: E402
+from app.routers.epg import router as epg_router                # noqa: E402
 from app.routers.web_ui import router as web_ui_router          # noqa: E402
 
 app.include_router(health_router)
@@ -311,6 +401,8 @@ app.include_router(proxy_router)
 app.include_router(watchlist_router)
 app.include_router(history_router)
 app.include_router(live_tv_router)
+app.include_router(plex_router)
+app.include_router(epg_router)
 
 # Web UI must be registered LAST so its "/" route doesn't shadow the API
 app.include_router(web_ui_router)

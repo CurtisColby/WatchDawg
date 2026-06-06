@@ -92,7 +92,7 @@ sealed class PlayerStartMode {
         val lockedSource: Boolean = false,
     ) : PlayerStartMode()
     data class DirectSingle(val url: String, val title: String) : PlayerStartMode()
-    data class DirectQueue(val urls: List<String>, val startIndex: Int) : PlayerStartMode()
+    data class DirectQueue(val urls: List<String>, val startIndex: Int, val startMs: Long = 0L) : PlayerStartMode()
 }
 
 // ── Hold-seek constants ───────────────────────────────────────────────────────
@@ -111,6 +111,12 @@ fun PlayerScreen(
     startMode: PlayerStartMode,
     onExit: () -> Unit,
     onStop: () -> Unit,
+    // Session 38 — EPG channel surfing. When non-null, D-pad Down/Up call these
+    // lambdas instead of viewModel.next()/previous(). MainActivity wires them up
+    // with EPG logic (getAdjacentSlot + re-navigate). Null for all non-EPG screens
+    // so existing queue-based surfing is completely unaffected.
+    onSurfNext: (() -> Unit)? = null,
+    onSurfPrev: (() -> Unit)? = null,
 ) {
     val context              = LocalContext.current
     val state                by viewModel.state.collectAsStateWithLifecycle()
@@ -134,6 +140,7 @@ fun PlayerScreen(
     var saveBubble         by remember { mutableStateOf(false) }
     var deleteBubble       by remember { mutableStateOf(false) }
     var speedBubble        by remember { mutableStateOf<String?>(null) }  // Milestone E
+    var channelSurfBubble  by remember { mutableStateOf<String?>(null) }  // Session 38
     var okDownTime         by remember { mutableLongStateOf(0L) }
     val longPressMs  = 500L
     val autoHideMs   = 7_000L
@@ -212,11 +219,12 @@ fun PlayerScreen(
     }
 
     // ── Bubble auto-dismiss ───────────────────────────────────────────────────
-    LaunchedEffect(seekBubble)   { if (seekBubble != null)  { delay(900);  seekBubble = null  } }
-    LaunchedEffect(favBubble)    { if (favBubble)    { delay(1200); favBubble  = false } }
-    LaunchedEffect(saveBubble)   { if (saveBubble)   { delay(1200); saveBubble = false } }
-    LaunchedEffect(deleteBubble) { if (deleteBubble) { delay(1200); deleteBubble = false } }
-    LaunchedEffect(speedBubble)  { if (speedBubble != null) { delay(1200); speedBubble = null } }
+    LaunchedEffect(seekBubble)        { if (seekBubble != null)        { delay(900);  seekBubble = null  } }
+    LaunchedEffect(favBubble)         { if (favBubble)                 { delay(1200); favBubble  = false } }
+    LaunchedEffect(saveBubble)        { if (saveBubble)                { delay(1200); saveBubble = false } }
+    LaunchedEffect(deleteBubble)      { if (deleteBubble)              { delay(1200); deleteBubble = false } }
+    LaunchedEffect(speedBubble)       { if (speedBubble != null)       { delay(1200); speedBubble = null } }
+    LaunchedEffect(channelSurfBubble) { if (channelSurfBubble != null) { delay(800);  channelSurfBubble = null } }
     LaunchedEffect(state.ended)  { if (state.ended) onStop() }
 
     // ── Dynamic Tinting: extract dominant muted colour from thumbnail ─────────
@@ -267,7 +275,7 @@ fun PlayerScreen(
                 }
             }
             is PlayerStartMode.DirectSingle -> viewModel.startDirect(m.url, m.title)
-            is PlayerStartMode.DirectQueue  -> viewModel.startDirectQueue(m.urls, m.startIndex)
+            is PlayerStartMode.DirectQueue  -> viewModel.startDirectQueue(m.urls, m.startIndex, m.startMs)
         }
         playerSurfaceFocus.requestFocus()
     }
@@ -309,6 +317,13 @@ fun PlayerScreen(
                     // YouTube split (video-only + audio-only progressive MP4).
                     val baseUrl = Graph.serverPrefs.getBaseUrl().trimEnd('/')
                     playerManager.playDash("$baseUrl/resolve/$videoId/manifest.mpd", resumeMs)
+                }
+                url.contains(".mpd", ignoreCase = true) || url.contains("manifest.mpd", ignoreCase = true) -> {
+                    // Session 40: EPG WatchDawg slots return a /resolve/{id}/manifest.mpd URL.
+                    // Route through playDash() which uses STATE_READY listener for seekTo()
+                    // instead of ClippingConfiguration — ClippingConfiguration fails on DASH
+                    // manifests backed by YouTube progressive MP4 (CDN rejects byte-range seeks).
+                    playerManager.playDash(url, resumeMs)
                 }
                 else -> playerManager.play(url, resumeMs)
             }
@@ -459,8 +474,26 @@ fun PlayerScreen(
                             playerManager.player.play()
                             true
                         }
-                        Key.DirectionDown -> if (controlsVisible) false else { showControls(); true }
-                        Key.DirectionUp   -> { if (controlsVisible) hideControls() else showControls(); true }
+                        Key.DirectionDown -> if (controlsVisible) false else {
+                            // Session 38: Down surfs to next channel/video when controls hidden.
+                            // If onSurfNext is wired (EPG mode) call it — MainActivity handles
+                            // getAdjacentSlot + re-navigation. Otherwise fall back to queue next().
+                            if (onSurfNext != null) onSurfNext()
+                            else viewModel.next()
+                            channelSurfBubble = "▶▶"
+                            true
+                        }
+                        Key.DirectionUp -> {
+                            // Session 38: Up surfs to previous channel/video when controls hidden.
+                            // Up with controls visible still hides the overlay (existing behaviour).
+                            if (controlsVisible) hideControls()
+                            else {
+                                if (onSurfPrev != null) onSurfPrev()
+                                else viewModel.previous()
+                                channelSurfBubble = "◀◀"
+                            }
+                            true
+                        }
                         else -> false
                     }
                     else -> false
@@ -537,6 +570,9 @@ fun PlayerScreen(
                 Text("⚡ ${speedBubble}×", fontSize = 24.sp, color = WatchDawgColors.Orange)
             }
         }
+
+        // Session 38: channel surf bubble removed — surfing is now instant via
+        // FFmpeg streams so the directional arrow indicator is no longer needed.
 
         // ── Milestone E: Speed menu overlay ──────────────────────────────────
         // Shown above the control bar. D-pad navigable row of speed buttons.

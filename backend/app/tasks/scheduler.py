@@ -62,6 +62,9 @@ SCHEDULED_EXPIRED_LIMIT = 100
 # Live TV health probe interval (minutes)
 LIVE_TV_PROBE_INTERVAL_MINUTES = 15
 
+# EPG schedule rebuild interval (hours)
+EPG_REBUILD_INTERVAL_HOURS = 6
+
 
 async def scheduled_scrape():
     """
@@ -222,6 +225,22 @@ async def scheduled_live_tv_probe():
         logger.error(f"Scheduled live TV probe failed: {e}")
 
 
+async def scheduled_epg_rebuild():
+    """
+    EPG pseudo-channel schedule rebuild. Runs every EPG_REBUILD_INTERVAL_HOURS (6h).
+
+    Rebuilds 48-hour rolling schedules for all enabled EPG channels.
+    Channels with no content (bad genre filter, disconnected Plex) are skipped
+    with a warning — other channels are unaffected.
+    """
+    logger.info("Scheduled EPG schedule rebuild starting...")
+    try:
+        from app.routers.epg import rebuild_all_epg_schedules
+        await rebuild_all_epg_schedules()
+    except Exception as e:
+        logger.error(f"Scheduled EPG rebuild failed: {e}")
+
+
 def start_scheduler():
     """
     Start the background scheduler with configured intervals.
@@ -279,6 +298,16 @@ def start_scheduler():
         next_run_time=None,
     )
 
+    # EPG pseudo-channel schedule rebuild — every 6 hours
+    scheduler.add_job(
+        scheduled_epg_rebuild,
+        trigger=IntervalTrigger(hours=EPG_REBUILD_INTERVAL_HOURS),
+        id="epg_rebuild_job",
+        name="EPG Schedule Rebuild",
+        replace_existing=True,
+        next_run_time=None,
+    )
+
     scheduler.start()
     logger.info(
         f"Background scheduler started. "
@@ -289,6 +318,7 @@ def start_scheduler():
         f"Quality upgrade interval: {QUALITY_UPGRADE_INTERVAL_HOURS} hours "
         f"(chunk={QUALITY_UPGRADE_CHUNK_SIZE}, min={QUALITY_UPGRADE_MIN_HEIGHT}p). "
         f"Live TV probe interval: {LIVE_TV_PROBE_INTERVAL_MINUTES} minutes. "
+        f"EPG rebuild interval: {EPG_REBUILD_INTERVAL_HOURS} hours. "
         f"All jobs start on next tick (trigger manually for first run)."
     )
 

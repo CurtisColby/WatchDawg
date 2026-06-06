@@ -40,6 +40,7 @@ object Routes {
     const val LOCAL            = "local"
     const val ADULT            = "adult"
     const val SETTINGS         = "settings"
+    const val EPG               = "epg"
 
     // ── Sub-routes ────────────────────────────────────────────────────────────
 
@@ -125,5 +126,6 @@ enum class NavSection(val route: String, val label: String) {
     FAVORITES(Routes.FAVORITES, "Favorites"),
     LOCAL(Routes.LOCAL, "Local"),
     ADULT(Routes.ADULT, "Adult"),
+    EPG(Routes.EPG, "EPG"),
     SETTINGS(Routes.SETTINGS, "Settings"),
 }

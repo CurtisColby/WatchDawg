@@ -179,8 +179,7 @@ async def resolve_video(
         "browser",
         description=(
             "Client hint. 'tv' returns split video_url + audio_url for external player. "
-            "'browser' (default) returns a single combined stream URL, or split URLs "
-            "for Vimeo (which only serves HLS split streams)."
+            "'browser' (default) returns a single combined stream URL."
         ),
     ),
     db: AsyncSession = Depends(get_db_session),
@@ -195,12 +194,7 @@ async def resolve_video(
       with full audio+video sync.
 
     Browser clients (client=browser, default):
-      For YouTube and Reddit: returns a single combined stream URL.
-      For Vimeo: Vimeo exclusively serves HLS split streams (video-only + audio-only).
-        The standard resolver only captured the video track, leaving browsers muted.
-        This path now routes Vimeo through resolve_video_for_tv() so both stream_url
-        (video m3u8) and audio_url (audio m3u8) are returned. The web UI detects
-        audio_url and uses hls.js with a synced hidden <audio> element for playback.
+      Returns a single combined stream URL via the standard yt-dlp resolver.
     """
     resolver = ResolverService(db)
 
@@ -210,46 +204,6 @@ async def resolve_video(
             raise HTTPException(
                 status_code=404,
                 detail=f"Video {video_id} could not be resolved for TV playback.",
-            )
-        return result
-
-    # Bug 4 fix: for Vimeo sources, use the TV extractor on the browser path too.
-    # Vimeo only serves HLS split streams — the standard FORMAT_SELECTOR captures
-    # only the video track and discards the audio URL, leaving the browser player
-    # muted. resolve_video_for_tv() correctly returns both stream_url (video m3u8)
-    # and audio_url (audio m3u8). The web UI's _attachVimeoSplitVideo() handles the
-    # two-stream playback via hls.js + synced hidden <audio> element.
-    #
-    # This does NOT affect:
-    #  - Android TV: uses /manifest.mpd, never hits this branch
-    #  - YouTube browser: is_youtube check inside resolve_video_for_tv() takes the
-    #    same combined-stream path it always has; browser player already proxies it
-    #  - Reddit/other: returns combined stream with audio_url=None, plays normally
-    from sqlalchemy import select as _select
-    from app.models import Video as _Video
-
-    _stmt = _select(_Video).where(_Video.id == video_id)
-    _result = await db.execute(_stmt)
-    _video = _result.scalar_one_or_none()
-
-    _is_vimeo = (
-        _video is not None and (
-            _video.source_provider == "vimeo" or
-            "vimeo.com" in (_video.source_url or "")
-        )
-    )
-
-    if _is_vimeo:
-        logger.info(
-            f"Browser resolve: video {video_id} is Vimeo — routing through "
-            "TV extractor to capture split audio stream for web player"
-        )
-        result = await resolver.resolve_video_for_tv(video_id)
-        if result is None:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Video {video_id} could not be resolved. It may be unavailable, "
-                "private, geo-blocked, or was identified as a lower-scored duplicate.",
             )
         return result
 
@@ -325,7 +279,7 @@ async def resolve_video_dash_manifest(
     # Proxy both URLs through the backend so YouTube CDN auth headers are injected
     # correctly by /proxy/stream. ExoPlayer cannot send the required headers to
     # googlevideo.com directly — it would get a 403.
-    base_url = str(request.base_url).rstrip("/")
+    import os; base_url = os.environ.get("WATCHDAWG_BASE_URL", "").rstrip("/") or str(request.base_url).rstrip("/")
     proxied_video = f"{base_url}/proxy/stream?url={urllib.parse.quote(video_url, safe='')}"
 
     if audio_url:
@@ -413,7 +367,7 @@ async def resolve_video_seek(
             detail=f"Video {video_id} resolved but returned no stream URL.",
         )
 
-    base_url = str(request.base_url).rstrip("/")
+    import os; base_url = os.environ.get("WATCHDAWG_BASE_URL", "").rstrip("/") or str(request.base_url).rstrip("/")
     manifest_url = f"{base_url}/resolve/{video_id}/manifest.mpd"
     start_ms = t * 1000
 
@@ -463,7 +417,7 @@ async def resolve_video_playlist(
     audio_url = result.get("audio_url", "")
     title = result.get("title") or "WatchDawg"
 
-    base_url = str(request.base_url).rstrip("/")
+    import os; base_url = os.environ.get("WATCHDAWG_BASE_URL", "").rstrip("/") or str(request.base_url).rstrip("/")
     proxied_video = f"{base_url}/proxy/stream?url={urllib.parse.quote(video_url, safe='')}"
     proxied_audio = (
         f"{base_url}/proxy/stream?url={urllib.parse.quote(audio_url, safe='')}"

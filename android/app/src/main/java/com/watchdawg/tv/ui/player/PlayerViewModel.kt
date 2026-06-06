@@ -221,12 +221,14 @@ class PlayerViewModel(
         emitDirect(streamUrl, title, "")
     }
 
-    fun startDirectQueue(urls: List<String>, startIndex: Int) {
+    fun startDirectQueue(urls: List<String>, startIndex: Int, startMs: Long = 0L) {
         mode = Mode.DIRECT_QUEUE
         idQueue = emptyList()
         urlQueue = urls
         index = startIndex.coerceIn(0, urls.lastIndex)
-        pendingStartMs = 0L
+        // Session 38: accept a start position so EPG can seek to the correct
+        // offset into the current slot (wall-clock time minus slot start time).
+        pendingStartMs = startMs
         hlsMode = false
         isLockedSource = false
         cancelTokenRefresh()
@@ -275,6 +277,22 @@ class PlayerViewModel(
         val clientParam = if (hlsMode) "browser" else "tv"
 
         viewModelScope.launch {
+            // Session 38 — Resume fix: if no explicit startMs was passed by the caller
+            // (pendingStartMs == 0L), check the backend watch history for this video.
+            // EPG launches always set pendingStartMs > 0 (or use epgSlotStartTimeUtc
+            // below), so history lookup is naturally skipped for EPG content.
+            if (pendingStartMs == 0L && !isLockedSource && QueueHolder.epgSlotStartTimeUtc == null) {
+                repo.getHistory(limit = 200).onSuccess { items ->
+                    val record = items.firstOrNull { it.videoId == videoId }
+                    if (record != null && !record.completed) {
+                        val posMs = ((record.positionSeconds ?: 0f) * 1000f).toLong()
+                        if (posMs > 5_000L) {
+                            pendingStartMs = posMs
+                        }
+                    }
+                }
+            }
+
             when (val outcome = repo.resolve(videoId, force = retryForce, client = clientParam)) {
                 is WatchDawgRepository.ResolveOutcome.Ok -> {
                     val data = outcome.data
@@ -282,6 +300,33 @@ class PlayerViewModel(
                     if (url.isNullOrBlank()) {
                         advanceAfterFailure()
                     } else {
+                        // Session 40 — EPG live offset recomputation:
+                        // If this was an EPG launch, recompute (now - slotStartTime)
+                        // right after resolve finishes. This corrects for the 10-20s
+                        // yt-dlp delay that made the offset stale at playback time.
+                        // With pre-resolution the cache is warm and this runs instantly,
+                        // but we recompute anyway as a safety net.
+                        val epgStart = QueueHolder.epgSlotStartTimeUtc
+                        if (epgStart != null && pendingStartMs >= 0L) {
+                            try {
+                                val fmt1 = java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSSSSS")
+                                val fmt2 = java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")
+                                val slotStart = try {
+                                    java.time.LocalDateTime.parse(epgStart.replace("T", " ").substringBefore(".") + ".000000", fmt1)
+                                } catch (_: Exception) {
+                                    java.time.LocalDateTime.parse(epgStart.replace("T", " ").substringBefore("."), fmt2)
+                                }
+                                val nowUtc = java.time.LocalDateTime.now(java.time.ZoneOffset.UTC)
+                                val offsetSec = java.time.temporal.ChronoUnit.SECONDS.between(slotStart, nowUtc)
+                                    .coerceAtLeast(0L)
+                                pendingStartMs = offsetSec * 1000L
+                                android.util.Log.d("WatchDawg", "EPG offset recomputed after resolve: ${offsetSec}s (slotStart=$epgStart)")
+                            } catch (e: Exception) {
+                                android.util.Log.w("WatchDawg", "EPG offset recompute failed: $e")
+                                // Keep whatever pendingStartMs was set at tap time
+                            }
+                            QueueHolder.epgSlotStartTimeUtc = null
+                        }
                         _state.value = _state.value.copy(
                             loading = false,
                             title = data.title ?: "Now Playing",
