@@ -173,6 +173,16 @@ async def _run_migrations():
             """))
             logger.info("Migration checked: live_tv_sources table")
 
+            # Session 44: live_tv_sources.group_filter column
+            # ----------------------------------------------------------------
+            result = await db.execute(text("PRAGMA table_info(live_tv_sources)"))
+            lts_cols = {row[1] for row in result.fetchall()}
+            if "group_filter" not in lts_cols:
+                await db.execute(
+                    text("ALTER TABLE live_tv_sources ADD COLUMN group_filter TEXT DEFAULT NULL")
+                )
+                logger.info("Migration applied: live_tv_sources.group_filter")
+
             # ----------------------------------------------------------------
             # Session 39: plex_config table
             # ----------------------------------------------------------------
@@ -277,6 +287,44 @@ async def _run_migrations():
                 )
             """))
             logger.info("Migration checked: epg_movie_pointers table")
+
+            # ----------------------------------------------------------------
+            # Session 44: epg_xmltv_sources table
+            # Stores XMLTV feed URLs (e.g. Tunarr) and their epg_type
+            # ----------------------------------------------------------------
+            await db.execute(text("""
+                CREATE TABLE IF NOT EXISTS epg_xmltv_sources (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    label           TEXT NOT NULL,
+                    url             TEXT NOT NULL UNIQUE,
+                    epg_type        TEXT NOT NULL DEFAULT 'main',
+                    enabled         INTEGER NOT NULL DEFAULT 1,
+                    channel_filter  TEXT DEFAULT NULL,
+                    last_imported_at DATETIME,
+                    created_at      DATETIME NOT NULL
+                )
+            """))
+            logger.info("Migration checked: epg_xmltv_sources table")
+
+            # Session 44: epg_xmltv_sources.channel_filter column
+            result = await db.execute(text("PRAGMA table_info(epg_xmltv_sources)"))
+            xmltv_cols = {row[1] for row in result.fetchall()}
+            if "channel_filter" not in xmltv_cols:
+                await db.execute(
+                    text("ALTER TABLE epg_xmltv_sources ADD COLUMN channel_filter TEXT DEFAULT NULL")
+                )
+                logger.info("Migration applied: epg_xmltv_sources.channel_filter")
+
+            # Session 44: epg_channels.xmltv_channel_id column
+            # Stores the tvg-id from the XMLTV so schedule rebuilds can match
+            # programmes back to the correct epg_channels row.
+            result = await db.execute(text("PRAGMA table_info(epg_channels)"))
+            epg_ch_cols = {row[1] for row in result.fetchall()}
+            if "xmltv_channel_id" not in epg_ch_cols:
+                await db.execute(
+                    text("ALTER TABLE epg_channels ADD COLUMN xmltv_channel_id TEXT DEFAULT NULL")
+                )
+                logger.info("Migration applied: epg_channels.xmltv_channel_id")
 
             await db.commit()
             logger.info("All migrations complete.")

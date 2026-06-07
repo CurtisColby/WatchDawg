@@ -41,8 +41,10 @@ import asyncio
 import datetime
 import logging
 import os
+import xml.etree.ElementTree as ET
 from typing import Optional, List
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks, Request
 from fastapi.responses import StreamingResponse, RedirectResponse
 from pydantic import BaseModel, Field
@@ -56,7 +58,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/epg", tags=["epg"])
 
 # Valid source types
-VALID_SOURCE_TYPES = {"iptv_favorites", "plex_movie", "plex_tv", "watchdawg"}
+VALID_SOURCE_TYPES = {"iptv_favorites", "plex_movie", "plex_tv", "watchdawg", "local_private"}
 
 # Valid EPG types — main is PIN-free, adult is PIN-gated
 VALID_EPG_TYPES = {"main", "adult"}
@@ -76,7 +78,7 @@ class CreateEpgChannelRequest(BaseModel):
     channel_number: int = Field(..., description="Channel number (e.g. 101, 102). Must be unique.")
     name: str = Field(..., description="Display name (e.g. 'Horror Channel')")
     epg_type: str = Field(default="main", description="'main' or 'adult'")
-    source_type: str = Field(..., description="'iptv_favorites', 'plex_movie', 'plex_tv', or 'watchdawg'")
+    source_type: str = Field(..., description="'iptv_favorites', 'plex_movie', 'plex_tv', 'watchdawg', or 'local_private'")
     plex_library_key: Optional[str] = Field(None, description="Plex library section key (plex_* types only)")
     genre_filter: Optional[str] = Field(None, description="Comma-separated genres to include. Null = all genres.")
     episodes_per_day: int = Field(default=2, description="Max episodes per TV series per day (plex_tv only)")
@@ -86,6 +88,9 @@ class CreateEpgChannelRequest(BaseModel):
     enabled: bool = Field(default=True)
     # Session 40: optional pin to a specific WatchDawg source channel (watchdawg source_type only)
     watchdawg_source_id: Optional[int] = Field(None, description="Pin to a specific WatchDawg channel ID. Null = all sources matching genre_filter.")
+    # Session 43: local_private source — subfolder path under /watchdawg/Private/
+    # Stored in plex_library_key column. e.g. "123_Vimeo_Girls"
+    local_folder_path: Optional[str] = Field(None, description="Subfolder path under /watchdawg/Private/ (local_private source type only)")
 
 
 class UpdateEpgChannelRequest(BaseModel):
@@ -100,6 +105,8 @@ class UpdateEpgChannelRequest(BaseModel):
     enabled: Optional[bool] = None
     # Session 40: allow updating the watchdawg source pin
     watchdawg_source_id: Optional[int] = None
+    # Session 43: local_private folder path update
+    local_folder_path: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -127,25 +134,30 @@ def _serialize_channel(row) -> dict:
     }
 
 
-def _serialize_slot(row, base_url: str = "") -> dict:
+async def _serialize_slot(row, base_url: str = "") -> dict:
     source_type = row[10]
     source_id   = row[11]
     raw_stream  = row[9]
     progress    = _compute_progress(row[12], row[14])
     epg_ch_id   = row[1]
 
-    # Session 40 — WatchDawg slots:
-    # If a local downloaded file exists for this slot, route through /epg/stream/
-    # exactly like Plex channels — FFmpeg seeks to the exact wall-clock position.
-    # If no local file, fall back to on-demand resolve via Android (video_id path).
+    # Session 43 — WatchDawg slots with HEAD-check URL validation:
+    # 1. If a locally downloaded EPG file exists, stream via FFmpeg (perfect timing).
+    # 2. If a pre-resolved stream URL exists in the DB, fire a HEAD request to check
+    #    whether the CDN token is still valid (200/206 = fresh, anything else = stale).
+    #    Fresh URL → serve directly to Android (instant playback, no yt-dlp).
+    #    Stale URL → fall through to video_id path so Android resolves fresh via yt-dlp.
+    # 3. No URL and no local file → video_id path (on-demand resolve).
+    # HEAD timeout: 5 seconds. On timeout or error, assume stale and re-resolve.
     if source_type == "watchdawg" and source_id:
         try:
             video_id_int = int(source_id)
         except (ValueError, TypeError):
             video_id_int = None
 
-        # Check if a local file exists for this slot
         _base = base_url or os.environ.get("WATCHDAWG_BASE_URL", "").rstrip("/")
+
+        # Step 1: check for a locally downloaded EPG file
         local_file_found = False
         for epg_folder in ("Public/EPG", "Private/EPG"):
             candidate = f"/watchdawg/{epg_folder}/{epg_ch_id}_{source_id}.mp4"
@@ -154,11 +166,38 @@ def _serialize_slot(row, base_url: str = "") -> dict:
                 break
 
         if local_file_found and _base:
-            # Local file ready — stream via FFmpeg for perfect timing
+            # Local file ready — stream via FFmpeg for perfect wall-clock timing
             video_id   = None
             stream_url = f"{_base}/epg/stream/{epg_ch_id}"
+
+        elif raw_stream:
+            # Step 2: pre-resolved URL exists — HEAD check to verify CDN token is live
+            import asyncio as _asyncio
+            import httpx as _httpx
+            url_valid = False
+            try:
+                async with _httpx.AsyncClient(timeout=5.0, verify=False) as _client:
+                    _head = await _asyncio.wait_for(
+                        _client.head(raw_stream, follow_redirects=True),
+                        timeout=5.0,
+                    )
+                    url_valid = _head.status_code in (200, 206, 302, 301)
+            except Exception:
+                url_valid = False  # timeout or network error — treat as stale
+
+            if url_valid:
+                # CDN token still live — serve directly, instant playback
+                video_id   = None
+                stream_url = raw_stream
+                logger.debug(f"EPG WatchDawg: slot {source_id} URL is fresh — serving direct")
+            else:
+                # CDN token expired — force fresh yt-dlp resolve on Android
+                video_id   = video_id_int
+                stream_url = ""
+                logger.info(f"EPG WatchDawg: slot {source_id} URL is stale — routing to on-demand resolve")
+
         else:
-            # No local file yet — use Android on-demand resolve
+            # Step 3: no URL, no local file — on-demand resolve
             video_id   = video_id_int
             stream_url = ""
 
@@ -171,9 +210,25 @@ def _serialize_slot(row, base_url: str = "") -> dict:
         _base = base_url or os.environ.get("WATCHDAWG_BASE_URL", "").rstrip("/")
         stream_url = f"{_base}/epg/stream/{epg_ch_id}" if _base else raw_stream
 
+    # Session 43 fix — local_private slots: source_id is the relative disk path under
+    # /watchdawg/ (e.g. "Private/Reddit/Porn-Reddit/video.mp4").
+    # ALWAYS route through /epg/stream/{channel_id} — never send the raw
+    # /library/stream/ URL to Android. That endpoint requires an auth token
+    # header which ExoPlayer does not send, causing a 403 black screen.
+    # /epg/stream/ reads the file directly from disk (no auth check) and pipes
+    # it through FFmpeg for both seeking and future-slot playback.
+    elif source_type == "local_private":
+        video_id   = None
+        _base = base_url or os.environ.get("WATCHDAWG_BASE_URL", "").rstrip("/")
+        stream_url = f"{_base}/epg/stream/{epg_ch_id}" if _base else raw_stream
     else:
         video_id   = None
         stream_url = raw_stream
+
+    # XMLTV slots (e.g. Tunarr) are live HLS streams — seeking by offset is
+    # meaningless and causes ExoPlayer to fail on a live stream. Always return
+    # progress_seconds=0 so Android plays from the live head, not a seek offset.
+    effective_progress = 0 if source_type == "xmltv" else progress
 
     return {
         "id":              row[0],
@@ -192,7 +247,7 @@ def _serialize_slot(row, base_url: str = "") -> dict:
         "start_time":      row[12].isoformat() if row[12] and hasattr(row[12], "isoformat") else str(row[12]) if row[12] else None,
         "end_time":        row[13].isoformat() if row[13] and hasattr(row[13], "isoformat") else str(row[13]) if row[13] else None,
         "duration_seconds": row[14],
-        "progress_seconds": progress,
+        "progress_seconds": effective_progress,
     }
 
 
@@ -345,18 +400,30 @@ async def stream_epg_channel(
         f"offset={offset_seconds}s | url={stream_url[:80]}"
     )
 
-    # Future slot — redirect to direct URL, no FFmpeg needed
-    if offset_seconds <= 2:
+    # Future slot — redirect to direct URL, no FFmpeg needed.
+    # Exception: local_private channels must always use FFmpeg — the file lives
+    # on disk, not at an HTTP URL. A redirect would send Android to the auth-gated
+    # /library/stream/ endpoint which rejects requests without a token header.
+    if offset_seconds <= 2 and source_type != "local_private":
         if stream_url:
             return RedirectResponse(url=stream_url, status_code=302)
         else:
             raise HTTPException(status_code=404, detail="No stream URL for this slot")
 
-    # Check for a locally downloaded file for this slot.
-    # WatchDawg slots downloaded by _download_watchdawg_slots live here.
-    # Pattern: /watchdawg/{Public|Private}/EPG/{channel_id}_{source_id}.mp4
+    # Resolve the file to stream.
+    # local_private: source_id IS the relative path under /watchdawg/
+    # (e.g. "Private/Reddit/Porn-Reddit/video.mp4") — build disk path directly.
+    # WatchDawg EPG-downloaded: pattern /watchdawg/{Public|Private}/EPG/{ch}_{id}.mp4
     local_file = None
-    if source_id:
+    if source_type == "local_private" and source_id:
+        candidate = f"/watchdawg/{source_id}"
+        if os.path.exists(candidate) and os.path.getsize(candidate) > 100_000:
+            local_file = candidate
+            logger.info(f"EPG stream: local_private resolved: {local_file}")
+        else:
+            logger.warning(f"EPG stream: local_private file not found or too small: {candidate}")
+            raise HTTPException(status_code=404, detail=f"Local file not found: {source_id}")
+    elif source_id:
         for epg_folder in ("Public/EPG", "Private/EPG"):
             candidate = f"/watchdawg/{epg_folder}/{channel_id}_{source_id}.mp4"
             if os.path.exists(candidate) and os.path.getsize(candidate) > 1_000_000:
@@ -365,7 +432,7 @@ async def stream_epg_channel(
                 break
 
     # Use local file if available, otherwise use the stored stream URL
-    if not stream_url and not local_file:
+    if not local_file and not stream_url:
         raise HTTPException(status_code=404, detail="No stream source available for this slot")
 
     input_source = local_file or stream_url
@@ -414,6 +481,55 @@ async def stream_epg_channel(
     )
 
 
+
+
+
+@router.get("/private-folders")
+async def list_private_folders():
+    """
+    List available subfolders under /watchdawg/Private/ for use as local_private EPG sources.
+
+    Each folder entry includes its name, file count, and estimated total duration.
+    Used by the web UI channel-creation form when source_type = local_private.
+    Adult EPG channels only — private content requires PIN unlock to view.
+    """
+    import glob as _glob
+
+    private_root = "/watchdawg/Private"
+    if not os.path.isdir(private_root):
+        return {"folders": [], "message": "Private directory not found at /watchdawg/Private"}
+
+    video_exts = {".mp4", ".mkv", ".webm", ".m4v", ".avi", ".mov"}
+    folders = []
+
+    try:
+        for entry in sorted(os.scandir(private_root), key=lambda e: e.name):
+            if not entry.is_dir():
+                continue
+            # Skip the EPG cache subfolder — those are pre-downloaded EPG files, not library content
+            if entry.name.upper() == "EPG":
+                continue
+            file_count = 0
+            for root, _dirs, files in os.walk(entry.path):
+                for fname in files:
+                    _, ext = os.path.splitext(fname)
+                    if ext.lower() in video_exts:
+                        file_count += 1
+            if file_count > 0:
+                folders.append({
+                    "name":       entry.name,
+                    "path":       entry.name,   # relative path stored in plex_library_key
+                    "file_count": file_count,
+                })
+    except Exception as e:
+        logger.error(f"EPG private-folders scan error: {e}")
+        return {"folders": [], "error": str(e)}
+
+    return {
+        "folders": folders,
+        "total":   len(folders),
+        "root":    private_root,
+    }
 
 
 @router.get("/watchdawg-sources")
@@ -616,6 +732,17 @@ async def create_epg_channel(
             detail="plex_library_key is required for plex_movie and plex_tv source types."
         )
 
+    # Session 43: local_private — local_folder_path stored in plex_library_key column
+    if request.source_type == "local_private":
+        if not request.local_folder_path and not request.plex_library_key:
+            raise HTTPException(
+                status_code=400,
+                detail="local_folder_path is required for local_private source type."
+            )
+        # Normalise: store folder path in plex_library_key
+        if request.local_folder_path and not request.plex_library_key:
+            request = request.model_copy(update={"plex_library_key": request.local_folder_path})
+
     # Adult channels cannot be created in the main EPG
     if request.epg_type == "adult" and request.source_type == "iptv_favorites":
         raise HTTPException(
@@ -743,6 +870,9 @@ async def update_epg_channel(
     # (frontend sends 0 to mean "clear", None means "don't change")
     if request.watchdawg_source_id is not None:
         updates["watchdawg_source_id"] = request.watchdawg_source_id if request.watchdawg_source_id > 0 else None
+    # Session 43: local_private folder path update — stored in plex_library_key
+    if request.local_folder_path is not None:
+        updates["plex_library_key"] = request.local_folder_path
 
     if not updates:
         return {"status": "no_change", "id": channel_id}
@@ -891,7 +1021,7 @@ async def get_epg_schedule(
                 "channel_logo": row[4],
                 "slots": [],
             }
-        channels_map[ch_id]["slots"].append(_serialize_slot(row))
+        channels_map[ch_id]["slots"].append(await _serialize_slot(row))
 
     # Also include IPTV favorite channels (live — no pre-computed schedule needed)
     live_result = await db.execute(text("""
@@ -979,7 +1109,10 @@ async def get_channel_schedule(
         ORDER BY s.start_time ASC
     """), {"channel_id": channel_id, "now": now, "window_end": window_end})
 
-    slots = [_serialize_slot(row) for row in result.fetchall()]
+    _slot_rows = result.fetchall()
+    slots = []
+    for _r in _slot_rows:
+        slots.append(await _serialize_slot(_r))
 
     return {
         "channel_id": channel_id,
@@ -1123,3 +1256,381 @@ async def rebuild_all_epg_schedules():
     for channel_id in channel_ids:
         await _rebuild_channel_schedule(channel_id)
     logger.info(f"EPG scheduled rebuild complete: {len(channel_ids)} channels processed.")
+
+
+# ---------------------------------------------------------------------------
+# XMLTV Import — Session 44
+# Ingests Tunarr (or any standard XMLTV) feed into epg_channels + epg_schedules
+# ---------------------------------------------------------------------------
+
+XMLTV_FETCH_HEADERS = {
+    "User-Agent": "WatchDawg/1.0",
+    "Accept": "application/xml, text/xml, */*",
+}
+
+
+class ImportXmltvRequest(BaseModel):
+    url: str = Field(..., description="XMLTV feed URL (e.g. http://192.168.50.42:7777/api/xmltv.xml)")
+    epg_type: str = Field(default="main", description="'main' or 'adult'")
+    label: Optional[str] = Field(None, description="Friendly label for this source")
+    channel_filter: Optional[str] = Field(None, description="Only import channels whose display-name contains this string (case-insensitive). Leave blank for all channels.")
+
+
+def _parse_xmltv_datetime(dt_str: str) -> Optional[datetime.datetime]:
+    """
+    Parse XMLTV datetime string.
+    Formats: '20260607185900 +0000' or '20260607185900 -0600' or '20260607185900'
+    Always returns UTC datetime.
+    """
+    if not dt_str:
+        return None
+    dt_str = dt_str.strip()
+    try:
+        if " " in dt_str:
+            # Has timezone offset
+            naive_part, tz_part = dt_str.split(" ", 1)
+            dt = datetime.datetime.strptime(naive_part, "%Y%m%d%H%M%S")
+            # Parse offset: +0600 or -0600
+            sign = 1 if tz_part[0] == "+" else -1
+            tz_hours = int(tz_part[1:3])
+            tz_mins = int(tz_part[3:5]) if len(tz_part) >= 5 else 0
+            offset = datetime.timedelta(hours=tz_hours, minutes=tz_mins) * sign
+            dt_utc = dt - offset
+        else:
+            dt_utc = datetime.datetime.strptime(dt_str, "%Y%m%d%H%M%S")
+        return dt_utc
+    except Exception:
+        return None
+
+
+async def _do_xmltv_import(url: str, epg_type: str, label: str, db: AsyncSession, channel_filter: Optional[str] = None) -> dict:
+    """
+    Core XMLTV import logic — shared by endpoint and scheduler.
+
+    1. Fetch XMLTV XML from url.
+    2. Parse <channel> elements → upsert epg_channels rows (source_type=xmltv).
+       If channel_filter is set, only import channels whose display-name contains
+       that string (case-insensitive).
+    3. Parse <programme> elements → clear + re-insert epg_schedules for xmltv channels.
+    4. Match stream_url by looking up Live TV channels whose name matches the
+       XMLTV channel display-name (case-insensitive).
+    5. Upsert epg_xmltv_sources record.
+    """
+    # Fetch XML
+    try:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True, headers=XMLTV_FETCH_HEADERS) as client:
+            resp = await client.get(url)
+            if not resp.is_success:
+                raise HTTPException(status_code=502, detail=f"XMLTV host returned HTTP {resp.status_code}")
+            xml_content = resp.text
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=502, detail="Timed out fetching XMLTV URL")
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Network error: {e}")
+
+    # Parse XML
+    try:
+        root = ET.fromstring(xml_content)
+    except ET.ParseError as e:
+        raise HTTPException(status_code=502, detail=f"Invalid XMLTV XML: {e}")
+
+    now = datetime.datetime.utcnow()
+
+    # Build Live TV channel lookup: name (lower) → stream_url
+    ltv_result = await db.execute(text("""
+        SELECT LOWER(name), stream_url FROM live_tv_channels
+        WHERE stream_url IS NOT NULL AND stream_url != ''
+    """))
+    ltv_by_name = {row[0]: row[1] for row in ltv_result.fetchall()}
+
+    # Parse <channel> elements
+    channels_upserted = 0
+    xmltv_ch_map = {}  # xmltv_id → epg_channel_id
+
+    for ch_el in root.findall("channel"):
+        xmltv_id = ch_el.get("id", "").strip()
+        if not xmltv_id:
+            continue
+
+        display_name_el = ch_el.find("display-name")
+        ch_name = display_name_el.text.strip() if display_name_el is not None and display_name_el.text else xmltv_id
+
+        # Apply channel name filter
+        # Prefix with ! to exclude channels containing that string (e.g. !Adult)
+        # No prefix = only include channels containing that string (e.g. Adult)
+        if channel_filter:
+            if channel_filter.startswith('!'):
+                exclude_term = channel_filter[1:].lower()
+                if exclude_term and exclude_term in ch_name.lower():
+                    continue  # skip channels whose name contains the exclude term
+            else:
+                if channel_filter.lower() not in ch_name.lower():
+                    continue  # skip channels whose name doesn't contain the filter
+
+        icon_el = ch_el.find("icon")
+        logo_url = icon_el.get("src", "") if icon_el is not None else ""
+
+        # Derive channel number from xmltv_id (Tunarr uses "C1.49.tunarr.com" → parse number)
+        # Try extracting leading digits after first "C"
+        ch_num = None
+        try:
+            num_part = xmltv_id.lstrip("Cc").split(".")[0]
+            ch_num = int(num_part)
+        except (ValueError, IndexError):
+            ch_num = None
+
+        # Check if epg_channel already exists for this xmltv_channel_id
+        existing = await db.execute(text("""
+            SELECT id, channel_number FROM epg_channels
+            WHERE xmltv_channel_id = :xmltv_id
+        """), {"xmltv_id": xmltv_id})
+        existing_row = existing.fetchone()
+
+        if existing_row:
+            epg_ch_id = existing_row[0]
+            # Update name/logo
+            await db.execute(text("""
+                UPDATE epg_channels
+                SET name = :name, logo_url = :logo, enabled = 1
+                WHERE id = :id
+            """), {"name": ch_name, "logo": logo_url or None, "id": epg_ch_id})
+        else:
+            # Find a free channel number if we couldn't parse one
+            if ch_num is None:
+                max_result = await db.execute(text(
+                    "SELECT COALESCE(MAX(channel_number), 0) FROM epg_channels WHERE source_type = 'xmltv'"
+                ))
+                ch_num = (max_result.scalar() or 0) + 1
+
+            # Ensure channel number is unique — bump if taken
+            taken = await db.execute(text(
+                "SELECT id FROM epg_channels WHERE channel_number = :n"
+            ), {"n": ch_num})
+            if taken.fetchone():
+                max_result = await db.execute(text("SELECT COALESCE(MAX(channel_number), 0) FROM epg_channels"))
+                ch_num = (max_result.scalar() or 0) + 1
+
+            await db.execute(text("""
+                INSERT INTO epg_channels
+                    (channel_number, name, epg_type, source_type, logo_url,
+                     enabled, sort_order, created_at, xmltv_channel_id)
+                VALUES
+                    (:ch_num, :name, :epg_type, 'xmltv', :logo,
+                     1, :ch_num, :now, :xmltv_id)
+            """), {
+                "ch_num": ch_num, "name": ch_name, "epg_type": epg_type,
+                "logo": logo_url or None, "now": now, "xmltv_id": xmltv_id,
+            })
+            # Fetch the new id
+            new_row = await db.execute(text(
+                "SELECT id FROM epg_channels WHERE xmltv_channel_id = :xmltv_id"
+            ), {"xmltv_id": xmltv_id})
+            epg_ch_id = new_row.scalar()
+
+        xmltv_ch_map[xmltv_id] = {"epg_ch_id": epg_ch_id, "name": ch_name}
+        channels_upserted += 1
+
+    await db.commit()
+
+    # Clear existing xmltv schedules for channels we're about to rebuild
+    if xmltv_ch_map:
+        epg_ids = list({v["epg_ch_id"] for v in xmltv_ch_map.values()})
+        for epg_ch_id in epg_ids:
+            await db.execute(text(
+                "DELETE FROM epg_schedules WHERE epg_channel_id = :id"
+            ), {"id": epg_ch_id})
+        await db.commit()
+
+    # Parse <programme> elements → insert schedules
+    slots_inserted = 0
+    for prog_el in root.findall("programme"):
+        xmltv_id = prog_el.get("channel", "").strip()
+        ch_info = xmltv_ch_map.get(xmltv_id)
+        if not ch_info:
+            continue
+
+        start_str = prog_el.get("start", "")
+        stop_str = prog_el.get("stop", "")
+        start_dt = _parse_xmltv_datetime(start_str)
+        end_dt = _parse_xmltv_datetime(stop_str)
+        if not start_dt or not end_dt:
+            continue
+
+        duration_seconds = max(0, int((end_dt - start_dt).total_seconds()))
+
+        title_el = prog_el.find("title")
+        title = title_el.text.strip() if title_el is not None and title_el.text else "Unknown"
+
+        desc_el = prog_el.find("desc")
+        description = desc_el.text.strip() if desc_el is not None and desc_el.text else ""
+
+        sub_el = prog_el.find("sub-title")
+        subtitle = sub_el.text.strip() if sub_el is not None and sub_el.text else ""
+
+        icon_el = prog_el.find("icon")
+        thumbnail = icon_el.get("src", "") if icon_el is not None else ""
+
+        # Match stream_url from Live TV channel by display name.
+        # Tunarr prefixes channel names with the channel number (e.g. "4 Drama 4")
+        # so strip the leading number before matching.
+        ch_name_raw = ch_info["name"]
+        parts = ch_name_raw.split(" ", 1)
+        if len(parts) == 2 and parts[0].isdigit():
+            ch_name_for_match = parts[1]  # strip leading "4 " → "Drama 4"
+        else:
+            ch_name_for_match = ch_name_raw
+        ch_name_lower = ch_name_for_match.lower()
+        stream_url = ltv_by_name.get(ch_name_lower, "")
+
+        await db.execute(text("""
+            INSERT INTO epg_schedules
+                (epg_channel_id, title, subtitle, description, thumbnail_url,
+                 stream_url, source_type, source_id, start_time, end_time,
+                 duration_seconds, created_at)
+            VALUES
+                (:ch_id, :title, :subtitle, :desc, :thumb,
+                 :stream_url, 'xmltv', '', :start, :end,
+                 :dur, :now)
+        """), {
+            "ch_id": ch_info["epg_ch_id"],
+            "title": title, "subtitle": subtitle, "desc": description,
+            "thumb": thumbnail, "stream_url": stream_url,
+            "start": start_dt, "end": end_dt,
+            "dur": duration_seconds, "now": now,
+        })
+        slots_inserted += 1
+
+    await db.commit()
+
+    # Upsert epg_xmltv_sources record
+    existing_src = await db.execute(text(
+        "SELECT id FROM epg_xmltv_sources WHERE url = :url"
+    ), {"url": url})
+    src_row = existing_src.fetchone()
+    if src_row:
+        await db.execute(text("""
+            UPDATE epg_xmltv_sources
+            SET label = :label, epg_type = :epg_type, channel_filter = :channel_filter, last_imported_at = :now
+            WHERE url = :url
+        """), {"label": label, "epg_type": epg_type, "channel_filter": channel_filter or None, "now": now, "url": url})
+    else:
+        await db.execute(text("""
+            INSERT INTO epg_xmltv_sources (label, url, epg_type, channel_filter, enabled, last_imported_at, created_at)
+            VALUES (:label, :url, :epg_type, :channel_filter, 1, :now, :now)
+        """), {"label": label, "url": url, "epg_type": epg_type, "channel_filter": channel_filter or None, "now": now})
+    await db.commit()
+
+    logger.info(
+        f"XMLTV import '{label}': {channels_upserted} channels, {slots_inserted} slots → {epg_type} EPG"
+        + (f" (filter: '{channel_filter}')" if channel_filter else "")
+    )
+    return {
+        "status": "complete",
+        "label": label,
+        "epg_type": epg_type,
+        "channel_filter": channel_filter,
+        "channels_upserted": channels_upserted,
+        "slots_inserted": slots_inserted,
+    }
+
+
+@router.post("/import-xmltv")
+async def import_xmltv(
+    request: ImportXmltvRequest,
+    db: AsyncSession = Depends(get_db_session),
+):
+    """
+    Fetch a standard XMLTV feed (e.g. Tunarr) and populate epg_channels +
+    epg_schedules. Existing xmltv channels for this feed are updated in-place;
+    their schedules are wiped and rebuilt from the fresh XML.
+    """
+    if request.epg_type not in VALID_EPG_TYPES:
+        raise HTTPException(status_code=400, detail=f"epg_type must be one of: {VALID_EPG_TYPES}")
+
+    label = request.label or request.url.split("//")[-1].split("/")[0]
+    return await _do_xmltv_import(request.url, request.epg_type, label, db, channel_filter=request.channel_filter or None)
+
+
+@router.get("/xmltv-sources")
+async def list_xmltv_sources(db: AsyncSession = Depends(get_db_session)):
+    """List all stored XMLTV sources."""
+    result = await db.execute(text("""
+        SELECT id, label, url, epg_type, enabled, channel_filter, last_imported_at, created_at
+        FROM epg_xmltv_sources
+        ORDER BY created_at ASC
+    """))
+    rows = result.fetchall()
+    return {
+        "sources": [
+            {
+                "id": row[0],
+                "label": row[1],
+                "url": row[2],
+                "epg_type": row[3],
+                "enabled": bool(row[4]),
+                "channel_filter": row[5],
+                "last_imported_at": row[6].isoformat() if row[6] and hasattr(row[6], "isoformat") else str(row[6]) if row[6] else None,
+                "created_at": row[7].isoformat() if row[7] and hasattr(row[7], "isoformat") else str(row[7]) if row[7] else None,
+            }
+            for row in rows
+        ]
+    }
+
+
+@router.delete("/xmltv-sources/{source_id}")
+async def delete_xmltv_source(
+    source_id: int,
+    db: AsyncSession = Depends(get_db_session),
+):
+    """
+    Delete an XMLTV source record. Also deletes all epg_channels and their
+    schedules that were imported from this source (source_type = 'xmltv' and
+    matching xmltv_channel_id values).
+    """
+    src_result = await db.execute(text(
+        "SELECT id, label, url FROM epg_xmltv_sources WHERE id = :id"
+    ), {"id": source_id})
+    src = src_result.fetchone()
+    if not src:
+        raise HTTPException(status_code=404, detail="XMLTV source not found")
+
+    label = src[1]
+
+    # Delete epg_channels for this source (cascades to epg_schedules)
+    deleted = await db.execute(text(
+        "DELETE FROM epg_channels WHERE source_type = 'xmltv' AND epg_type = (SELECT epg_type FROM epg_xmltv_sources WHERE id = :id)"
+    ), {"id": source_id})
+
+    await db.execute(text("DELETE FROM epg_xmltv_sources WHERE id = :id"), {"id": source_id})
+    await db.commit()
+
+    logger.info(f"XMLTV source '{label}' deleted, {deleted.rowcount} channels removed")
+    return {"status": "deleted", "label": label, "channels_deleted": deleted.rowcount}
+
+
+async def refresh_all_xmltv_sources():
+    """
+    Called by the scheduler every 2 hours.
+    Re-fetches all enabled XMLTV sources and rebuilds their schedules.
+    """
+    from app.database import async_session_factory
+    async with async_session_factory() as db:
+        result = await db.execute(text("""
+            SELECT id, label, url, epg_type, channel_filter FROM epg_xmltv_sources WHERE enabled = 1
+        """))
+        sources = result.fetchall()
+
+    if not sources:
+        logger.info("XMLTV scheduled refresh: no enabled sources.")
+        return
+
+    logger.info(f"XMLTV scheduled refresh: {len(sources)} sources...")
+    for src in sources:
+        try:
+            from app.database import async_session_factory
+            async with async_session_factory() as db:
+                await _do_xmltv_import(src[2], src[3], src[1], db, channel_filter=src[4] if len(src) > 4 else None)
+        except Exception as e:
+            logger.error(f"XMLTV scheduled refresh failed for '{src[1]}': {e}")
+            continue
+    logger.info("XMLTV scheduled refresh complete.")

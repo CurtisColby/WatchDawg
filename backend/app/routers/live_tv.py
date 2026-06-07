@@ -13,6 +13,7 @@ Endpoints:
 Source management:
   GET    /live-tv/sources                   — List all M3U sources with stats.
   PATCH  /live-tv/sources/{id}/toggle       — Enable / disable a source.
+  POST   /live-tv/sources/{id}/refresh      — Re-fetch M3U and sync channels (add new, remove stale).
   DELETE /live-tv/sources/{id}              — Delete source + all its channels.
 
 Group management (Session 36):
@@ -74,7 +75,7 @@ class AddStreamRequest(BaseModel):
 class ImportM3URequest(BaseModel):
     url: Optional[str] = Field(None)
     content: Optional[str] = Field(None)
-    group_filter: Optional[str] = Field(None)
+    group_filter: Optional[str] = Field(None, description="Only import channels whose group-title matches (case-insensitive). Leave blank to import all.")
     label: Optional[str] = Field(None, description="Friendly label for source (auto-derived if omitted)")
 
 
@@ -115,6 +116,7 @@ def _serialize_source(src: LiveTvSource) -> dict:
         "url":              src.url,
         "enabled":          src.enabled,
         "channel_count":    src.channel_count,
+        "group_filter":     src.group_filter,
         "created_at":       src.created_at.isoformat() if src.created_at else None,
         "last_imported_at": src.last_imported_at.isoformat() if src.last_imported_at else None,
     }
@@ -362,7 +364,7 @@ async def import_m3u(
     await db.commit()
 
     if request.url:
-        await _upsert_source(db, url=request.url, label=request.label, now=now)
+        await _upsert_source(db, url=request.url, label=request.label, now=now, group_filter=request.group_filter or None)
 
     logger.info(f"Live TV M3U import: {imported} imported, {skipped} skipped from {source_label}")
     return {
@@ -529,6 +531,184 @@ async def delete_source(source_id: int, db: AsyncSession = Depends(get_db_sessio
     return {"status": "deleted", "label": label, "channels_deleted": deleted_channels}
 
 
+@router.post("/sources/{source_id}/refresh")
+async def refresh_source(source_id: int, db: AsyncSession = Depends(get_db_session)):
+    """
+    Re-fetch a source's M3U URL and sync channels:
+      - Adds channels present in M3U but not in DB.
+      - Removes channels that belong to this source but are no longer in M3U.
+      - Preserves favorites, sort_order, and is_online on existing channels.
+    """
+    stmt = select(LiveTvSource).where(LiveTvSource.id == source_id)
+    result = await db.execute(stmt)
+    source = result.scalar_one_or_none()
+
+    if source is None:
+        raise HTTPException(status_code=404, detail="Source not found")
+
+    # Fetch fresh M3U content
+    try:
+        async with httpx.AsyncClient(
+            timeout=30,
+            follow_redirects=True,
+            headers=M3U_FETCH_HEADERS,
+        ) as client:
+            resp = await client.get(source.url)
+            if not resp.is_success:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"M3U host returned HTTP {resp.status_code}.",
+                )
+            content = resp.text
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=502, detail="Request timed out fetching M3U URL.")
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Network error: {e}")
+
+    parsed = _parse_m3u(content, source_label=source.url)
+
+    # Apply stored group filter if set
+    if source.group_filter:
+        parsed = [ch for ch in parsed if (ch.get("group_name") or "").lower() == source.group_filter.lower()]
+
+    # Build set of stream URLs currently in M3U
+    m3u_urls = {ch["stream_url"] for ch in parsed}
+
+    # Fetch existing channels for this source
+    existing_stmt = select(LiveTvChannel).where(LiveTvChannel.source_m3u == source.url)
+    existing_result = await db.execute(existing_stmt)
+    existing_channels = existing_result.scalars().all()
+    existing_url_map = {ch.stream_url: ch for ch in existing_channels}
+
+    now = datetime.datetime.utcnow()
+    added = removed = 0
+
+    # Add new channels not already in DB
+    for ch_data in parsed:
+        if ch_data["stream_url"] not in existing_url_map:
+            channel = LiveTvChannel(
+                name=ch_data["name"],
+                stream_url=ch_data["stream_url"],
+                logo_url=ch_data["logo_url"],
+                group_name=ch_data["group_name"],
+                channel_type="real",
+                is_online=None,
+                source_m3u=source.url,
+                is_favorite=False,
+                sort_order=999,
+                created_at=now,
+            )
+            db.add(channel)
+            added += 1
+
+    # Remove channels no longer in M3U (only from this source)
+    for stream_url, channel in existing_url_map.items():
+        if stream_url not in m3u_urls:
+            await db.delete(channel)
+            removed += 1
+
+    # Update source metadata
+    source.last_imported_at = now
+    source.channel_count = len(m3u_urls)
+
+    await db.commit()
+
+    logger.info(
+        f"Live TV source refresh '{source.label}': "
+        f"+{added} added, -{removed} removed, "
+        f"{len(existing_url_map) - removed} unchanged"
+    )
+    return {
+        "status":    "refreshed",
+        "label":     source.label,
+        "added":     added,
+        "removed":   removed,
+        "unchanged": len(existing_url_map) - removed,
+    }
+
+
+async def refresh_all_sources(db: AsyncSession) -> dict:
+    """
+    Shared sync logic used by the scheduler to refresh all enabled sources.
+    Re-fetches each source's M3U and syncs channels (add new, remove stale).
+    """
+    stmt = select(LiveTvSource).where(LiveTvSource.enabled == True)
+    result = await db.execute(stmt)
+    sources = result.scalars().all()
+
+    total_added = total_removed = 0
+
+    for source in sources:
+        try:
+            async with httpx.AsyncClient(
+                timeout=30,
+                follow_redirects=True,
+                headers=M3U_FETCH_HEADERS,
+            ) as client:
+                resp = await client.get(source.url)
+                if not resp.is_success:
+                    logger.warning(
+                        f"Live TV scheduler refresh: HTTP {resp.status_code} from {source.url}"
+                    )
+                    continue
+                content = resp.text
+
+            parsed = _parse_m3u(content, source_label=source.url)
+
+            # Apply stored group filter if set
+            if source.group_filter:
+                parsed = [ch for ch in parsed if (ch.get("group_name") or "").lower() == source.group_filter.lower()]
+
+            m3u_urls = {ch["stream_url"] for ch in parsed}
+
+            existing_stmt = select(LiveTvChannel).where(LiveTvChannel.source_m3u == source.url)
+            existing_result = await db.execute(existing_stmt)
+            existing_channels = existing_result.scalars().all()
+            existing_url_map = {ch.stream_url: ch for ch in existing_channels}
+
+            now = datetime.datetime.utcnow()
+            added = removed = 0
+
+            for ch_data in parsed:
+                if ch_data["stream_url"] not in existing_url_map:
+                    channel = LiveTvChannel(
+                        name=ch_data["name"],
+                        stream_url=ch_data["stream_url"],
+                        logo_url=ch_data["logo_url"],
+                        group_name=ch_data["group_name"],
+                        channel_type="real",
+                        is_online=None,
+                        source_m3u=source.url,
+                        is_favorite=False,
+                        sort_order=999,
+                        created_at=now,
+                    )
+                    db.add(channel)
+                    added += 1
+
+            for stream_url, channel in existing_url_map.items():
+                if stream_url not in m3u_urls:
+                    await db.delete(channel)
+                    removed += 1
+
+            source.last_imported_at = now
+            source.channel_count = len(m3u_urls)
+            await db.commit()
+
+            total_added += added
+            total_removed += removed
+            logger.info(
+                f"Live TV scheduler refresh '{source.label}': "
+                f"+{added} added, -{removed} removed"
+            )
+
+        except Exception as e:
+            logger.error(f"Live TV scheduler refresh failed for '{source.url}': {e}")
+            continue
+
+    return {"sources": len(sources), "added": total_added, "removed": total_removed}
+
+
 # ---------------------------------------------------------------------------
 # Endpoints — group management (Session 36)
 # ---------------------------------------------------------------------------
@@ -680,6 +860,7 @@ async def _upsert_source(
     url: str,
     label: Optional[str],
     now: datetime.datetime,
+    group_filter: Optional[str] = None,
 ) -> None:
     stmt = select(LiveTvSource).where(LiveTvSource.url == url)
     result = await db.execute(stmt)
@@ -697,6 +878,7 @@ async def _upsert_source(
             label=label or _derive_label(url),
             enabled=True,
             channel_count=channel_count,
+            group_filter=group_filter,
             created_at=now,
             last_imported_at=now,
         )
@@ -704,6 +886,8 @@ async def _upsert_source(
     else:
         if label:
             source.label = label
+        if group_filter is not None:
+            source.group_filter = group_filter
         source.channel_count = channel_count
         source.last_imported_at = now
 
@@ -742,16 +926,21 @@ async def _probe_all_channels():
                     if not channel.stream_url:
                         continue
                     try:
-                        resp = await client.head(channel.stream_url, follow_redirects=True)
+                        # Don't follow redirects — a 3xx response means the channel
+                        # server is alive and responding (e.g. Tunarr returns 302 before
+                        # spinning up FFmpeg). Following the redirect causes a timeout
+                        # waiting for FFmpeg to produce the first HLS segment.
+                        resp = await client.head(channel.stream_url, follow_redirects=False)
                         if resp.status_code == 405:
                             get_resp = await client.get(
                                 channel.stream_url,
-                                follow_redirects=True,
+                                follow_redirects=False,
                                 headers={"Range": "bytes=0-0"},
                             )
-                            is_online = get_resp.status_code < 400
+                            is_online = get_resp.status_code < 500
                         else:
-                            is_online = resp.status_code < 400
+                            # 2xx, 3xx = online; 4xx, 5xx = offline
+                            is_online = resp.status_code < 400 or resp.status_code in (301, 302, 303, 307, 308)
                     except Exception:
                         is_online = False
 

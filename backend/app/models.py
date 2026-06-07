@@ -230,13 +230,18 @@ class LiveTvSource(Base):
     url = Column(Text, nullable=False, unique=True)
     enabled = Column(Boolean, nullable=False, default=True)
     channel_count = Column(Integer, nullable=False, default=0)
+    # Session 44: optional group filter — only import channels whose group-title
+    # matches this value (case-insensitive). NULL = import all groups.
+    # Migration: ALTER TABLE live_tv_sources ADD COLUMN group_filter TEXT DEFAULT NULL
+    group_filter = Column(Text, nullable=True, default=None)
     created_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
     last_imported_at = Column(DateTime, nullable=True)
 
     def __repr__(self) -> str:
         return (
             f"<LiveTvSource id={self.id} label='{self.label}' "
-            f"enabled={self.enabled} channels={self.channel_count}>"
+            f"enabled={self.enabled} channels={self.channel_count} "
+            f"group_filter={self.group_filter}>"
         )
 
 

@@ -178,6 +178,8 @@ async def build_channel_schedule(channel_id: int):
                 slots = await _build_plex_schedule(channel, build_from, schedule_end, db)
             elif channel["source_type"] == "watchdawg":
                 slots = await _build_watchdawg_schedule(channel, build_from, schedule_end, db)
+            elif channel["source_type"] == "local_private":
+                slots = await _build_local_private_schedule(channel, build_from, schedule_end)
             else:
                 logger.warning(f"EPG scheduler: unknown source_type '{channel['source_type']}' for channel {channel_id}")
                 return
@@ -873,6 +875,130 @@ async def _download_watchdawg_slots(epg_channel_id: int, epg_type: str, db) -> N
                     os.remove(out_path)
         except Exception as e:
             logger.warning(f"EPG download: video {vid_id} subprocess error — {e}")
+
+
+
+# ---------------------------------------------------------------------------
+# Local Private schedule builder (Session 43)
+# ---------------------------------------------------------------------------
+
+async def _build_local_private_schedule(
+    channel: dict,
+    build_from: datetime.datetime,
+    schedule_end: datetime.datetime,
+) -> list:
+    """
+    Build schedule slots from files in /watchdawg/Private/{folder_path}.
+
+    plex_library_key holds the subfolder name relative to /watchdawg/Private/,
+    e.g. "123_Vimeo_Girls". Walks that directory recursively, gets duration for
+    each video via ffprobe, and packs them into time slots using _pack_time_slots.
+
+    All slots use source_type="local_private" and stream_url pointing to
+    /library/stream/Private/{folder}/{filename}. For in-progress slots the
+    /epg/stream/ endpoint handles FFmpeg seeking (same as Plex channels).
+    """
+    import asyncio as _asyncio
+    import os as _os
+    import urllib.parse as _urllib_parse
+
+    folder_path = channel.get("plex_library_key", "") or ""
+    if not folder_path:
+        logger.warning(f"EPG local_private: channel {channel['id']} has no folder_path set in plex_library_key — skipping.")
+        return []
+
+    full_folder = _os.path.join("/watchdawg/Private", folder_path)
+    if not _os.path.isdir(full_folder):
+        logger.warning(f"EPG local_private: channel {channel['id']} folder does not exist: {full_folder}")
+        return []
+
+    video_exts = {".mp4", ".mkv", ".webm", ".m4v", ".avi", ".mov"}
+    video_files = []
+    for dirpath, _dirs, files in _os.walk(full_folder):
+        for fname in sorted(files):
+            _, ext = _os.path.splitext(fname)
+            if ext.lower() not in video_exts:
+                continue
+            full_path = _os.path.join(dirpath, fname)
+            # Only include files > 1MB — skip partial downloads
+            try:
+                if _os.path.getsize(full_path) < 1_000_000:
+                    continue
+            except OSError:
+                continue
+            video_files.append(full_path)
+
+    if not video_files:
+        logger.warning(f"EPG local_private: channel {channel['id']} — no video files found in {full_folder}")
+        return []
+
+    # Get duration for each file via ffprobe
+    async def _ffprobe_duration(file_path: str) -> int:
+        """Returns duration in seconds, or 0 on failure."""
+        try:
+            proc = await _asyncio.create_subprocess_exec(
+                "ffprobe",
+                "-v", "quiet",
+                "-print_format", "json",
+                "-show_format",
+                file_path,
+                stdout=_asyncio.subprocess.PIPE,
+                stderr=_asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await _asyncio.wait_for(proc.communicate(), timeout=30)
+            raw = stdout.decode(errors="ignore").strip()
+            if raw:
+                import json as _json
+                data = _json.loads(raw)
+                dur_str = data.get("format", {}).get("duration", "0")
+                return max(0, int(float(dur_str)))
+            return 0
+        except _asyncio.TimeoutError:
+            logger.warning(f"EPG local_private: ffprobe timed out for {file_path}")
+            return 0
+        except Exception as e:
+            logger.warning(f"EPG local_private: ffprobe error for {file_path}: {e}")
+            return 0
+
+    items = []
+    for full_path in video_files:
+        # stream_url is relative to the watchdawg downloads root
+        # library.py serves /library/stream/{relative_path}
+        rel = _os.path.relpath(full_path, "/watchdawg")  # e.g. Private/123_Folder/vid.mp4
+        stream_url = f"/library/stream/{_urllib_parse.quote(rel, safe='/')}"
+
+        title = _os.path.splitext(_os.path.basename(full_path))[0]
+
+        duration_s = await _ffprobe_duration(full_path)
+        if duration_s < MIN_DURATION_SECONDS:
+            # ffprobe failed or very short — skip
+            logger.debug(f"EPG local_private: skipping {full_path} (duration={duration_s}s)")
+            continue
+
+        items.append({
+            "title":            title,
+            "subtitle":         folder_path,
+            "description":      "",
+            "thumbnail_url":    "",
+            "stream_url":       stream_url,
+            "source_type":      "local_private",
+            "source_id":        rel,   # relative path used by FFmpeg stream endpoint
+            "duration_seconds": duration_s,
+            "rating":           0,
+        })
+
+    if not items:
+        logger.warning(f"EPG local_private: channel {channel['id']} — no usable video files after duration check in {full_folder}")
+        return []
+
+    if channel["rotation_style"] == "shuffle":
+        random.shuffle(items)
+
+    logger.info(
+        f"EPG local_private: channel {channel['id']} '{channel['name']}' — "
+        f"{len(items)} files from {full_folder}"
+    )
+    return _pack_time_slots(items, build_from, schedule_end, channel)
 
 
 # ---------------------------------------------------------------------------

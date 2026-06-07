@@ -356,9 +356,21 @@
         .ch-cat-group.collapsed .ch-cat-body { display: none; }
 
         /* Channel card */
-        .channel-card { background: var(--bg-card); border: 1px solid var(--border-subtle); border-radius: var(--radius); padding: 12px 14px; transition: border-color 0.2s; animation: fadeIn 0.3s ease both; }
+        .channel-card { background: var(--bg-card); border: 1px solid var(--border-subtle); border-radius: var(--radius); padding: 12px 14px; transition: border-color 0.2s, background 0.3s; animation: fadeIn 0.3s ease both; }
         .channel-card:hover { border-color: var(--border-focus); }
         .channel-card.locked-channel { border-color: var(--accent-orange); }
+        .channel-card.has-local { background: #0d1f0f; border-color: #22c55e44; }
+        .channel-card.has-local:hover { border-color: var(--accent-green); }
+        .channel-card.is-downloading { background: #0d1525; border-color: #3b82f644; animation: pulse-blue 2s infinite; }
+        @keyframes pulse-blue { 0%,100% { border-color: #3b82f644; } 50% { border-color: #3b82f6aa; } }
+        .dl-status-badge { display:inline-flex; align-items:center; gap:5px; font-size:11px; font-weight:600; padding:2px 8px; border-radius:20px; margin-top:4px; }
+        .dl-status-badge.has-local { background:var(--accent-green-dim); color:var(--accent-green); }
+        .dl-status-badge.is-downloading { background:var(--accent-blue-dim); color:var(--accent-blue); }
+        .dl-status-badge .dl-dot { width:6px; height:6px; border-radius:50%; background:currentColor; }
+        .dl-status-badge.is-downloading .dl-dot { animation: blink 1s infinite; }
+        @keyframes blink { 0%,100% { opacity:1; } 50% { opacity:0.2; } }
+        .btn-icon-stop { background:none; border:1px solid var(--accent-orange); color:var(--accent-orange); border-radius:var(--radius-sm); padding:3px 7px; font-size:13px; cursor:pointer; transition:all 0.15s; }
+        .btn-icon-stop:hover { background:var(--accent-orange-dim); }
         .channel-type-badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 10px; font-weight: 700; text-transform: uppercase; margin-bottom: 6px; }
         .badge-playlist { background: var(--accent-orange-dim); color: var(--accent-orange); }
         .channel-info { margin-bottom: 8px; }
@@ -909,6 +921,7 @@
                         <div class="live-tv-import-row">
                             <input type="text" id="m3uUrlInput" placeholder="Paste M3U URL...">
                             <input type="text" id="m3uLabelInput" placeholder="Label (optional)" style="max-width:200px;">
+                            <input type="text" id="m3uGroupFilterInput" placeholder="Group filter (optional, e.g. tunarr or adult)" style="max-width:280px;">
                             <button class="btn btn-primary btn-sm" onclick="importM3U()">Import</button>
                         </div>
                     </div>
@@ -972,27 +985,50 @@
                     </div>
                 </div>
 
+                <!-- XMLTV Sources Card (Session 44 — Tunarr EPG) -->
+                <div class="live-tv-import" id="xmltvSourcesCard">
+                    <h3>&#x1F4E1; XMLTV Sources <span style="font-size:11px;font-weight:400;color:var(--text-muted);">(Tunarr EPG)</span></h3>
+                    <div class="live-tv-import-row" style="margin-bottom:6px;">
+                        <input type="text" id="xmltvUrlInput" placeholder="XMLTV URL (e.g. http://192.168.50.42:7777/api/xmltv.xml)" style="flex:1;">
+                        <input type="text" id="xmltvLabelInput" placeholder="Label (optional)" style="max-width:180px;">
+                        <select id="xmltvEpgType" style="max-width:110px;padding:7px 10px;background:var(--bg-surface);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);color:var(--text-primary);font-size:13px;font-family:'Outfit',sans-serif;outline:none;">
+                            <option value="main">Main EPG</option>
+                            <option value="adult">Adult EPG</option>
+                        </select>
+                        <button class="btn btn-primary btn-sm" onclick="importXmltvSource()">Import</button>
+                    </div>
+                    <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px;">
+                        <input type="text" id="xmltvChannelFilterInput" placeholder="Channel name filter (optional). e.g. 'Adult' = only Adult channels. '!Adult' = exclude Adult channels." style="flex:1;padding:7px 12px;background:var(--bg-surface);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);color:var(--text-primary);font-size:13px;font-family:'Outfit',sans-serif;outline:none;">
+                    </div>
+                    <div id="xmltvSourcesList" style="font-size:13px;color:var(--text-muted);">Loading...</div>
+                </div>
+
                 <!-- Plex Connection Card -->
-                <div class="live-tv-import" id="epgPlexCard">
-                    <h3>&#x1F7E0; Plex Media Server</h3>
-                    <div id="epgPlexStatus" style="margin-bottom:10px;font-size:13px;color:var(--text-muted);">
-                        Checking Plex connection...
+                <div class="live-tv-import" id="epgPlexCard" style="padding:10px 16px;">
+                    <div style="display:flex;align-items:center;justify-content:space-between;cursor:pointer;" onclick="togglePlexCard()">
+                        <h3 style="margin:0;">&#x1F7E0; Plex Media Server &nbsp;<span id="epgPlexStatusInline" style="font-size:12px;font-weight:400;color:var(--text-muted);">Checking...</span></h3>
+                        <span id="plexCardChevron" style="font-size:14px;color:var(--text-muted);">&#x25BC;</span>
                     </div>
-                    <div id="epgPlexConnectForm" style="display:none;">
-                        <div class="live-tv-import-row" style="flex-wrap:wrap;gap:8px;">
-                            <input type="text" id="plexIpInput" placeholder="Plex IP (e.g. 192.168.50.10)" style="flex:2;min-width:160px;">
-                            <input type="number" id="plexPortInput" placeholder="Port" value="32400" style="flex:0.5;min-width:80px;">
-                            <input type="password" id="plexTokenInput" placeholder="X-Plex-Token" style="flex:2;min-width:160px;">
-                            <button class="btn btn-primary" onclick="connectPlex()">Connect</button>
+                    <div id="epgPlexCardBody" style="display:none;margin-top:10px;">
+                        <div id="epgPlexStatus" style="margin-bottom:10px;font-size:13px;color:var(--text-muted);">
+                            Checking Plex connection...
                         </div>
-                    </div>
-                    <div id="epgPlexLibraries" style="display:none;margin-top:12px;">
-                        <div style="font-size:12px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.6px;margin-bottom:8px;">Libraries</div>
-                        <div id="epgPlexLibraryList" style="display:flex;flex-wrap:wrap;gap:8px;"></div>
-                    </div>
-                    <div id="epgPlexConnectedActions" style="display:none;margin-top:10px;">
-                        <button class="btn btn-sm" onclick="loadPlexLibraries()">&#x21BB; Refresh Libraries</button>
-                        <button class="btn btn-sm" style="color:var(--text-muted);" onclick="disconnectPlex()">Disconnect</button>
+                        <div id="epgPlexConnectForm" style="display:none;">
+                            <div class="live-tv-import-row" style="flex-wrap:wrap;gap:8px;">
+                                <input type="text" id="plexIpInput" placeholder="Plex IP (e.g. 192.168.50.10)" style="flex:2;min-width:160px;">
+                                <input type="number" id="plexPortInput" placeholder="Port" value="32400" style="flex:0.5;min-width:80px;">
+                                <input type="password" id="plexTokenInput" placeholder="X-Plex-Token" style="flex:2;min-width:160px;">
+                                <button class="btn btn-primary" onclick="connectPlex()">Connect</button>
+                            </div>
+                        </div>
+                        <div id="epgPlexLibraries" style="display:none;margin-top:12px;">
+                            <div style="font-size:12px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.6px;margin-bottom:8px;">Libraries</div>
+                            <div id="epgPlexLibraryList" style="display:flex;flex-wrap:wrap;gap:8px;"></div>
+                        </div>
+                        <div id="epgPlexConnectedActions" style="display:none;margin-top:10px;">
+                            <button class="btn btn-sm" onclick="loadPlexLibraries()">&#x21BB; Refresh Libraries</button>
+                            <button class="btn btn-sm" style="color:var(--text-muted);" onclick="disconnectPlex()">Disconnect</button>
+                        </div>
                     </div>
                 </div>
 
@@ -1052,6 +1088,7 @@
                                 <option value="plex_tv">Plex — TV Series</option>
                                 <option value="watchdawg">WatchDawg Scraped Sources</option>
                                 <option value="iptv_favorites">IPTV Favorites (Live)</option>
+                                <option value="local_private">&#x1F4C2; Local Private Folder</option>
                             </select>
                         </div>
 
@@ -1070,6 +1107,15 @@
                                 <option value="">All Sources</option>
                             </select>
                             <div style="font-size:11px;color:var(--text-muted);margin-top:4px;">Pin this EPG channel to one specific WatchDawg source, or leave on All Sources and use the Genre Filter below to pull from multiple sources at once.</div>
+                        </div>
+
+                        <!-- Private Folder Picker (shown for local_private type) — Session 43 -->
+                        <div id="epgModalPrivateFolderRow" style="display:none;">
+                            <label style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;">Private Folder</label>
+                            <select id="epgModalPrivateFolder" style="width:100%;margin-top:4px;padding:7px 10px;background:var(--bg-surface);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);color:var(--text-primary);font-size:13px;font-family:'Outfit',sans-serif;outline:none;">
+                                <option value="">Select folder...</option>
+                            </select>
+                            <div style="font-size:11px;color:var(--text-muted);margin-top:4px;">Subfolders inside /watchdawg/Private/ that contain video files. Duration is probed automatically by the scheduler.</div>
                         </div>
 
                         <!-- Genre Filter -->
@@ -1627,6 +1673,8 @@
                     <div class="ch-cat-body">${chs.map((ch, i) => _channelCardOrGroupHtml(ch, i, childrenByParent)).join('')}</div>
                 </div>`;
             }).join('');
+            // Session 43: refresh download status badges for all rendered cards
+            setTimeout(refreshAllDlStatus, 50);
         }
 
         function _channelCardOrGroupHtml(ch, i, childrenByParent) {
@@ -1679,7 +1727,7 @@
             const genreHint = _genreHintForCat(ch.category);
             // Session 38: child playlist cards get an orange left-border accent
             const childClass = isChild ? ' ch-child' : '';
-            return `<div class="channel-card${childClass} ${ch.locked?'locked-channel':''}" style="animation-delay:${i*0.04}s" id="channelCard_${ch.id}">
+            return `<div class="channel-card${childClass} ${ch.locked?'locked-channel':''}" style="animation-delay:${i*0.04}s" id="channelCard_${ch.id}" data-chid="${ch.id}">
                 <div class="channel-type-badge ${typeBadge}">${typeLabel}</div>
                 <div class="channel-info">
                     <div class="channel-name" id="channelName_${ch.id}">${escapeHtml(ch.name)}</div>
@@ -1696,6 +1744,7 @@
                     <span>&#x1F551; ${lastScraped}</span>
                     ${ch.last_scrape_count!=null?`<span>+${ch.last_scrape_count} last</span>`:''}
                 </div>
+                <div id="dlStatusBadge_${ch.id}"></div>
                 ${genreBadgesHtml}
                 <div class="genre-tag-row" style="margin-top:6px;">
                     <input class="genre-tag-input" id="genreInput_${ch.id}"
@@ -1711,6 +1760,7 @@
                     <button class="btn-icon btn-icon-blue" id="upgradeBtn_${ch.id}" onclick="upgradeChannel(${ch.id},'${escapeHtml(ch.name).replace(/'/g,"\\'")}')">&#x2B06;</button>
                     <button class="btn-icon btn-icon-warn" onclick="clearChannelVideos(${ch.id},'${escapeHtml(ch.name).replace(/'/g,"\\'")}')">&#x1F9F9;</button>
                     <button class="btn-icon ${ch.locked?'btn-icon-danger':'btn-icon-blue'}" id="dlBtn_${ch.id}" onclick="massDownloadChannel(${ch.id},'${escapeHtml(ch.name).replace(/'/g,"\\'")}',${ch.locked})" title="Mass download all videos to local storage">&#x1F4E5;</button>
+                    <button class="btn-icon-stop" id="dlStopBtn_${ch.id}" onclick="stopMassDownload(${ch.id})" title="Stop download" style="display:none">&#x23F9;</button>
                     <button class="lock-toggle-btn ${ch.locked?'locked':''}" onclick="toggleChannelLock(${ch.id},${ch.locked})">${ch.locked?'&#x1F512;':'&#x1F513;'}</button>
                     <button class="toggle-switch ${ch.enabled?'active':''}" onclick="toggleChannel(${ch.id},${!ch.enabled})" title="${ch.enabled?'Disable':'Enable'}"></button>
                     <button class="btn-icon btn-icon-danger" onclick="deleteChannel(${ch.id},'${escapeHtml(ch.name).replace(/'/g,"\\'")}')">&#x1F5D1;</button>
@@ -2012,10 +2062,10 @@
             finally{if(btn){btn.classList.remove('spinning');btn.disabled=false;}}
         }
 
+        // Session 43: download status polling — keyed by channelId, value = setInterval id
+        const _dlPollers = {};
+
         async function massDownloadChannel(channelId, name, locked) {
-            // Session 42: mass download all videos for a channel to local storage.
-            // Locked channels → /watchdawg/Private/{id}_{name}/
-            // Unlocked channels → /watchdawg/Public/{id}_{name}/
             const quality = prompt(
                 `Download all videos from "${name}" to local storage.\n\n` +
                 `Quality (enter one):\n  720 — up to 720p (recommended, faster)\n  1080 — up to 1080p\n  best — highest available\n\n` +
@@ -2027,15 +2077,95 @@
                 if (quality !== null) log('Invalid quality. Use 720, 1080, or best.', 'warn');
                 return;
             }
-            const btn=document.getElementById(`dlBtn_${channelId}`);
-            if(btn){btn.classList.add('spinning');btn.disabled=true;}
+            const btn = document.getElementById(`dlBtn_${channelId}`);
+            if (btn) { btn.classList.add('spinning'); btn.disabled = true; }
             try {
-                const res=await fetch(`${API_BASE}/channel/${channelId}/mass-download?quality=${quality.trim()}`,{method:'POST'});
-                if(!res.ok){const err=await res.json();throw new Error(err.detail||'Failed');}
-                const data=await res.json();
+                const res = await fetch(`${API_BASE}/channel/${channelId}/mass-download?quality=${quality.trim()}`, { method: 'POST' });
+                if (!res.ok) { const err = await res.json(); throw new Error(err.detail || 'Failed'); }
+                const data = await res.json();
                 log(`Mass download started for "${name}": ${data.total_videos} videos → ${data.download_dir}`, 'success');
-            } catch(e){log(`Mass download failed: ${e.message}`,'error');}
-            finally{if(btn){btn.classList.remove('spinning');btn.disabled=false;}}
+                // Start polling status for this channel
+                startDlPoller(channelId);
+            } catch(e) { log(`Mass download failed: ${e.message}`, 'error'); }
+            finally { if (btn) { btn.classList.remove('spinning'); btn.disabled = false; } }
+        }
+
+        async function stopMassDownload(channelId) {
+            try {
+                const res = await fetch(`${API_BASE}/channel/${channelId}/mass-download/stop`, { method: 'POST' });
+                const data = await res.json();
+                log(`Download stopped for channel ${channelId}`, 'warn');
+                stopDlPoller(channelId);
+                updateDlStatusBadge(channelId, { is_downloading: false });
+            } catch(e) { log(`Stop failed: ${e.message}`, 'error'); }
+        }
+
+        function startDlPoller(channelId) {
+            if (_dlPollers[channelId]) clearInterval(_dlPollers[channelId]);
+            // Poll immediately then every 4 seconds
+            updateDlStatus(channelId);
+            _dlPollers[channelId] = setInterval(() => updateDlStatus(channelId), 4000);
+        }
+
+        function stopDlPoller(channelId) {
+            if (_dlPollers[channelId]) {
+                clearInterval(_dlPollers[channelId]);
+                delete _dlPollers[channelId];
+            }
+        }
+
+        async function updateDlStatus(channelId) {
+            try {
+                const res = await fetch(`${API_BASE}/channel/${channelId}/download-status`);
+                if (!res.ok) return;
+                const data = await res.json();
+                updateDlStatusBadge(channelId, data);
+                // Stop polling when download finishes
+                if (!data.is_downloading && _dlPollers[channelId]) {
+                    stopDlPoller(channelId);
+                }
+            } catch(e) { /* silent — don't spam logs */ }
+        }
+
+        function updateDlStatusBadge(channelId, data) {
+            const card = document.getElementById(`channelCard_${channelId}`);
+            const badge = document.getElementById(`dlStatusBadge_${channelId}`);
+            const dlBtn = document.getElementById(`dlBtn_${channelId}`);
+            const stopBtn = document.getElementById(`dlStopBtn_${channelId}`);
+            if (!card || !badge) return;
+
+            // Card color
+            card.classList.remove('has-local', 'is-downloading');
+            if (data.is_downloading) {
+                card.classList.add('is-downloading');
+            } else if (data.file_count > 0) {
+                card.classList.add('has-local');
+            }
+
+            // Stop / download button visibility
+            if (stopBtn) stopBtn.style.display = data.is_downloading ? '' : 'none';
+            if (dlBtn)   dlBtn.style.display   = data.is_downloading ? 'none' : '';
+
+            // Badge content
+            if (data.is_downloading) {
+                const pct = data.total > 0 ? Math.round(((data.completed + data.skipped) / data.total) * 100) : 0;
+                badge.innerHTML = `<span class="dl-status-badge is-downloading"><span class="dl-dot"></span> Downloading ${data.completed + data.skipped}/${data.total} &nbsp;${pct}%</span>`;
+            } else if (data.file_count > 0) {
+                badge.innerHTML = `<span class="dl-status-badge has-local"><span class="dl-dot"></span> ${data.file_count} files &nbsp;·&nbsp; ${data.total_size_mb} MB local</span>`;
+            } else {
+                badge.innerHTML = '';
+            }
+        }
+
+        // On channels page load: fetch status for all visible channel cards
+        async function refreshAllDlStatus() {
+            const cards = document.querySelectorAll('.channel-card[data-chid]');
+            for (const card of cards) {
+                const channelId = parseInt(card.dataset.chid);
+                if (!isNaN(channelId)) {
+                    await updateDlStatus(channelId);
+                }
+            }
         }
 
         async function scrapeChannel(channelId, name) {
@@ -2466,6 +2596,7 @@
                 const meta = [
                     `${src.channel_count} ch`,
                     src.total > 0 ? `${src.online}&#x25CF; ${src.offline}&#x25CB;` : 'not probed',
+                    src.group_filter ? `group: ${src.group_filter}` : '',
                     src.last_imported_at ? `imported ${new Date(src.last_imported_at).toLocaleDateString()}` : '',
                 ].filter(Boolean).join(' &nbsp;·&nbsp; ');
                 return `<div class="live-src-card${src.enabled ? '' : ' disabled'}">
@@ -2476,6 +2607,7 @@
                     </div>
                     <div class="live-src-actions">
                         <button class="live-src-filter${isActive ? ' active' : ''}" onclick="filterLiveTvBySource('${escapeHtml(src.url).replace(/'/g,"\\'")}', this)" title="Filter channels to this source">&#x1F50D;</button>
+                        <button class="btn btn-sm" onclick="refreshLiveTvSource(${src.id}, '${escapeHtml(src.label).replace(/'/g,"\\'")}')" title="Re-fetch M3U and sync channels">&#x21BB; Sync</button>
                         <button class="live-src-toggle ${toggleClass}" onclick="toggleLiveTvSource(${src.id})">${toggleLabel}</button>
                         <button class="btn-icon btn-icon-danger" onclick="deleteLiveTvSource(${src.id}, '${escapeHtml(src.label).replace(/'/g,"\\'")}', ${src.channel_count})" title="Delete source and all its channels">&#x1F5D1;</button>
                     </div>
@@ -2845,27 +2977,29 @@
         }
 
         async function importM3U() {
-            const urlInput   = document.getElementById('m3uUrlInput');
-            const labelInput = document.getElementById('m3uLabelInput');
-            const url        = urlInput.value.trim();
-            const label      = labelInput.value.trim() || null;
-            const btn        = document.querySelector('.live-tv-import .btn-primary');
+            const urlInput         = document.getElementById('m3uUrlInput');
+            const labelInput       = document.getElementById('m3uLabelInput');
+            const groupFilterInput = document.getElementById('m3uGroupFilterInput');
+            const url              = urlInput.value.trim();
+            const label            = labelInput.value.trim() || null;
+            const group_filter     = groupFilterInput.value.trim() || null;
+            const btn              = document.querySelector('.live-tv-import .btn-primary');
             btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
             if (!url) { log('Enter an M3U URL.', 'warn'); btn.disabled = false; btn.innerHTML = 'Import'; return; }
             try {
                 const res = await fetch(`${API_BASE}/live-tv/import-m3u`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ url, label }),
+                    body: JSON.stringify({ url, label, group_filter }),
                 });
                 const data = await res.json();
                 if (!res.ok) { log(`M3U import failed: ${data.detail || 'Unknown error (HTTP ' + res.status + ')'}`, 'error'); return; }
                 if (data.warning) {
                     log(`M3U: ${data.warning}`, 'warn');
                 } else {
-                    log(`M3U: ${data.imported} imported, ${data.skipped} skipped`, data.imported > 0 ? 'success' : 'info');
+                    log(`M3U: ${data.imported} imported, ${data.skipped} skipped${group_filter ? ' (group: ' + group_filter + ')' : ''}`, data.imported > 0 ? 'success' : 'info');
                 }
-                urlInput.value = ''; labelInput.value = '';
+                urlInput.value = ''; labelInput.value = ''; groupFilterInput.value = '';
                 await loadLiveTv();
             } catch(e) { log(`M3U import failed: ${e.message}`, 'error'); }
             finally { btn.disabled = false; btn.innerHTML = 'Import'; }
@@ -2896,6 +3030,17 @@
                 log(`Source ${data.status}`, 'info');
                 await loadLiveTv();
             } catch(e) { log(`Toggle failed: ${e.message}`, 'error'); }
+        }
+
+        async function refreshLiveTvSource(id, label) {
+            try {
+                log(`Syncing source "${label}"…`, 'info');
+                const res  = await fetch(`${API_BASE}/live-tv/sources/${id}/refresh`, { method: 'POST' });
+                const data = await res.json();
+                if (!res.ok) { log(`Sync failed: ${data.detail || 'error'}`, 'error'); return; }
+                log(`Source "${label}" synced: +${data.added} added, -${data.removed} removed, ${data.unchanged} unchanged`, 'success');
+                await loadLiveTv();
+            } catch(e) { log(`Sync failed: ${e.message}`, 'error'); }
         }
 
         async function deleteLiveTvSource(id, label, channelCount) {
@@ -3666,9 +3811,118 @@
     // -----------------------------------------------------------------------
     // Page load
     // -----------------------------------------------------------------------
+    let _plexCardOpen = false;
+
+    function togglePlexCard() {
+        _plexCardOpen = !_plexCardOpen;
+        document.getElementById('epgPlexCardBody').style.display = _plexCardOpen ? 'block' : 'none';
+        document.getElementById('plexCardChevron').innerHTML = _plexCardOpen ? '&#x25B2;' : '&#x25BC;';
+    }
+
     function loadEpgPage() {
         loadPlexStatus();
         loadEpgChannels(epgCurrentTab);
+        loadXmltvSources();
+    }
+
+    // -----------------------------------------------------------------------
+    // XMLTV Source Management — Session 44
+    // -----------------------------------------------------------------------
+    const _XMLTV_API = window.location.origin;
+
+    async function loadXmltvSources() {
+        try {
+            const res  = await fetch(`${_XMLTV_API}/epg/xmltv-sources`);
+            const data = await res.json();
+            renderXmltvSources(data.sources || []);
+        } catch(e) {
+            document.getElementById('xmltvSourcesList').innerHTML =
+                '<span style="color:var(--accent-red);">Failed to load XMLTV sources</span>';
+        }
+    }
+
+    function renderXmltvSources(sources) {
+        const el = document.getElementById('xmltvSourcesList');
+        if (!sources.length) {
+            el.innerHTML = '<span style="color:var(--text-muted);">No XMLTV sources yet — paste a URL above and click Import.</span>';
+            return;
+        }
+        el.innerHTML = sources.map(src => `
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--border-subtle);">
+                <div>
+                    <div style="font-weight:600;color:var(--text-primary);">${escapeHtml(src.label)}</div>
+                    <div style="font-size:11px;color:var(--text-muted);font-family:'JetBrains Mono',monospace;">${escapeHtml(src.url)}</div>
+                    <div style="font-size:11px;color:var(--text-muted);margin-top:2px;">
+                        ${src.epg_type === 'adult' ? '&#x1F51E; Adult EPG' : '&#x1F4FA; Main EPG'}
+                        ${src.channel_filter ? '&nbsp;·&nbsp; filter: <strong>' + escapeHtml(src.channel_filter) + '</strong>' : ''}
+                        &nbsp;·&nbsp;
+                        ${src.last_imported_at ? 'Last import: ' + new Date(src.last_imported_at).toLocaleString() : 'Never imported'}
+                    </div>
+                </div>
+                <div style="display:flex;gap:6px;flex-shrink:0;">
+                    <button class="btn btn-sm" onclick="reimportXmltvSource(${src.id}, '${escapeHtml(src.url).replace(/'/g,"\'")}', '${src.epg_type}', '${escapeHtml(src.label).replace(/'/g,"\'")}', ${src.channel_filter ? "'" + escapeHtml(src.channel_filter).replace(/'/g,"\'") + "'" : 'null'})">&#x21BB; Sync</button>
+                    <button class="btn-icon btn-icon-danger" onclick="deleteXmltvSource(${src.id}, '${escapeHtml(src.label).replace(/'/g,"\'")}')">&#x1F5D1;</button>
+                </div>
+            </div>
+        `).join('');
+    }
+
+    function _xmltvLog(msg, type) {
+        console.log('[XMLTV]', type, msg);
+        // Try the global log function if available
+        try { if (typeof log === 'function') log(msg, type); } catch(_) {}
+    }
+
+    async function importXmltvSource() {
+        const url            = document.getElementById('xmltvUrlInput').value.trim();
+        const label          = document.getElementById('xmltvLabelInput').value.trim() || null;
+        const epg_type       = document.getElementById('xmltvEpgType').value;
+        const channel_filter = document.getElementById('xmltvChannelFilterInput').value.trim() || null;
+        if (!url) { _xmltvLog('Enter an XMLTV URL.', 'warn'); return; }
+        _xmltvLog('Importing XMLTV...', 'info');
+        try {
+            const res  = await fetch(`${_XMLTV_API}/epg/import-xmltv`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ url, label, epg_type, channel_filter }),
+            });
+            const data = await res.json();
+            if (!res.ok) { _xmltvLog(`XMLTV import failed: ${data.detail || 'error'}`, 'error'); return; }
+            _xmltvLog(`XMLTV import complete: ${data.channels_upserted} channels, ${data.slots_inserted} slots${channel_filter ? ' (filter: ' + channel_filter + ')' : ''}`, 'success');
+            document.getElementById('xmltvUrlInput').value = '';
+            document.getElementById('xmltvLabelInput').value = '';
+            document.getElementById('xmltvChannelFilterInput').value = '';
+            await loadXmltvSources();
+            loadEpgChannels(epgCurrentTab);
+        } catch(e) { _xmltvLog(`XMLTV import failed: ${e.message}`, 'error'); }
+    }
+
+    async function reimportXmltvSource(id, url, epg_type, label, channel_filter) {
+        _xmltvLog(`Syncing XMLTV "${label}"...`, 'info');
+        try {
+            const res  = await fetch(`${_XMLTV_API}/epg/import-xmltv`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ url, label, epg_type, channel_filter: channel_filter || null }),
+            });
+            const data = await res.json();
+            if (!res.ok) { _xmltvLog(`XMLTV sync failed: ${data.detail || 'error'}`, 'error'); return; }
+            _xmltvLog(`XMLTV sync complete: ${data.channels_upserted} channels, ${data.slots_inserted} slots`, 'success');
+            await loadXmltvSources();
+            loadEpgChannels(epgCurrentTab);
+        } catch(e) { _xmltvLog(`XMLTV sync failed: ${e.message}`, 'error'); }
+    }
+
+    async function deleteXmltvSource(id, label) {
+        if (!confirm(`Delete XMLTV source "${label}" and all its EPG channels?`)) return;
+        try {
+            const res  = await fetch(`${_XMLTV_API}/epg/xmltv-sources/${id}`, { method: 'DELETE' });
+            const data = await res.json();
+            if (!res.ok) { _xmltvLog(`Delete failed: ${data.detail || 'error'}`, 'error'); return; }
+            _xmltvLog(`XMLTV source "${label}" deleted — ${data.channels_deleted} channels removed`, 'success');
+            await loadXmltvSources();
+            loadEpgChannels(epgCurrentTab);
+        } catch(e) { _xmltvLog(`Delete failed: ${e.message}`, 'error'); }
     }
 
     function switchEpgTab(type) {
@@ -3689,18 +3943,22 @@
         try {
             const res = await fetch('/plex/status');
             const data = await res.json();
+            const inlineEl = document.getElementById('epgPlexStatusInline');
             if (data.status === 'connected') {
                 statusEl.innerHTML = `<span style="color:var(--success-green);">&#x2705; Connected to <strong>${data.server_name}</strong> at ${data.plex_url}</span>`;
+                if (inlineEl) inlineEl.innerHTML = `<span style="color:var(--success-green);">&#x2705; ${data.server_name}</span>`;
                 connectForm.style.display = 'none';
                 actionsEl.style.display = 'block';
                 loadPlexLibraries();
             } else if (data.status === 'error') {
                 statusEl.innerHTML = `<span style="color:var(--error-red);">&#x26A0; ${data.server_name} — ${data.detail}</span>`;
+                if (inlineEl) inlineEl.innerHTML = `<span style="color:var(--accent-red);">&#x26A0; Error</span>`;
                 connectForm.style.display = 'block';
                 actionsEl.style.display = 'none';
                 librariesEl.style.display = 'none';
             } else {
                 statusEl.innerHTML = `<span style="color:var(--text-muted);">Plex not configured. Enter your server details below.</span>`;
+                if (inlineEl) inlineEl.innerHTML = `<span style="color:var(--text-muted);">Not configured</span>`;
                 connectForm.style.display = 'block';
                 actionsEl.style.display = 'none';
                 librariesEl.style.display = 'none';
@@ -3897,7 +4155,11 @@
             }
         }
 
-        if (ch.plex_library_key) {
+        // Session 43: restore private folder picker when editing local_private channel
+        if (ch.source_type === 'local_private' && ch.plex_library_key) {
+            await loadPrivateFolders();
+            document.getElementById('epgModalPrivateFolder').value = ch.plex_library_key;
+        } else if (ch.plex_library_key) {
             document.getElementById('epgModalPlexLibrary').value = ch.plex_library_key;
             await loadEpgModalGenres();
             if (ch.genre_filter) {
@@ -3926,19 +4188,17 @@
         const isWatchdawg = sourceType === 'watchdawg';
         const isTv = sourceType === 'plex_tv';
         const isIptv = sourceType === 'iptv_favorites';
+        const isLocalPrivate = sourceType === 'local_private';  // Session 43
 
         document.getElementById('epgModalPlexLibraryRow').style.display = isPlexType ? 'block' : 'none';
-        // Session 40: show WatchDawg source picker only for watchdawg type
         document.getElementById('epgModalWatchdawgSourceRow').style.display = isWatchdawg ? 'block' : 'none';
-        document.getElementById('epgModalGenreRow').style.display = isIptv ? 'none' : 'block';
+        document.getElementById('epgModalPrivateFolderRow').style.display = isLocalPrivate ? 'block' : 'none';
+        document.getElementById('epgModalGenreRow').style.display = (isIptv || isLocalPrivate) ? 'none' : 'block';
         document.getElementById('epgModalEpBudgetRow').style.display = isTv ? 'block' : 'none';
         document.getElementById('epgModalRotationRow').style.display = isIptv ? 'none' : 'block';
 
-        // Load WatchDawg sources and genres when switching to watchdawg type
-        if (isWatchdawg) {
-            loadWatchdawgSources();
-        }
-        // Reset genre dropdown when switching away from watchdawg or plex
+        if (isWatchdawg) { loadWatchdawgSources(); }
+        if (isLocalPrivate) { loadPrivateFolders(); }
         if (!isPlexType && !isWatchdawg) {
             document.getElementById('epgModalGenre').innerHTML = '<option value="">All Genres</option>';
         }
@@ -3995,6 +4255,25 @@
         }
     }
 
+    // Session 43: load /watchdawg/Private subfolders into the folder picker dropdown
+    async function loadPrivateFolders() {
+        const sel = document.getElementById('epgModalPrivateFolder');
+        sel.innerHTML = '<option value="">Loading folders...</option>';
+        try {
+            const res = await fetch('/epg/private-folders');
+            const data = await res.json();
+            const folders = data.folders || [];
+            if (folders.length === 0) {
+                sel.innerHTML = '<option value="">No folders found in /watchdawg/Private/</option>';
+            } else {
+                sel.innerHTML = '<option value="">Select folder...</option>' +
+                    folders.map(f => `<option value="${f.path}">${f.name} (${f.file_count} files)</option>`).join('');
+            }
+        } catch(e) {
+            sel.innerHTML = '<option value="">Error loading folders</option>';
+        }
+    }
+
     async function populatePlexLibraryDropdown() {
         if (epgPlexLibraries.length === 0) {
             try {
@@ -4032,20 +4311,24 @@
 
         const watchdawgSourceRaw = document.getElementById('epgModalWatchdawgSource').value;
 
+        const sourceType = document.getElementById('epgModalSourceType').value;
+        const isLocalPrivate = sourceType === 'local_private';
+
         const payload = {
             channel_number: parseInt(document.getElementById('epgModalNumber').value),
             name: document.getElementById('epgModalName').value.trim(),
             epg_type: document.getElementById('epgModalType').value,
-            source_type: document.getElementById('epgModalSourceType').value,
-            plex_library_key: document.getElementById('epgModalPlexLibrary').value || null,
+            source_type: sourceType,
+            plex_library_key: isLocalPrivate ? null : (document.getElementById('epgModalPlexLibrary').value || null),
             genre_filter: document.getElementById('epgModalGenre').value || null,
             episodes_per_day: parseInt(document.getElementById('epgModalEpBudget').value) || 2,
             rotation_style: document.getElementById('epgModalRotation').value,
             primetime_boost: document.getElementById('epgModalPrimetime').checked,
             logo_url: document.getElementById('epgModalLogo').value.trim() || null,
             enabled: true,
-            // Session 40: include watchdawg_source_id (null = all sources)
             watchdawg_source_id: watchdawgSourceRaw ? parseInt(watchdawgSourceRaw) : null,
+            // Session 43: local_private folder path
+            local_folder_path: isLocalPrivate ? (document.getElementById('epgModalPrivateFolder').value || null) : null,
         };
 
         if (!payload.name) { alert('Channel name is required.'); return; }

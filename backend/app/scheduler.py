@@ -62,8 +62,10 @@ SCHEDULED_EXPIRED_LIMIT = 100
 # Live TV health probe interval (minutes)
 LIVE_TV_PROBE_INTERVAL_MINUTES = 15
 
-# Live TV source refresh interval (hours) — re-syncs M3U sources, adds/removes channels
-LIVE_TV_REFRESH_INTERVAL_HOURS = 6
+# EPG schedule rebuild interval (hours)
+# Runs every 2 hours so pre-resolved WatchDawg CDN URLs stay fresher,
+# reducing the number of stale URLs that the HEAD-check falls back to yt-dlp for.
+EPG_REBUILD_INTERVAL_HOURS = 2
 
 
 async def scheduled_scrape():
@@ -225,42 +227,24 @@ async def scheduled_live_tv_probe():
         logger.error(f"Scheduled live TV probe failed: {e}")
 
 
-async def scheduled_xmltv_refresh():
+async def scheduled_epg_rebuild():
     """
-    XMLTV source refresh. Runs every 2 hours.
-    Re-fetches all enabled XMLTV sources (e.g. Tunarr) and rebuilds
-    epg_channels + epg_schedules from the fresh XML.
+    Periodic EPG schedule rebuild. Runs every EPG_REBUILD_INTERVAL_HOURS (2h).
+
+    Rebuilds all enabled EPG channels. Gap-fill logic means only channels with
+    schedule windows shorter than 48h actually write new rows — already-covered
+    channels return immediately with no DB writes. Lightweight on a full schedule.
+
+    Running every 2 hours keeps pre-resolved WatchDawg CDN URLs fresher,
+    reducing stale-URL failures caught by the HEAD-check in _serialize_slot.
     """
-    logger.info("Scheduled XMLTV refresh starting...")
+    logger.info("Scheduled EPG rebuild starting...")
     try:
-        from app.routers.epg import refresh_all_xmltv_sources
-        await refresh_all_xmltv_sources()
-        logger.info("Scheduled XMLTV refresh complete.")
+        from app.routers.epg import rebuild_all_epg_schedules
+        await rebuild_all_epg_schedules()
+        logger.info("Scheduled EPG rebuild complete.")
     except Exception as e:
-        logger.error(f"Scheduled XMLTV refresh failed: {e}")
-
-
-async def scheduled_live_tv_refresh():
-    """
-    Live TV source refresh. Runs every LIVE_TV_REFRESH_INTERVAL_HOURS (6h).
-
-    Re-fetches the M3U for every enabled source and syncs channels:
-      - Adds channels present in M3U but not in DB.
-      - Removes channels that belonged to this source but are no longer in M3U.
-      - Preserves favorites, sort_order, and online status on unchanged channels.
-    """
-    logger.info("Scheduled live TV source refresh starting...")
-    try:
-        from app.routers.live_tv import refresh_all_sources
-        async with async_session_factory() as db:
-            summary = await refresh_all_sources(db)
-        logger.info(
-            f"Scheduled live TV source refresh complete: "
-            f"{summary['sources']} sources, "
-            f"+{summary['added']} added, -{summary['removed']} removed"
-        )
-    except Exception as e:
-        logger.error(f"Scheduled live TV source refresh failed: {e}")
+        logger.error(f"Scheduled EPG rebuild failed: {e}")
 
 
 def start_scheduler():
@@ -320,22 +304,12 @@ def start_scheduler():
         next_run_time=None,
     )
 
-    # Live TV source refresh — every 6 hours
+    # EPG schedule rebuild — every EPG_REBUILD_INTERVAL_HOURS
     scheduler.add_job(
-        scheduled_live_tv_refresh,
-        trigger=IntervalTrigger(hours=LIVE_TV_REFRESH_INTERVAL_HOURS),
-        id="live_tv_refresh_job",
-        name="Live TV Source Refresh",
-        replace_existing=True,
-        next_run_time=None,
-    )
-
-    # XMLTV source refresh (Tunarr EPG) — every 2 hours
-    scheduler.add_job(
-        scheduled_xmltv_refresh,
-        trigger=IntervalTrigger(hours=2),
-        id="xmltv_refresh_job",
-        name="XMLTV EPG Refresh",
+        scheduled_epg_rebuild,
+        trigger=IntervalTrigger(hours=EPG_REBUILD_INTERVAL_HOURS),
+        id="epg_rebuild_job",
+        name="EPG Schedule Rebuild",
         replace_existing=True,
         next_run_time=None,
     )
@@ -350,7 +324,7 @@ def start_scheduler():
         f"Quality upgrade interval: {QUALITY_UPGRADE_INTERVAL_HOURS} hours "
         f"(chunk={QUALITY_UPGRADE_CHUNK_SIZE}, min={QUALITY_UPGRADE_MIN_HEIGHT}p). "
         f"Live TV probe interval: {LIVE_TV_PROBE_INTERVAL_MINUTES} minutes. "
-        f"Live TV source refresh interval: {LIVE_TV_REFRESH_INTERVAL_HOURS} hours. "
+        f"EPG rebuild interval: {EPG_REBUILD_INTERVAL_HOURS} hours. "
         f"All jobs start on next tick (trigger manually for first run)."
     )
 

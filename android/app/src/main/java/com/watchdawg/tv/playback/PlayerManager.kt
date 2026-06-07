@@ -3,7 +3,6 @@ package com.watchdawg.tv.playback
 import android.content.Context
 import android.net.Uri
 import androidx.annotation.OptIn
-import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MimeTypes
 import androidx.media3.common.util.UnstableApi
@@ -47,20 +46,6 @@ import okhttp3.OkHttpClient
  *   audioUrl present + URL contains "m3u8" or is VIMEO_CDN type  → playMerged()
  *   audioUrl present + URL is progressive MP4 (YouTube)           → playDash()
  *   audioUrl absent                                                → play()
- *
- * Session 40 — EPG resume fix:
- *   For progressive MP4 sources (WatchDawg EPG slots), calling seekTo() immediately
- *   after prepare() is unreliable — the seek fires before ExoPlayer has buffered
- *   enough to honour it, so the player silently starts at 0:00.
- *
- *   The correct approach is MediaItem.ClippingConfiguration.setStartPositionMs().
- *   ExoPlayer bakes the start offset into the media item before the first byte is
- *   decoded, making it reliable for both progressive and HLS sources. We use this
- *   for all positionMs > 0 cases in play(), playDash(), and playMerged().
- *
- *   seekTo() after prepare() is still used as a belt-and-suspenders fallback for
- *   HLS and DASH, where the media source has a known timeline before playback
- *   starts and seekTo() is reliable.
  *
  * Surface lifecycle:
  *   detachSurface()    — called from MainActivity.onStop(). Clears the video
@@ -106,67 +91,19 @@ class PlayerManager(
         }
 
     /**
-     * Build a MediaItem with an optional clipping start position.
-     *
-     * Session 40: When positionMs > 0, we use ClippingConfiguration instead of
-     * a post-prepare seekTo(). ClippingConfiguration is baked into the MediaItem
-     * before ExoPlayer initialises the media source, so it is honoured reliably
-     * even for progressive MP4 streams that have no timeline until buffering begins.
-     *
-     * setStartPositionMs / setEndPositionMs require API 21+ — always satisfied
-     * since WatchDawg targets Android TV which is API 21+.
-     */
-    private fun buildMediaItem(uri: Uri, mimeType: String? = null, positionMs: Long = 0L): MediaItem {
-        val builder = MediaItem.Builder().setUri(uri)
-        if (mimeType != null) builder.setMimeType(mimeType)
-        if (positionMs > 0L) {
-            builder.setClippingConfiguration(
-                MediaItem.ClippingConfiguration.Builder()
-                    .setStartPositionMs(positionMs)
-                    .build()
-            )
-        }
-        return builder.build()
-    }
-
-    /**
      * Play a single stream URL — standard path for most sources.
      *
      * Always stops and clears the current media before loading the new source.
      * This is critical because PlayerManager is a singleton — without clearing,
      * a previously loaded DASH or Merged source can interfere with the next play.
-     *
-     * Session 40 — Seek fix:
-     * For progressive MP4 sources, ClippingConfiguration bakes the start offset
-     * into the MediaItem before the first byte is decoded — reliable.
-     *
-     * For HLS sources (YouTube HLS, EPG watchdawg slots), ClippingConfiguration
-     * fails because YouTube HLS segments are numbered from 0, not time-coded from
-     * an arbitrary offset. Instead we use a STATE_READY listener that fires
-     * seekTo() once ExoPlayer has parsed the HLS manifest and knows the timeline.
-     *
-     * For DASH, playDash() handles its own STATE_READY listener — this path is
-     * only reached for non-DASH sources.
      */
     fun play(rawStreamUrl: String, positionMs: Long = 0L): StreamType {
         val playable  = streamResolver.toPlayable(rawStreamUrl)
-
-        // Only use ClippingConfiguration for progressive sources where it's reliable.
-        // HLS uses a STATE_READY listener below instead.
-        val useClipping = positionMs > 0L && (
-            playable.type == StreamType.MP4 ||
-            playable.type == StreamType.LOCAL ||
-            playable.type == StreamType.TRANSCODE ||
-            playable.type == StreamType.VIMEO_CDN
-        )
-        val mediaItem = if (useClipping) {
-            buildMediaItem(playable.uri, positionMs = positionMs)
-        } else {
-            buildMediaItem(playable.uri, positionMs = 0L)
-        }
+        val mediaItem = MediaItem.fromUri(playable.uri)
 
         val source: MediaSource = when (playable.type) {
             StreamType.HLS,
+            StreamType.DIRECT_HLS,
             StreamType.YOUTUBE_CDN ->
                 HlsMediaSource.Factory(dataSourceFactory).createMediaSource(mediaItem)
             StreamType.DASH ->
@@ -182,22 +119,7 @@ class PlayerManager(
         player.clearMediaItems()
         player.setMediaSource(source)
         player.prepare()
-
-        // For HLS sources with a non-zero start position, register a one-shot
-        // STATE_READY listener — same pattern as playDash(). This fires seekTo()
-        // after ExoPlayer has parsed the manifest and the timeline is valid.
-        if (positionMs > 0L && (playable.type == StreamType.HLS || playable.type == StreamType.YOUTUBE_CDN)) {
-            val listener = object : androidx.media3.common.Player.Listener {
-                override fun onPlaybackStateChanged(state: Int) {
-                    if (state == androidx.media3.common.Player.STATE_READY) {
-                        player.seekTo(positionMs)
-                        player.removeListener(this)
-                    }
-                }
-            }
-            player.addListener(listener)
-        }
-
+        if (positionMs > 0L) player.seekTo(positionMs)
         player.playWhenReady = true
         player.play()
         return playable.type
@@ -211,41 +133,21 @@ class PlayerManager(
      * ExoPlayer's native DASH engine handles sync of both tracks.
      *
      * NOT used for Vimeo HLS splits — use playMerged() for those instead.
-     *
-     * Session 40 — EPG resume fix:
-     * ClippingConfiguration cannot be used for DASH manifests whose BaseURL
-     * points to a YouTube progressive MP4. ClippingConfiguration attempts a
-     * byte-range seek on the underlying MP4 before ExoPlayer has established
-     * the timeline, which YouTube CDN rejects (black screen). Instead we
-     * register a one-shot Player.Listener that fires seekTo() exactly when
-     * ExoPlayer reaches STATE_READY — at that point the DASH timeline is known
-     * and seekTo() is guaranteed to land at the correct position.
      */
     fun playDash(manifestUrl: String, positionMs: Long = 0L) {
         val mediaItem = MediaItem.Builder()
-            .setUri(Uri.parse(manifestUrl))
+            .setUri(manifestUrl)
             .setMimeType(MimeTypes.APPLICATION_MPD)
             .build()
-        val source = DashMediaSource.Factory(dataSourceFactory).createMediaSource(mediaItem)
+
+        val source = DashMediaSource.Factory(dataSourceFactory)
+            .createMediaSource(mediaItem)
 
         player.stop()
         player.clearMediaItems()
         player.setMediaSource(source)
         player.prepare()
-
-        if (positionMs > 0L) {
-            // Register a one-shot listener — fires seekTo when DASH timeline is ready.
-            val listener = object : androidx.media3.common.Player.Listener {
-                override fun onPlaybackStateChanged(state: Int) {
-                    if (state == androidx.media3.common.Player.STATE_READY) {
-                        player.seekTo(positionMs)
-                        player.removeListener(this)
-                    }
-                }
-            }
-            player.addListener(listener)
-        }
-
+        if (positionMs > 0L) player.seekTo(positionMs)
         player.playWhenReady = true
         player.play()
     }
@@ -266,12 +168,11 @@ class PlayerManager(
      * the required Referer: https://vimeo.com/ header is injected correctly.
      * ExoPlayer never contacts Vimeo CDN directly.
      *
-     * Session 40: positionMs uses ClippingConfiguration on video item + seekTo
-     * belt-and-suspenders. HLS is reliable with seekTo post-prepare but
-     * ClippingConfiguration ensures the seek fires at the right moment.
+     * positionMs seek is applied after prepare() — ExoPlayer honours seekTo()
+     * on HLS by finding the correct segment for that timestamp.
      */
     fun playMerged(videoUrl: String, audioUrl: String, positionMs: Long = 0L) {
-        val videoItem  = buildMediaItem(Uri.parse(videoUrl), positionMs = positionMs)
+        val videoItem  = MediaItem.fromUri(Uri.parse(videoUrl))
         val audioItem  = MediaItem.fromUri(Uri.parse(audioUrl))
 
         val videoSource = HlsMediaSource.Factory(dataSourceFactory).createMediaSource(videoItem)

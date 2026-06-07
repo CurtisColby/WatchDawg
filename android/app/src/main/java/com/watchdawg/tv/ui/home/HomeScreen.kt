@@ -61,7 +61,7 @@ import com.watchdawg.tv.ui.theme.WatchDawgColors
  */
 
 /** Bump this each build. Format: v{session}.{build-within-session} */
-const val APP_VERSION = "v40.1"
+const val APP_VERSION = "v43.1"
 
 @Composable
 fun HomeScreen(
@@ -73,7 +73,11 @@ fun HomeScreen(
 
     val sections = remember(isUnlocked) {
         NavSection.entries.filter { section ->
-            if (section == NavSection.ADULT) isUnlocked != null else true
+            // ADULT and ADULT_EPG: only visible when PIN is unlocked
+            if (section == NavSection.ADULT || section == NavSection.ADULT_EPG)
+                isUnlocked != null
+            else
+                true
         }
     }
 
@@ -256,6 +260,7 @@ private fun SectionIcon(section: NavSection, isFocused: Boolean) {
         NavSection.LOCAL             -> LocalIcon(isFocused = isFocused, size = iconSize)
         NavSection.ADULT             -> AdultIcon(isFocused = isFocused, size = iconSize)
         NavSection.EPG               -> LiveTvIcon(isFocused = isFocused, size = iconSize)
+        NavSection.ADULT_EPG         -> AdultIcon(isFocused = isFocused, size = iconSize)
         NavSection.SETTINGS          -> SettingsIcon(isFocused = isFocused, size = iconSize)
     }
 }
@@ -299,5 +304,6 @@ private fun subtitleFor(section: NavSection): String = when (section) {
     NavSection.LOCAL             -> "Downloaded to server"
     NavSection.ADULT             -> "PIN unlocked"
     NavSection.EPG               -> "TV Guide & channel surfing"
+    NavSection.ADULT_EPG         -> "PIN-gated channel guide"
     NavSection.SETTINGS          -> "Server & app settings"
 }

@@ -39,6 +39,14 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/channel", tags=["channel"])
 
+# ---------------------------------------------------------------------------
+# Active download task registry (Session 43)
+# ---------------------------------------------------------------------------
+# Keyed by channel_id. Value: asyncio.Task so we can cancel it.
+# Also stores progress counters updated by _run_mass_download.
+# {channel_id: {"task": Task, "total": int, "completed": int, "skipped": int, "failed": int, "dir": str}}
+_active_downloads: dict = {}
+
 
 # --- Request/Response Models ---
 
@@ -640,6 +648,87 @@ async def scrape_channel(
     }
 
 
+
+@router.get("/{channel_id}/download-status")
+async def get_download_status(
+    channel_id: int,
+    db: AsyncSession = Depends(get_db_session),
+):
+    """
+    Session 43 — Return download status and local file count/size for a channel.
+
+    Returns:
+      - is_downloading: bool — whether a mass download task is currently running
+      - file_count: int — number of video files on disk in the channel folder
+      - total_size_mb: float — total size of downloaded files in MB
+      - completed: int — files downloaded in the current run (if active)
+      - total: int — total videos queued in the current run (if active)
+      - download_dir: str — path to the channel's download folder
+    """
+    import os
+
+    # Get channel info to determine folder path
+    stmt = select(Channel).where(Channel.id == channel_id)
+    result = await db.execute(stmt)
+    channel = result.scalar_one_or_none()
+    if channel is None:
+        raise HTTPException(status_code=404, detail="Channel not found")
+
+    safe_name = re.sub(r'[^\w\-]', '_', channel.name)[:50]
+    folder_type = "Private" if channel.locked else "Public"
+    download_dir = f"/watchdawg/{folder_type}/{channel_id}_{safe_name}"
+
+    # Count files and total size on disk
+    video_exts = {".mp4", ".mkv", ".webm", ".m4v", ".avi", ".mov"}
+    file_count = 0
+    total_bytes = 0
+    if os.path.isdir(download_dir):
+        for fname in os.listdir(download_dir):
+            _, ext = os.path.splitext(fname)
+            if ext.lower() in video_exts:
+                try:
+                    fsize = os.path.getsize(os.path.join(download_dir, fname))
+                    if fsize > 100_000:  # skip tiny/partial files
+                        file_count += 1
+                        total_bytes += fsize
+                except OSError:
+                    pass
+
+    # Active download progress
+    active = _active_downloads.get(channel_id)
+    is_downloading = bool(active and not active["task"].done())
+
+    return {
+        "channel_id":    channel_id,
+        "channel_name":  channel.name,
+        "is_downloading": is_downloading,
+        "file_count":    file_count,
+        "total_size_mb": round(total_bytes / 1_048_576, 1),
+        "download_dir":  download_dir,
+        "completed":     active["completed"] if active else 0,
+        "skipped":       active["skipped"]   if active else 0,
+        "failed":        active["failed"]    if active else 0,
+        "total":         active["total"]     if active else 0,
+    }
+
+
+@router.post("/{channel_id}/mass-download/stop")
+async def stop_mass_download(channel_id: int):
+    """
+    Session 43 — Cancel an in-progress mass download for a channel.
+    Cancels the asyncio task. Any file currently being downloaded by yt-dlp
+    may leave a partial file — the next download run will retry it.
+    """
+    active = _active_downloads.get(channel_id)
+    if not active or active["task"].done():
+        return {"status": "not_running", "channel_id": channel_id}
+
+    active["task"].cancel()
+    _active_downloads.pop(channel_id, None)
+    logger.info(f"Mass download stopped by user: channel {channel_id}")
+    return {"status": "stopped", "channel_id": channel_id}
+
+
 @router.post("/{channel_id}/mass-download")
 async def mass_download_channel(
     channel_id: int,
@@ -713,10 +802,18 @@ async def mass_download_channel(
         f"{total} videos → {download_dir} (quality={quality})"
     )
 
-    # Fire background task — don't block the request
-    asyncio.ensure_future(
+    # Fire background task — register in active downloads so status endpoint can track it
+    task = asyncio.ensure_future(
         _run_mass_download(videos, download_dir, fmt, channel_id, channel.name)
     )
+    _active_downloads[channel_id] = {
+        "task":      task,
+        "total":     total,
+        "completed": 0,
+        "skipped":   0,
+        "failed":    0,
+        "dir":       download_dir,
+    }
 
     return {
         "status": "started",
@@ -742,6 +839,8 @@ async def _run_mass_download(
     """
     Background mass downloader. Downloads each video sequentially using yt-dlp.
     Skips files already present and >1MB. Logs progress per video.
+    Updates _active_downloads counters so the status endpoint can report live progress.
+    Cleans up _active_downloads entry on completion or cancellation.
     """
     import asyncio
     import os
@@ -754,74 +853,89 @@ async def _run_mass_download(
     failed = 0
     total = len(videos)
 
-    for video_id, source_url, title in videos:
-        out_path = os.path.join(download_dir, f"{video_id}.mp4")
+    def _update_progress():
+        if channel_id in _active_downloads:
+            _active_downloads[channel_id]["completed"] = completed
+            _active_downloads[channel_id]["skipped"]   = skipped
+            _active_downloads[channel_id]["failed"]    = failed
 
-        # Skip already downloaded
-        if os.path.exists(out_path) and os.path.getsize(out_path) > 1_000_000:
-            skipped += 1
-            continue
+    try:
+        for video_id, source_url, title in videos:
+            out_path = os.path.join(download_dir, f"{video_id}.mp4")
 
-        logger.info(
-            f"Mass download [{channel_name}] {completed + skipped + failed + 1}/{total}: "
-            f"video {video_id} '{(title or '')[:50]}'"
-        )
+            # Skip already downloaded
+            if os.path.exists(out_path) and os.path.getsize(out_path) > 1_000_000:
+                skipped += 1
+                _update_progress()
+                continue
 
-        cmd = [
-            "yt-dlp",
-            "-f", fmt,
-            "--no-playlist",
-            "--no-warnings",
-            "--quiet",
-            "-o", out_path,
-        ]
-        if cookies_path and os.path.isfile(cookies_path):
-            cmd += ["--cookies", cookies_path]
-        cmd.append(source_url)
-
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+            logger.info(
+                f"Mass download [{channel_name}] {completed + skipped + failed + 1}/{total}: "
+                f"video {video_id} '{(title or '')[:50]}'"
             )
+
+            cmd = [
+                "yt-dlp",
+                "-f", fmt,
+                "--no-playlist",
+                "--no-warnings",
+                "--quiet",
+                "-o", out_path,
+            ]
+            if cookies_path and os.path.isfile(cookies_path):
+                cmd += ["--cookies", cookies_path]
+            cmd.append(source_url)
+
             try:
-                _, stderr = await asyncio.wait_for(proc.communicate(), timeout=1800)
-                if proc.returncode == 0 and os.path.exists(out_path):
-                    size_mb = os.path.getsize(out_path) // 1_000_000
-                    logger.info(
-                        f"Mass download [{channel_name}]: video {video_id} "
-                        f"complete — {size_mb}MB"
-                    )
-                    completed += 1
-                else:
-                    err = stderr.decode(errors="ignore")[:200] if stderr else "unknown"
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                try:
+                    _, stderr = await asyncio.wait_for(proc.communicate(), timeout=1800)
+                    if proc.returncode == 0 and os.path.exists(out_path):
+                        size_mb = os.path.getsize(out_path) // 1_000_000
+                        logger.info(
+                            f"Mass download [{channel_name}]: video {video_id} "
+                            f"complete — {size_mb}MB"
+                        )
+                        completed += 1
+                        _update_progress()
+                    else:
+                        err = stderr.decode(errors="ignore")[:200] if stderr else "unknown"
+                        logger.warning(
+                            f"Mass download [{channel_name}]: video {video_id} "
+                            f"failed (rc={proc.returncode}) — {err}"
+                        )
+                        failed += 1
+                        _update_progress()
+                        if os.path.exists(out_path):
+                            os.remove(out_path)
+                except asyncio.TimeoutError:
                     logger.warning(
-                        f"Mass download [{channel_name}]: video {video_id} "
-                        f"failed (rc={proc.returncode}) — {err}"
+                        f"Mass download [{channel_name}]: video {video_id} timed out"
                     )
+                    proc.kill()
                     failed += 1
                     if os.path.exists(out_path):
                         os.remove(out_path)
-            except asyncio.TimeoutError:
+            except Exception as e:
                 logger.warning(
-                    f"Mass download [{channel_name}]: video {video_id} timed out"
+                    f"Mass download [{channel_name}]: video {video_id} error — {e}"
                 )
-                proc.kill()
                 failed += 1
-                if os.path.exists(out_path):
-                    os.remove(out_path)
-        except Exception as e:
-            logger.warning(
-                f"Mass download [{channel_name}]: video {video_id} error — {e}"
-            )
-            failed += 1
 
-        # Brief pause between downloads to avoid hammering the source
-        await asyncio.sleep(0.5)
+            # Brief pause between downloads to avoid hammering the source
+            await asyncio.sleep(0.5)
 
-    logger.info(
-        f"Mass download [{channel_name}] complete: "
-        f"{completed} downloaded, {skipped} already existed, {failed} failed "
-        f"out of {total} total"
-    )
+        logger.info(
+            f"Mass download [{channel_name}] complete: "
+            f"{completed} downloaded, {skipped} already existed, {failed} failed "
+            f"out of {total} total"
+        )
+    except asyncio.CancelledError:
+        logger.info(f"Mass download [{channel_name}] cancelled by user after {completed} completed.")
+    finally:
+        # Always clean up the active downloads registry
+        _active_downloads.pop(channel_id, None)

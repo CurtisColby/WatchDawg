@@ -9,6 +9,7 @@ import com.watchdawg.tv.ui.home.HomeViewModel
 import com.watchdawg.tv.ui.movies.MoviesViewModel
 import com.watchdawg.tv.ui.library.FavoritesViewModel
 import com.watchdawg.tv.ui.library.LibraryViewModel
+import com.watchdawg.tv.ui.epg.AdultEpgViewModel
 import com.watchdawg.tv.ui.epg.EpgViewModel
 import com.watchdawg.tv.ui.movies.MovieDetailViewModel
 import com.watchdawg.tv.ui.player.PlayerViewModel
@@ -67,6 +68,8 @@ class WatchDawgViewModelFactory : ViewModelProvider.Factory {
                 LiveTvViewModel(Graph.repository) as T
             modelClass.isAssignableFrom(EpgViewModel::class.java) ->
                 EpgViewModel() as T
+            modelClass.isAssignableFrom(AdultEpgViewModel::class.java) ->
+                AdultEpgViewModel() as T
             else -> throw IllegalArgumentException("Unknown ViewModel: ${modelClass.name}")
         }
     }
