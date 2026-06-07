@@ -21,11 +21,12 @@ serializer; new PATCH /channel/{id}/genre_tags endpoint.
 
 import datetime
 import logging
+import random
 import re
 from typing import Optional
 from urllib.parse import urlparse
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Header
+from fastapi import APIRouter, Depends, HTTPException, Query, Header, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import select, func, delete
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -939,3 +940,229 @@ async def _run_mass_download(
     finally:
         # Always clean up the active downloads registry
         _active_downloads.pop(channel_id, None)
+
+
+# ---------------------------------------------------------------------------
+# Live M3U Export — Session 45
+#
+# Every entry points to /channel/stream/{video_id} — resolved on demand at
+# play time so CDN token expiry never causes black screens.
+#
+# group-title: first genre tag if set, otherwise category capitalised.
+# Shuffle: DB query uses created_at (fast index), Python shuffles in memory.
+#
+# ROUTE ORDER IS CRITICAL — literal paths before int path params:
+#   /all/live.m3u  →  /stream/{id}  →  /{channel_id}/live.m3u
+# ---------------------------------------------------------------------------
+
+
+def _m3u_group_for_channel(channel) -> str:
+    """First genre tag if set, otherwise category capitalised."""
+    tags_raw = (channel.genre_tags or "").strip()
+    if tags_raw:
+        first_tag = tags_raw.split(",")[0].strip()
+        if first_tag:
+            return first_tag
+    return (channel.category or "general").title()
+
+
+def _is_hls_stream(url: str) -> bool:
+    """Return True if the URL points to an HLS manifest."""
+    if not url:
+        return False
+    path = url.split("?")[0].lower()
+    return path.endswith(".m3u8") or "m3u8" in path
+
+
+@router.get("/all/live.m3u", response_class=Response)
+async def export_all_channels_live_m3u(
+    db: AsyncSession = Depends(get_db_session),
+):
+    """
+    Export ALL scraped videos across all enabled channels as one combined
+    live M3U playlist. group-title driven by genre_tags or category.
+    Videos shuffled randomly in Python on every fetch.
+    Add http://192.168.50.42:6868/channel/all/live.m3u to TiviMate.
+    """
+    base_url = "http://192.168.50.42:6868"
+
+    ch_stmt = select(Channel).where(Channel.enabled == True).order_by(Channel.name)
+    ch_result = await db.execute(ch_stmt)
+    channels = ch_result.scalars().all()
+
+    lines = ["#EXTM3U"]
+    for channel in channels:
+        group = _m3u_group_for_channel(channel)
+
+        video_stmt = (
+            select(Video)
+            .where(
+                Video.channel_id == channel.id,
+                Video.source_url.isnot(None),
+                Video.source_url != "",
+                Video.resolution_status != "failed",
+            )
+            .order_by(Video.created_at.desc())
+        )
+        video_result = await db.execute(video_stmt)
+        videos = list(video_result.scalars().all())
+        random.shuffle(videos)
+
+        for v in videos:
+            duration = v.duration_seconds or -1
+            title = (v.title or "Untitled").replace(",", " ")
+            logo = v.thumbnail_url or ""
+            stream_url = f"{base_url}/channel/stream/{v.id}"
+            lines.append(
+                f'#EXTINF:{duration} tvg-name="{title}" tvg-logo="{logo}" '
+                f'group-title="{group}",{title}'
+            )
+            lines.append(stream_url)
+
+    content_str = "\n".join(lines)
+    return Response(
+        content=content_str,
+        media_type="application/x-mpegurl",
+        headers={"Content-Disposition": 'inline; filename="watchdawg_all.m3u"'},
+    )
+
+
+@router.get("/stream/{video_id}", response_class=Response)
+async def stream_video_redirect(
+    video_id: int,
+    db: AsyncSession = Depends(get_db_session),
+):
+    """
+    On-demand resolve-and-redirect for IPTV clients (TiviMate).
+
+    Routing logic:
+    - HLS stream (m3u8 URL): always route through /proxy/stream.
+      HLS manifests already contain both audio and video tracks — the DASH
+      manifest approach is only needed for truly split MP4 files.
+    - Split MP4 stream (audio_url present, non-HLS): route to DASH manifest
+      so ExoPlayer merges both tracks.
+    - Combined stream: route through /proxy/stream.
+
+    Timeout: 25s hard limit on yt-dlp. Falls back to stale cached URL if
+    available rather than returning a 502.
+    """
+    from app.services.resolver import ResolverService
+    import asyncio as _asyncio
+    import urllib.parse
+
+    base_url = "http://192.168.50.42:6868"
+    proxy_base = f"{base_url}/proxy/stream"
+
+    stmt = select(Video).where(Video.id == video_id)
+    result = await db.execute(stmt)
+    video = result.scalar_one_or_none()
+
+    if video is None:
+        raise HTTPException(status_code=404, detail=f"Video {video_id} not found")
+    if not video.source_url:
+        raise HTTPException(status_code=404, detail=f"Video {video_id} has no source URL")
+    if video.resolution_status == "failed":
+        logger.warning(f"STREAM REDIRECT | video {video_id} permanently failed — 404")
+        raise HTTPException(status_code=404, detail=f"Video {video_id} is permanently unavailable")
+
+    logger.info(f"STREAM REDIRECT | video {video_id} | title={(video.title or '')[:60]}")
+
+    resolver = ResolverService(db)
+    resolution = None
+    try:
+        resolution = await _asyncio.wait_for(
+            resolver.resolve_video(video_id, force=False),
+            timeout=25.0,
+        )
+    except _asyncio.TimeoutError:
+        logger.warning(f"STREAM REDIRECT | video {video_id} — yt-dlp timed out after 25s")
+
+    # Stale-cache fallback
+    if resolution is None and video.resolved_stream_url:
+        logger.warning(f"STREAM REDIRECT | video {video_id} — serving stale cached URL")
+        resolution = {"stream_url": video.resolved_stream_url, "audio_url": None}
+
+    if resolution is None or not resolution.get("stream_url"):
+        logger.warning(f"STREAM REDIRECT | video {video_id} — no stream URL, returning 502")
+        raise HTTPException(status_code=502, detail=f"Could not resolve stream for video {video_id}")
+
+    cdn_url = resolution["stream_url"]
+    audio_url = resolution.get("audio_url")
+
+    # HLS streams (Vimeo): always proxy directly — the combined Vimeo HLS
+    # manifest already contains both audio and video tracks. TiviMate plays
+    # it correctly through the proxy (which injects Vimeo Referer headers).
+    # This is the same path the Android app uses when selecting HLS — it works.
+    # Never use master playlist or DASH for HLS; those only work for split MP4.
+    if _is_hls_stream(cdn_url):
+        proxy_url = f"{proxy_base}?url={urllib.parse.quote(cdn_url, safe='')}"
+        logger.info(f"STREAM REDIRECT | video {video_id} — HLS → proxy → {cdn_url[:80]}")
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse(url=proxy_url, status_code=302)
+
+    # Split MP4 (non-HLS, e.g. YouTube): DASH manifest merges both tracks.
+    if audio_url and not _is_hls_stream(audio_url):
+        manifest_url = f"{base_url}/resolve/{video_id}/manifest.mpd"
+        logger.info(f"STREAM REDIRECT | video {video_id} — split MP4 → DASH manifest")
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse(url=manifest_url, status_code=302)
+
+    # Combined stream: proxy handles CDN headers.
+    proxy_url = f"{proxy_base}?url={urllib.parse.quote(cdn_url, safe='')}"
+    logger.info(f"STREAM REDIRECT | video {video_id} — combined → proxy → {cdn_url[:80]}")
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url=proxy_url, status_code=302)
+
+
+@router.get("/{channel_id}/live.m3u", response_class=Response)
+async def export_channel_live_m3u(
+    channel_id: int,
+    db: AsyncSession = Depends(get_db_session),
+):
+    """
+    Export all scraped videos for a single channel as a live M3U playlist.
+    group-title uses first genre tag if set, otherwise category.
+    Videos shuffled randomly in Python on every fetch.
+    """
+    base_url = "http://192.168.50.42:6868"
+
+    stmt = select(Channel).where(Channel.id == channel_id)
+    result = await db.execute(stmt)
+    channel = result.scalar_one_or_none()
+    if channel is None:
+        raise HTTPException(status_code=404, detail="Channel not found")
+
+    video_stmt = (
+        select(Video)
+        .where(
+            Video.channel_id == channel_id,
+            Video.source_url.isnot(None),
+            Video.source_url != "",
+            Video.resolution_status != "failed",
+        )
+        .order_by(Video.created_at.desc())
+    )
+    video_result = await db.execute(video_stmt)
+    videos = list(video_result.scalars().all())
+    random.shuffle(videos)
+
+    group = _m3u_group_for_channel(channel)
+    lines = ["#EXTM3U"]
+    for v in videos:
+        duration = v.duration_seconds or -1
+        title = (v.title or "Untitled").replace(",", " ")
+        logo = v.thumbnail_url or ""
+        stream_url = f"{base_url}/channel/stream/{v.id}"
+        lines.append(
+            f'#EXTINF:{duration} tvg-name="{title}" tvg-logo="{logo}" '
+            f'group-title="{group}",{title}'
+        )
+        lines.append(stream_url)
+
+    content_str = "\n".join(lines)
+    safe_name = re.sub(r"[^\w\-]", "_", channel.name)
+    return Response(
+        content=content_str,
+        media_type="application/x-mpegurl",
+        headers={"Content-Disposition": f'inline; filename="{safe_name}.m3u"'},
+    )

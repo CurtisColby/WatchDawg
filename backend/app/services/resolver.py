@@ -65,6 +65,9 @@ YTDLP_TIMEOUT_SECONDS = 90
 # concurrent extractions to avoid hammering platforms.
 _process_pool = concurrent.futures.ProcessPoolExecutor(max_workers=4)
 
+# Default format selector — used by resolve_video() for general sources (YouTube etc.)
+# Prefers combined audio+video MP4 with explicit codec checks so YouTube DASH
+# video-only segments are never selected.
 FORMAT_SELECTOR = (
     # Prefer combined mp4 streams (video+audio) up to 1080p
     "best[height<=1080][ext=mp4][vcodec!*=none][acodec!*=none]/"
@@ -76,11 +79,26 @@ FORMAT_SELECTOR = (
     "best[protocol^=m3u8][vcodec!*=none][acodec!*=none]/"
     # Format 18 fallback — 360p combined mp4
     "18/"
-    # Vimeo and some sources only serve split streams (no combined format available).
-    # Fall back to best split pair so these videos resolve instead of failing entirely.
+    # Split streams fallback for sources with no combined format.
     "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
     "bestvideo+bestaudio/"
     "best[protocol!=http_dash_segments]/"
+    "best"
+)
+
+# Vimeo-specific format selector — used when source_url contains vimeo.com.
+# Vimeo progressive HTTP MP4s (http-360p/540p/720p/1080p) are combined audio+video
+# but yt-dlp reports acodec=none on them, causing FORMAT_SELECTOR to skip them and
+# fall through to HLS sub-playlists which are video-only. Selecting by protocol=https
+# bypasses the acodec check and gets the combined progressive MP4 directly.
+VIMEO_FORMAT_SELECTOR = (
+    "best[height<=1080][ext=mp4][protocol=https]/"
+    "best[height<=1080][ext=mp4][protocol=http]/"
+    "best[ext=mp4][protocol=https]/"
+    "best[ext=mp4][protocol=http]/"
+    "best[protocol=m3u8_native][vcodec!*=none][acodec!*=none]/"
+    "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
+    "bestvideo+bestaudio/"
     "best"
 )
 
@@ -209,8 +227,15 @@ def _extract_sync_worker(url: str, cookies_path: Optional[str]) -> Tuple[Optiona
     """
     import yt_dlp
 
+    # Use Vimeo-specific format selector for Vimeo URLs — their progressive HTTP MP4s
+    # have acodec=none reported by yt-dlp even though they contain audio, so the
+    # standard FORMAT_SELECTOR skips them and falls through to HLS sub-playlists
+    # (video-only). VIMEO_FORMAT_SELECTOR uses protocol=https to bypass the acodec
+    # check and get the combined progressive MP4 directly.
+    _format_selector = VIMEO_FORMAT_SELECTOR if "vimeo.com" in url else FORMAT_SELECTOR
+
     ydl_opts = {
-        "format": FORMAT_SELECTOR,
+        "format": _format_selector,
         "quiet": True,
         "no_warnings": True,
         "extract_flat": False,
@@ -483,17 +508,6 @@ class ResolverService:
         """
         Resolve a video by its database ID.
 
-        Session 42 — Local file check:
-          Before any network call, checks if the video has been mass-downloaded
-          to local storage. If a local file exists, returns a /library/stream/
-          URL pointing to it — instant playback, no yt-dlp needed.
-
-          Local file path convention:
-            /watchdawg/{Public|Private}/{channel_id}_{channel_name_safe}/{video_id}.mp4
-
-          This check runs before the yt-dlp cache check so downloaded files
-          always take priority. Fallback to normal resolution if no file found.
-
         Cache check → yt-dlp extraction (with hard timeout) → dedup → result.
 
         If this video resolves but is a lower-scored CDN duplicate, playback is
@@ -509,44 +523,6 @@ class ResolverService:
 
         self._db.expire(video)
         await self._db.refresh(video)
-
-        # Session 42 — Local file check: prefer mass-downloaded file over yt-dlp.
-        # Look up the channel to build the deterministic folder path.
-        if video.channel_id is not None:
-            try:
-                from app.models import Channel as ChannelModel
-                ch_stmt = select(ChannelModel).where(ChannelModel.id == video.channel_id)
-                ch_result = await self._db.execute(ch_stmt)
-                channel = ch_result.scalar_one_or_none()
-                if channel is not None:
-                    import re as _re
-                    safe_name = _re.sub(r'[^\w\-]', '_', channel.name)[:50]
-                    folder_type = "Private" if channel.locked else "Public"
-                    local_path = (
-                        f"/watchdawg/{folder_type}/"
-                        f"{channel.id}_{safe_name}/{video_id}.mp4"
-                    )
-                    if os.path.exists(local_path) and os.path.getsize(local_path) > 1_000_000:
-                        # Build a /library/stream/ relative URL — Android prepends baseUrl
-                        import urllib.parse as _up
-                        rel = os.path.relpath(local_path, "/watchdawg")
-                        stream_url = f"/library/stream/{_up.quote(rel, safe='/')}"
-                        logger.info(
-                            f"Local file hit for video {video_id} "
-                            f"'{(video.title or '')[:50]}': {local_path}"
-                        )
-                        return {
-                            "id": video.id,
-                            "title": video.title,
-                            "artist": video.artist,
-                            "stream_url": stream_url,
-                            "format": "local/mp4",
-                            "resolved_at": None,
-                            "source_url": video.source_url,
-                            "thumbnail_url": video.thumbnail_url,
-                        }
-            except Exception as _e:
-                logger.debug(f"Local file check skipped for video {video_id}: {_e}")
 
         # Return cached resolution if still valid
         if not force and self._is_cache_valid(video):
@@ -585,6 +561,10 @@ class ResolverService:
             if stream_info.uploader and not video.artist:
                 video.artist = stream_info.uploader
 
+            # Capture audio_url from split-stream resolution — not stored in DB,
+            # passed through to stream_video_redirect for routing decisions.
+            resolved_audio_url = stream_info.audio_url if hasattr(stream_info, "audio_url") else None
+
             await self._db.commit()
 
             # Auto-dedup: if this is the lower-scored duplicate, redirect to keeper
@@ -599,7 +579,7 @@ class ResolverService:
             except Exception as exc:
                 logger.warning(f"Auto-dedup check failed for video {video_id}: {exc}")
 
-            return self._build_result(video)
+            return self._build_result(video, audio_url=resolved_audio_url)
 
         elif is_permanent:
             logger.warning(
@@ -729,12 +709,18 @@ class ResolverService:
             "no_fingerprint_count": no_fingerprint,
         }
 
-    def _build_result(self, video: Video) -> dict:
+    def _build_result(self, video: Video, audio_url: Optional[str] = None) -> dict:
+        """
+        Serialize a resolved Video to a result dict.
+        audio_url is passed through when yt-dlp returned a split stream —
+        not stored in DB, only used by stream_video_redirect routing.
+        """
         return {
             "id": video.id,
             "title": video.title,
             "artist": video.artist,
             "stream_url": video.resolved_stream_url,
+            "audio_url": audio_url,
             "format": video.resolved_format,
             "resolved_at": video.resolved_at.isoformat() if video.resolved_at else None,
             "source_url": video.source_url,
@@ -744,11 +730,6 @@ class ResolverService:
     async def resolve_video_for_tv(self, video_id: int) -> Optional[dict]:
         """
         TV-specific resolution that returns both video_url and audio_url separately.
-
-        Session 42 — Local file check:
-          Same as resolve_video — checks for a mass-downloaded local file first.
-          Local files are combined MP4s so audio_url is None (no split needed).
-          Falls back to yt-dlp split extraction if no local file found.
 
         This allows the Android TV client to pass split stream URLs directly to
         VLC (or another external player) which can merge them natively — giving
@@ -772,42 +753,6 @@ class ResolverService:
         if video.resolution_status == "failed":
             logger.debug(f"TV resolve: skipping permanently failed video {video_id}")
             return None
-
-        # Session 42 — Local file check (same logic as resolve_video)
-        if video.channel_id is not None:
-            try:
-                from app.models import Channel as ChannelModel
-                ch_stmt = select(ChannelModel).where(ChannelModel.id == video.channel_id)
-                ch_result = await self._db.execute(ch_stmt)
-                channel = ch_result.scalar_one_or_none()
-                if channel is not None:
-                    import re as _re
-                    safe_name = _re.sub(r'[^\w\-]', '_', channel.name)[:50]
-                    folder_type = "Private" if channel.locked else "Public"
-                    local_path = (
-                        f"/watchdawg/{folder_type}/"
-                        f"{channel.id}_{safe_name}/{video_id}.mp4"
-                    )
-                    if os.path.exists(local_path) and os.path.getsize(local_path) > 1_000_000:
-                        import urllib.parse as _up
-                        rel = os.path.relpath(local_path, "/watchdawg")
-                        stream_url = f"/library/stream/{_up.quote(rel, safe='/')}"
-                        logger.info(
-                            f"TV resolve: local file hit for video {video_id} "
-                            f"'{(video.title or '')[:50]}': {local_path}"
-                        )
-                        return {
-                            "id": video.id,
-                            "title": video.title,
-                            "artist": video.artist,
-                            "stream_url": stream_url,
-                            "audio_url": None,  # combined MP4 — no split needed
-                            "format": "local/mp4",
-                            "source_url": video.source_url,
-                            "thumbnail_url": video.thumbnail_url,
-                        }
-            except Exception as _e:
-                logger.debug(f"TV local file check skipped for video {video_id}: {_e}")
 
         # Only YouTube uses the split extractor (bestvideo+bestaudio → DASH manifest).
         # Vimeo and Reddit serve combined streams and must use the standard resolver

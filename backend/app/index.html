@@ -1264,11 +1264,44 @@
                                 onkeydown="if(event.key==='Enter') addPlexLibraryChannel()">
                         </div>
                     </div>
+                    <!-- Live M3U Export Card -->
+                    <div id="livem3uCard" style="background:var(--bg-card);border:1px solid #22c55e44;border-radius:var(--radius);padding:14px 16px;margin-bottom:16px;">
+                        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
+                            <div style="display:flex;align-items:center;gap:8px;">
+                                <span style="font-size:16px;">📡</span>
+                                <span style="font-size:13px;font-weight:700;color:#22c55e;text-transform:uppercase;letter-spacing:0.06em;">Live M3U Feed</span>
+                            </div>
+                            <button class="btn btn-sm" onclick="refreshLiveM3uPreview()" title="Reload entry count">&#x21BB; Refresh</button>
+                        </div>
+                        <div style="font-size:11px;color:var(--text-muted);margin-bottom:10px;">
+                            Add either URL to TiviMate or any IPTV client. The feed is always live — resolved stream URLs are updated automatically by the scheduler.
+                        </div>
+                        <!-- All channels feed -->
+                        <div style="background:var(--bg-surface);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);padding:8px 10px;margin-bottom:6px;">
+                            <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;">
+                                <div>
+                                    <div style="font-size:10px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.06em;margin-bottom:2px;">All Channels</div>
+                                    <code id="m3uAllUrl" style="font-size:11px;font-family:'JetBrains Mono',monospace;color:var(--accent-orange);word-break:break-all;">http://192.168.50.42:6868/channel/all/live.m3u</code>
+                                </div>
+                                <div style="display:flex;gap:6px;flex-shrink:0;">
+                                    <button class="btn btn-sm" onclick="copyM3uUrl('all')" title="Copy URL">&#x2398; Copy</button>
+                                    <a href="/channel/all/live.m3u" target="_blank" class="btn btn-sm" style="text-decoration:none;" title="Preview raw M3U in browser">&#x1F441; Preview</a>
+                                </div>
+                            </div>
+                            <div id="m3uAllStats" style="font-size:10px;color:var(--text-muted);margin-top:5px;">Loading stats...</div>
+                        </div>
+                        <!-- Per-channel M3U links (collapsed by default) -->
+                        <div>
+                            <button class="btn btn-sm" onclick="togglePerChannelM3u()" id="btnPerChannelM3u" style="width:100%;justify-content:center;margin-top:4px;">
+                                &#x25BC; Per-Channel M3U Links
+                            </button>
+                            <div id="perChannelM3uList" style="display:none;margin-top:8px;flex-direction:column;gap:4px;"></div>
+                        </div>
+                    </div>
+
                     <div id="channelList"></div>
                 </div>
             </div>
-
-        </div><!-- /main-content -->
     </div><!-- /app-body -->
 
     <!-- Player Modal -->
@@ -1608,6 +1641,67 @@
         // =====================================================================
         //  CHANNELS
         // =====================================================================
+        // =====================================================================
+        //  LIVE M3U PANEL (Session 45)
+        // =====================================================================
+
+        async function refreshLiveM3uPreview() {
+            const statsEl = document.getElementById('m3uAllStats');
+            if (statsEl) statsEl.textContent = 'Loading...';
+            try {
+                const res = await fetch(`${API_BASE}/channel/all/live.m3u`);
+                if (!res.ok) { if (statsEl) statsEl.textContent = `Error ${res.status} — check backend logs`; return; }
+                const text = await res.text();
+                const lines = text.split('\n').filter(l => l && !l.startsWith('#'));
+                const entries = lines.length;
+                const extinfLines = text.split('\n').filter(l => l.startsWith('#EXTINF'));
+                const groups = [...new Set(extinfLines.map(l => { const m = l.match(/group-title="([^"]+)"/); return m ? m[1] : 'Unknown'; }))];
+                if (statsEl) statsEl.textContent = `${entries} stream${entries !== 1 ? 's' : ''} across ${groups.length} group${groups.length !== 1 ? 's' : ''}: ${groups.join(', ')}`;
+            } catch (e) {
+                if (statsEl) statsEl.textContent = `Failed to fetch: ${e.message}`;
+            }
+        }
+
+        function copyM3uUrl(channelId) {
+            const url = channelId === 'all'
+                ? `${window.location.protocol}//${window.location.hostname}:6868/channel/all/live.m3u`
+                : `${window.location.protocol}//${window.location.hostname}:6868/channel/${channelId}/live.m3u`;
+            navigator.clipboard.writeText(url).then(() => {
+                log('M3U URL copied to clipboard', 'success');
+            }).catch(() => {
+                prompt('Copy this URL:', url);
+            });
+        }
+
+        let _perChannelM3uVisible = false;
+        function togglePerChannelM3u() {
+            _perChannelM3uVisible = !_perChannelM3uVisible;
+            const list = document.getElementById('perChannelM3uList');
+            const btn = document.getElementById('btnPerChannelM3u');
+            if (!list) return;
+            list.style.display = _perChannelM3uVisible ? 'flex' : 'none';
+            if (btn) btn.innerHTML = _perChannelM3uVisible ? '&#x25B2; Per-Channel M3U Links' : '&#x25BC; Per-Channel M3U Links';
+            if (_perChannelM3uVisible) renderPerChannelM3uList();
+        }
+
+        function renderPerChannelM3uList() {
+            const list = document.getElementById('perChannelM3uList');
+            if (!list || !currentChannels.length) { if (list) list.innerHTML = '<div style="font-size:11px;color:var(--text-muted);padding:4px;">No channels loaded yet.</div>'; return; }
+            const enabled = currentChannels.filter(ch => ch.enabled);
+            list.innerHTML = enabled.map(ch => `
+                <div style="background:var(--bg-surface);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);padding:6px 10px;display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;">
+                    <div style="min-width:0;">
+                        <div style="font-size:11px;font-weight:600;color:var(--text-secondary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:260px;">${escapeHtml(ch.name)}</div>
+                        <code style="font-size:10px;color:var(--text-muted);font-family:'JetBrains Mono',monospace;">…/channel/${ch.id}/live.m3u</code>
+                    </div>
+                    <div style="display:flex;gap:5px;flex-shrink:0;">
+                        <button class="btn btn-sm" onclick="copyM3uUrl(${ch.id})" title="Copy URL">&#x2398; Copy</button>
+                        <a href="/channel/${ch.id}/live.m3u" target="_blank" class="btn btn-sm" style="text-decoration:none;" title="Preview">&#x1F441;</a>
+                    </div>
+                </div>
+            `).join('');
+        }
+
         async function loadChannels() {
             try {
                 const res = await fetch(`${API_BASE}/channel`);
@@ -1619,6 +1713,7 @@
                 buildFeedSidebar(_activeCat ? visible.filter(ch => ch.category === _activeCat) : visible, !!_activeCat);
             } catch (e) { log(`Failed to load channels: ${e.message}`, 'error'); }
             loadPlexLibraryDropdown();
+            refreshLiveM3uPreview();
         }
 
         function renderChannels(channels) {
