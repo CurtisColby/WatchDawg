@@ -147,12 +147,8 @@ fun PlayerScreen(
     val longPressMs  = 500L
     val autoHideMs   = 7_000L
 
-    // Session 42 — EPG info banner.
-    // Captured once at composition time from QueueHolder. If epgChannelNumber > 0
-    // this is an EPG session and the banner prefix shows "CH N • ChannelName".
-    // For all non-EPG sessions epgChannelNumber == -1 and the banner shows title only.
-    val epgChannelNumber: Int    = remember { QueueHolder.epgChannelNumber }
-    val epgChannelName: String   = remember { QueueHolder.epgChannelName }
+    // ── Info banner ───────────────────────────────────────────────────────────
+    // Auto-shown for 4s on every new stream start. Re-triggered by long-press OK.
     var infoBannerVisible by remember { mutableStateOf(false) }
 
     // Milestone E: speed menu visibility (separate from main controls)
@@ -564,21 +560,15 @@ fun PlayerScreen(
             )
         }
 
-        // ── Session 42: Info banner ───────────────────────────────────────────
+        // ── Info banner ───────────────────────────────────────────────────────
         // Auto-shown for 4s on every new stream start. Re-triggered by long-press OK.
-        // EPG: shows "CH N  •  ChannelName" header above the slot title.
-        // Non-EPG: shows title only — epgChannelNumber == -1 suppresses the header.
         AnimatedVisibility(
             visible  = infoBannerVisible && !controlsVisible,
             enter    = fadeIn(animationSpec = tween(300)),
             exit     = fadeOut(animationSpec = tween(500)),
             modifier = Modifier.align(Alignment.TopStart),
         ) {
-            InfoBanner(
-                channelNumber = epgChannelNumber,
-                channelName   = epgChannelName,
-                title         = state.title,
-            )
+            InfoBanner(title = state.title)
         }
 
         // ── Single-seek bubble ────────────────────────────────────────────────
@@ -976,26 +966,15 @@ private fun ScrubOverlay(
     }
 }
 
-// ── Session 42: Info banner ───────────────────────────────────────────────────
+// ── Info banner ───────────────────────────────────────────────────────────────
 
 /**
  * Overlay banner shown for 4 seconds at the start of each new stream and
  * on long-press OK. Positioned top-left in TV convention style.
- *
- * EPG sessions (channelNumber > 0):
- *   CH 101  •  Horror Channel
- *   Movie Title Here
- *
- * Non-EPG sessions (channelNumber == -1):
- *   Movie Title Here
- *   (no channel line)
+ * Shows the current video title only.
  */
 @Composable
-private fun InfoBanner(
-    channelNumber: Int,
-    channelName: String,
-    title: String,
-) {
+private fun InfoBanner(title: String) {
     Box(
         modifier = Modifier
             .padding(start = 48.dp, top = 40.dp)
@@ -1007,23 +986,13 @@ private fun InfoBanner(
             )
             .padding(horizontal = 28.dp, vertical = 20.dp),
     ) {
-        Column {
-            if (channelNumber > 0) {
-                Text(
-                    text  = "CH $channelNumber  •  $channelName",
-                    style = MaterialTheme.typography.labelLarge,
-                    color = WatchDawgColors.Orange,
-                )
-                Spacer(Modifier.height(6.dp))
-            }
-            Text(
-                text     = title,
-                fontSize = 34.sp,
-                color    = Color.White,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
-            )
-        }
+        Text(
+            text     = title,
+            fontSize = 34.sp,
+            color    = Color.White,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+        )
     }
 }
 

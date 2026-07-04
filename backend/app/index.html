@@ -423,24 +423,7 @@
         /* Genre tag hints label */
         .genre-tag-hint { font-size: 10px; color: var(--text-muted); width: 100%; margin-top: 2px; }
 
-        /* Add to EPG button on channel cards (Session 40) */
-        .btn-epg { padding: 3px 8px; background: none; border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); font-size: 11px; font-weight: 600; cursor: pointer; color: var(--accent-blue); border-color: var(--accent-blue); transition: all 0.15s; white-space: nowrap; }
-        .btn-epg:hover { background: var(--accent-blue-dim); }
-        .btn-epg.adult { color: var(--accent-orange); border-color: var(--accent-orange); }
-        .btn-epg.adult:hover { background: var(--accent-orange-dim); }
-        .btn-epg.added { color: var(--accent-green); border-color: var(--accent-green); cursor: default; }
 
-        /* Add to EPG mini-modal overlay (Session 40) */
-        .epg-quick-modal-overlay { display:none; position:fixed; top:0; left:0; right:0; bottom:0; background:rgba(0,0,0,0.65); z-index:2000; align-items:center; justify-content:center; }
-        .epg-quick-modal-overlay.active { display:flex; }
-        .epg-quick-modal { background:var(--bg-card); border:1px solid var(--border-focus); border-radius:var(--radius); padding:20px; width:380px; max-width:90vw; display:flex; flex-direction:column; gap:12px; }
-        .epg-quick-modal h4 { font-size:14px; font-weight:700; margin:0; color:var(--text-primary); }
-        .epg-quick-modal .epg-qm-meta { font-size:11px; color:var(--text-muted); margin-top:-6px; }
-        .epg-quick-modal label { font-size:11px; color:var(--text-muted); text-transform:uppercase; letter-spacing:0.5px; display:block; margin-bottom:4px; }
-        .epg-quick-modal input[type=number], .epg-quick-modal select { width:100%; padding:7px 10px; background:var(--bg-surface); border:1px solid var(--border-subtle); border-radius:var(--radius-sm); color:var(--text-primary); font-size:13px; font-family:'Outfit',sans-serif; outline:none; }
-        .epg-quick-modal input[type=number]:focus, .epg-quick-modal select:focus { border-color:var(--accent-orange); }
-        .epg-quick-modal .epg-qm-check-row { display:flex; align-items:center; gap:8px; }
-        .epg-quick-modal .epg-qm-actions { display:flex; gap:8px; justify-content:flex-end; margin-top:4px; }
 
         /* YouTube parent channel root row (Session 38) */
         .ch-yt-parent-group { margin-bottom: 8px; }
@@ -696,11 +679,6 @@
             <button class="nav-item" id="nav-livetv" onclick="switchPage('livetv', this)">
                 <span class="nav-item-icon">&#x1F4E1;</span>
                 <span class="nav-item-label">Live TV</span>
-            </button>
-            <button class="nav-item" id="nav-epg" onclick="switchPage('epg', this)">
-                <span class="nav-item-icon">&#x1F4FA;</span>
-                <span class="nav-item-label">EPG</span>
-                <span class="nav-item-count" id="navCountEpg">0</span>
             </button>
             <div class="nav-divider"></div>
             <div class="nav-section-label">Manage</div>
@@ -973,197 +951,6 @@
                 </div>
             </div>
 
-            <!-- ============================================================
-                 EPG PAGE
-                 ============================================================ -->
-            <div class="page" id="page-epg">
-                <div class="page-header">
-                    <h2>&#x1F4FA; EPG Channels</h2>
-                    <div class="page-controls">
-                        <button class="btn btn-sm" onclick="loadEpgPage()">&#x21BB; Refresh</button>
-                        <button class="btn btn-sm btn-primary" onclick="showEpgChannelModal()">&#x2795; New Channel</button>
-                    </div>
-                </div>
-
-                <!-- XMLTV Sources Card (Session 44 — Tunarr EPG) -->
-                <div class="live-tv-import" id="xmltvSourcesCard">
-                    <h3>&#x1F4E1; XMLTV Sources <span style="font-size:11px;font-weight:400;color:var(--text-muted);">(Tunarr EPG)</span></h3>
-                    <div class="live-tv-import-row" style="margin-bottom:6px;">
-                        <input type="text" id="xmltvUrlInput" placeholder="XMLTV URL (e.g. http://192.168.50.42:7777/api/xmltv.xml)" style="flex:1;">
-                        <input type="text" id="xmltvLabelInput" placeholder="Label (optional)" style="max-width:180px;">
-                        <select id="xmltvEpgType" style="max-width:110px;padding:7px 10px;background:var(--bg-surface);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);color:var(--text-primary);font-size:13px;font-family:'Outfit',sans-serif;outline:none;">
-                            <option value="main">Main EPG</option>
-                            <option value="adult">Adult EPG</option>
-                        </select>
-                        <button class="btn btn-primary btn-sm" onclick="importXmltvSource()">Import</button>
-                    </div>
-                    <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px;">
-                        <input type="text" id="xmltvChannelFilterInput" placeholder="Channel name filter (optional). e.g. 'Adult' = only Adult channels. '!Adult' = exclude Adult channels." style="flex:1;padding:7px 12px;background:var(--bg-surface);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);color:var(--text-primary);font-size:13px;font-family:'Outfit',sans-serif;outline:none;">
-                    </div>
-                    <div id="xmltvSourcesList" style="font-size:13px;color:var(--text-muted);">Loading...</div>
-                </div>
-
-                <!-- Plex Connection Card -->
-                <div class="live-tv-import" id="epgPlexCard" style="padding:10px 16px;">
-                    <div style="display:flex;align-items:center;justify-content:space-between;cursor:pointer;" onclick="togglePlexCard()">
-                        <h3 style="margin:0;">&#x1F7E0; Plex Media Server &nbsp;<span id="epgPlexStatusInline" style="font-size:12px;font-weight:400;color:var(--text-muted);">Checking...</span></h3>
-                        <span id="plexCardChevron" style="font-size:14px;color:var(--text-muted);">&#x25BC;</span>
-                    </div>
-                    <div id="epgPlexCardBody" style="display:none;margin-top:10px;">
-                        <div id="epgPlexStatus" style="margin-bottom:10px;font-size:13px;color:var(--text-muted);">
-                            Checking Plex connection...
-                        </div>
-                        <div id="epgPlexConnectForm" style="display:none;">
-                            <div class="live-tv-import-row" style="flex-wrap:wrap;gap:8px;">
-                                <input type="text" id="plexIpInput" placeholder="Plex IP (e.g. 192.168.50.10)" style="flex:2;min-width:160px;">
-                                <input type="number" id="plexPortInput" placeholder="Port" value="32400" style="flex:0.5;min-width:80px;">
-                                <input type="password" id="plexTokenInput" placeholder="X-Plex-Token" style="flex:2;min-width:160px;">
-                                <button class="btn btn-primary" onclick="connectPlex()">Connect</button>
-                            </div>
-                        </div>
-                        <div id="epgPlexLibraries" style="display:none;margin-top:12px;">
-                            <div style="font-size:12px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.6px;margin-bottom:8px;">Libraries</div>
-                            <div id="epgPlexLibraryList" style="display:flex;flex-wrap:wrap;gap:8px;"></div>
-                        </div>
-                        <div id="epgPlexConnectedActions" style="display:none;margin-top:10px;">
-                            <button class="btn btn-sm" onclick="loadPlexLibraries()">&#x21BB; Refresh Libraries</button>
-                            <button class="btn btn-sm" style="color:var(--text-muted);" onclick="disconnectPlex()">Disconnect</button>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- EPG Type Tabs -->
-                <div style="display:flex;gap:8px;margin-bottom:16px;">
-                    <button class="btn btn-primary" id="epgTabMain" onclick="switchEpgTab('main')">&#x1F4FA; Main EPG</button>
-                    <button class="btn btn-sm" id="epgTabAdult" onclick="switchEpgTab('adult')">&#x1F512; Adult EPG</button>
-                    <div style="flex:1;"></div>
-                    <button class="btn btn-sm" onclick="rebuildEpgSchedules()">&#x23F1; Rebuild Schedules</button>
-                </div>
-
-                <!-- Channel List -->
-                <div id="epgChannelList" style="display:flex;flex-direction:column;gap:10px;overflow-y:auto;max-height:calc(100vh - 420px);padding-right:4px;">
-                    <div style="color:var(--text-muted);font-size:13px;text-align:center;padding:40px;">
-                        Loading EPG channels...
-                    </div>
-                </div>
-            </div>
-
-            <!-- EPG Channel Create/Edit Modal -->
-            <div id="epgChannelModal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.7);z-index:1000;align-items:center;justify-content:center;">
-                <div style="background:var(--bg-card);border:1px solid var(--border-subtle);border-radius:var(--radius);padding:24px;width:520px;max-width:95vw;max-height:90vh;overflow-y:auto;">
-                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;">
-                        <h3 id="epgModalTitle" style="font-size:16px;font-weight:600;">New EPG Channel</h3>
-                        <button onclick="closeEpgChannelModal()" style="background:none;border:none;color:var(--text-muted);font-size:18px;cursor:pointer;">&#x2715;</button>
-                    </div>
-
-                    <input type="hidden" id="epgModalChannelId" value="">
-
-                    <div style="display:flex;flex-direction:column;gap:14px;">
-                        <!-- Channel Number + Name -->
-                        <div style="display:flex;gap:10px;">
-                            <div style="flex:0.4;">
-                                <label style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;">CH #</label>
-                                <input type="number" id="epgModalNumber" placeholder="101" style="width:100%;margin-top:4px;padding:7px 10px;background:var(--bg-surface);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);color:var(--text-primary);font-size:13px;font-family:'Outfit',sans-serif;outline:none;">
-                            </div>
-                            <div style="flex:1.6;">
-                                <label style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;">Channel Name</label>
-                                <input type="text" id="epgModalName" placeholder="Horror Channel" style="width:100%;margin-top:4px;padding:7px 10px;background:var(--bg-surface);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);color:var(--text-primary);font-size:13px;font-family:'Outfit',sans-serif;outline:none;">
-                            </div>
-                        </div>
-
-                        <!-- EPG Type -->
-                        <div>
-                            <label style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;">EPG Type</label>
-                            <select id="epgModalType" onchange="onEpgTypeChange()" style="width:100%;margin-top:4px;padding:7px 10px;background:var(--bg-surface);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);color:var(--text-primary);font-size:13px;font-family:'Outfit',sans-serif;outline:none;">
-                                <option value="main">Main EPG (No PIN)</option>
-                                <option value="adult">Adult EPG (PIN Required)</option>
-                            </select>
-                        </div>
-
-                        <!-- Source Type -->
-                        <div>
-                            <label style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;">Content Source</label>
-                            <select id="epgModalSourceType" onchange="onEpgSourceTypeChange()" style="width:100%;margin-top:4px;padding:7px 10px;background:var(--bg-surface);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);color:var(--text-primary);font-size:13px;font-family:'Outfit',sans-serif;outline:none;">
-                                <option value="plex_movie">Plex — Movies</option>
-                                <option value="plex_tv">Plex — TV Series</option>
-                                <option value="watchdawg">WatchDawg Scraped Sources</option>
-                                <option value="iptv_favorites">IPTV Favorites (Live)</option>
-                                <option value="local_private">&#x1F4C2; Local Private Folder</option>
-                            </select>
-                        </div>
-
-                        <!-- Plex Library Picker (shown for plex_* types) -->
-                        <div id="epgModalPlexLibraryRow">
-                            <label style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;">Plex Library</label>
-                            <select id="epgModalPlexLibrary" onchange="loadEpgModalGenres()" style="width:100%;margin-top:4px;padding:7px 10px;background:var(--bg-surface);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);color:var(--text-primary);font-size:13px;font-family:'Outfit',sans-serif;outline:none;">
-                                <option value="">Loading libraries...</option>
-                            </select>
-                        </div>
-
-                        <!-- WatchDawg Source Picker (shown for watchdawg source type) — Session 40 -->
-                        <div id="epgModalWatchdawgSourceRow" style="display:none;">
-                            <label style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;">Source Channel <span style="font-weight:400;">(leave on All Sources to use genre filter)</span></label>
-                            <select id="epgModalWatchdawgSource" onchange="onWatchdawgSourceChange()" style="width:100%;margin-top:4px;padding:7px 10px;background:var(--bg-surface);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);color:var(--text-primary);font-size:13px;font-family:'Outfit',sans-serif;outline:none;">
-                                <option value="">All Sources</option>
-                            </select>
-                            <div style="font-size:11px;color:var(--text-muted);margin-top:4px;">Pin this EPG channel to one specific WatchDawg source, or leave on All Sources and use the Genre Filter below to pull from multiple sources at once.</div>
-                        </div>
-
-                        <!-- Private Folder Picker (shown for local_private type) — Session 43 -->
-                        <div id="epgModalPrivateFolderRow" style="display:none;">
-                            <label style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;">Private Folder</label>
-                            <select id="epgModalPrivateFolder" style="width:100%;margin-top:4px;padding:7px 10px;background:var(--bg-surface);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);color:var(--text-primary);font-size:13px;font-family:'Outfit',sans-serif;outline:none;">
-                                <option value="">Select folder...</option>
-                            </select>
-                            <div style="font-size:11px;color:var(--text-muted);margin-top:4px;">Subfolders inside /watchdawg/Private/ that contain video files. Duration is probed automatically by the scheduler.</div>
-                        </div>
-
-                        <!-- Genre Filter -->
-                        <div id="epgModalGenreRow">
-                            <label style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;">Genre Filter <span style="font-weight:400;">(leave empty = all genres)</span></label>
-                            <select id="epgModalGenre" style="width:100%;margin-top:4px;padding:7px 10px;background:var(--bg-surface);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);color:var(--text-primary);font-size:13px;font-family:'Outfit',sans-serif;outline:none;">
-                                <option value="">All Genres</option>
-                            </select>
-                        </div>
-
-                        <!-- TV-specific: Episodes per day budget -->
-                        <div id="epgModalEpBudgetRow" style="display:none;">
-                            <label style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;">Episodes Per Series Per Day</label>
-                            <input type="number" id="epgModalEpBudget" value="2" min="1" max="10" style="width:100%;margin-top:4px;padding:7px 10px;background:var(--bg-surface);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);color:var(--text-primary);font-size:13px;font-family:'Outfit',sans-serif;outline:none;">
-                            <div style="font-size:11px;color:var(--text-muted);margin-top:4px;">Limits how many episodes of a single series air per day. Prevents one show from dominating the channel.</div>
-                        </div>
-
-                        <!-- Rotation Style -->
-                        <div id="epgModalRotationRow">
-                            <label style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;">Rotation Style</label>
-                            <select id="epgModalRotation" style="width:100%;margin-top:4px;padding:7px 10px;background:var(--bg-surface);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);color:var(--text-primary);font-size:13px;font-family:'Outfit',sans-serif;outline:none;">
-                                <option value="shuffle">Shuffle — random order, reshuffled each loop</option>
-                                <option value="sequential">Sequential — plays in order, loops at end</option>
-                            </select>
-                        </div>
-
-                        <!-- Primetime Boost -->
-                        <div style="display:flex;align-items:center;gap:10px;">
-                            <input type="checkbox" id="epgModalPrimetime" style="accent-color:var(--accent-orange);width:16px;height:16px;">
-                            <div>
-                                <label for="epgModalPrimetime" style="font-size:13px;cursor:pointer;">Primetime Boost (7–11 PM)</label>
-                                <div style="font-size:11px;color:var(--text-muted);">Fills evening slots with highest-rated content.</div>
-                            </div>
-                        </div>
-
-                        <!-- Logo URL -->
-                        <div>
-                            <label style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;">Logo URL <span style="font-weight:400;">(optional)</span></label>
-                            <input type="text" id="epgModalLogo" placeholder="https://..." style="width:100%;margin-top:4px;padding:7px 10px;background:var(--bg-surface);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);color:var(--text-primary);font-size:13px;font-family:'Outfit',sans-serif;outline:none;">
-                        </div>
-                    </div>
-
-                    <div style="display:flex;gap:8px;margin-top:20px;justify-content:flex-end;">
-                        <button class="btn btn-sm" onclick="closeEpgChannelModal()">Cancel</button>
-                        <button class="btn btn-primary" onclick="saveEpgChannel()">Save Channel</button>
-                    </div>
-                </div>
-            </div>
 
             <!-- ============================================================
                  CHANNELS PAGE
@@ -1264,44 +1051,59 @@
                                 onkeydown="if(event.key==='Enter') addPlexLibraryChannel()">
                         </div>
                     </div>
-                    <!-- Live M3U Export Card -->
-                    <div id="livem3uCard" style="background:var(--bg-card);border:1px solid #22c55e44;border-radius:var(--radius);padding:14px 16px;margin-bottom:16px;">
-                        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
-                            <div style="display:flex;align-items:center;gap:8px;">
-                                <span style="font-size:16px;">📡</span>
-                                <span style="font-size:13px;font-weight:700;color:#22c55e;text-transform:uppercase;letter-spacing:0.06em;">Live M3U Feed</span>
-                            </div>
-                            <button class="btn btn-sm" onclick="refreshLiveM3uPreview()" title="Reload entry count">&#x21BB; Refresh</button>
+                    <!-- Local Folder Add Section — Session 45 -->
+                    <div class="channel-add-form" id="localFolderAddForm" style="margin-top:12px;border-color:#3b82f6;display:none;">
+                        <div style="font-size:11px;font-weight:700;color:#3b82f6;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:4px;">&#x1F4C2; Add Local Folder as Channel</div>
+                        <div style="font-size:11px;color:var(--text-muted);margin-bottom:8px;">
+                            Scans a folder under <code>/watchdawg/Private/</code> or <code>/watchdawg/Public/</code> and adds every video file as a channel entry. Files play instantly — no resolution needed.
                         </div>
-                        <div style="font-size:11px;color:var(--text-muted);margin-bottom:10px;">
-                            Add either URL to TiviMate or any IPTV client. The feed is always live — resolved stream URLs are updated automatically by the scheduler.
+                        <!-- Row 1: Folder picker -->
+                        <div class="channel-add-row">
+                            <select id="localFolderSelect" style="flex:1;" onchange="onLocalFolderChange()">
+                                <option value="">Loading folders...</option>
+                            </select>
                         </div>
-                        <!-- All channels feed -->
-                        <div style="background:var(--bg-surface);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);padding:8px 10px;margin-bottom:6px;">
-                            <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;">
-                                <div>
-                                    <div style="font-size:10px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.06em;margin-bottom:2px;">All Channels</div>
-                                    <code id="m3uAllUrl" style="font-size:11px;font-family:'JetBrains Mono',monospace;color:var(--accent-orange);word-break:break-all;">http://192.168.50.42:6868/channel/all/live.m3u</code>
-                                </div>
-                                <div style="display:flex;gap:6px;flex-shrink:0;">
-                                    <button class="btn btn-sm" onclick="copyM3uUrl('all')" title="Copy URL">&#x2398; Copy</button>
-                                    <a href="/channel/all/live.m3u" target="_blank" class="btn btn-sm" style="text-decoration:none;" title="Preview raw M3U in browser">&#x1F441; Preview</a>
-                                </div>
-                            </div>
-                            <div id="m3uAllStats" style="font-size:10px;color:var(--text-muted);margin-top:5px;">Loading stats...</div>
+                        <!-- Row 2: Name, Category, Add button -->
+                        <div class="channel-add-row">
+                            <input type="text" id="localFolderNameInput"
+                                placeholder="Friendly name (auto-filled from folder name)..."
+                                onkeydown="if(event.key==='Enter') addLocalFolderChannel()">
+                            <select id="localFolderCatInput">
+                                <option value="general">General</option>
+                                <option value="music">Music</option>
+                                <option value="ccm">CCM</option>
+                                <option value="chill">Chill</option>
+                                <option value="nature">Nature</option>
+                                <option value="movies">Movies</option>
+                                <option value="tv">TV</option>
+                                <option value="vimeo">Vimeo</option>
+                                <option value="sexy">Sexy</option>
+                                <option value="adult" selected>Adult</option>
+                                <option value="live_tv">Live TV</option>
+                            </select>
+                            <button class="btn btn-primary" id="btnAddLocalFolder" onclick="addLocalFolderChannel()" style="background:#3b82f6;">&#x2795; Add Folder</button>
                         </div>
-                        <!-- Per-channel M3U links (collapsed by default) -->
-                        <div>
-                            <button class="btn btn-sm" onclick="togglePerChannelM3u()" id="btnPerChannelM3u" style="width:100%;justify-content:center;margin-top:4px;">
-                                &#x25BC; Per-Channel M3U Links
-                            </button>
-                            <div id="perChannelM3uList" style="display:none;margin-top:8px;flex-direction:column;gap:4px;"></div>
+                        <!-- Row 3: Genre tags -->
+                        <div class="channel-add-row">
+                            <input type="text" id="localFolderTagsInput"
+                                placeholder="Genre tags — comma separated, e.g. Local, Movies"
+                                style="flex:1;padding:6px 12px;background:var(--bg-surface);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);color:var(--text-primary);font-size:12px;font-family:'Outfit',sans-serif;outline:none;transition:border-color 0.2s;"
+                                onfocus="this.style.borderColor='#3b82f6'"
+                                onblur="this.style.borderColor='var(--border-subtle)'"
+                                onkeydown="if(event.key==='Enter') addLocalFolderChannel()">
+                        </div>
+                        <!-- Row 4: Lock toggle -->
+                        <div class="channel-add-row" style="gap:8px;align-items:center;">
+                            <input type="checkbox" id="localFolderLockInput" style="width:16px;height:16px;accent-color:#3b82f6;">
+                            <label for="localFolderLockInput" style="font-size:12px;color:var(--text-secondary);cursor:pointer;">&#x1F512; Lock channel (PIN required to view)</label>
                         </div>
                     </div>
 
                     <div id="channelList"></div>
                 </div>
             </div>
+
+        </div><!-- /main-content -->
     </div><!-- /app-body -->
 
     <!-- Player Modal -->
@@ -1641,67 +1443,6 @@
         // =====================================================================
         //  CHANNELS
         // =====================================================================
-        // =====================================================================
-        //  LIVE M3U PANEL (Session 45)
-        // =====================================================================
-
-        async function refreshLiveM3uPreview() {
-            const statsEl = document.getElementById('m3uAllStats');
-            if (statsEl) statsEl.textContent = 'Loading...';
-            try {
-                const res = await fetch(`${API_BASE}/channel/all/live.m3u`);
-                if (!res.ok) { if (statsEl) statsEl.textContent = `Error ${res.status} — check backend logs`; return; }
-                const text = await res.text();
-                const lines = text.split('\n').filter(l => l && !l.startsWith('#'));
-                const entries = lines.length;
-                const extinfLines = text.split('\n').filter(l => l.startsWith('#EXTINF'));
-                const groups = [...new Set(extinfLines.map(l => { const m = l.match(/group-title="([^"]+)"/); return m ? m[1] : 'Unknown'; }))];
-                if (statsEl) statsEl.textContent = `${entries} stream${entries !== 1 ? 's' : ''} across ${groups.length} group${groups.length !== 1 ? 's' : ''}: ${groups.join(', ')}`;
-            } catch (e) {
-                if (statsEl) statsEl.textContent = `Failed to fetch: ${e.message}`;
-            }
-        }
-
-        function copyM3uUrl(channelId) {
-            const url = channelId === 'all'
-                ? `${window.location.protocol}//${window.location.hostname}:6868/channel/all/live.m3u`
-                : `${window.location.protocol}//${window.location.hostname}:6868/channel/${channelId}/live.m3u`;
-            navigator.clipboard.writeText(url).then(() => {
-                log('M3U URL copied to clipboard', 'success');
-            }).catch(() => {
-                prompt('Copy this URL:', url);
-            });
-        }
-
-        let _perChannelM3uVisible = false;
-        function togglePerChannelM3u() {
-            _perChannelM3uVisible = !_perChannelM3uVisible;
-            const list = document.getElementById('perChannelM3uList');
-            const btn = document.getElementById('btnPerChannelM3u');
-            if (!list) return;
-            list.style.display = _perChannelM3uVisible ? 'flex' : 'none';
-            if (btn) btn.innerHTML = _perChannelM3uVisible ? '&#x25B2; Per-Channel M3U Links' : '&#x25BC; Per-Channel M3U Links';
-            if (_perChannelM3uVisible) renderPerChannelM3uList();
-        }
-
-        function renderPerChannelM3uList() {
-            const list = document.getElementById('perChannelM3uList');
-            if (!list || !currentChannels.length) { if (list) list.innerHTML = '<div style="font-size:11px;color:var(--text-muted);padding:4px;">No channels loaded yet.</div>'; return; }
-            const enabled = currentChannels.filter(ch => ch.enabled);
-            list.innerHTML = enabled.map(ch => `
-                <div style="background:var(--bg-surface);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);padding:6px 10px;display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;">
-                    <div style="min-width:0;">
-                        <div style="font-size:11px;font-weight:600;color:var(--text-secondary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:260px;">${escapeHtml(ch.name)}</div>
-                        <code style="font-size:10px;color:var(--text-muted);font-family:'JetBrains Mono',monospace;">…/channel/${ch.id}/live.m3u</code>
-                    </div>
-                    <div style="display:flex;gap:5px;flex-shrink:0;">
-                        <button class="btn btn-sm" onclick="copyM3uUrl(${ch.id})" title="Copy URL">&#x2398; Copy</button>
-                        <a href="/channel/${ch.id}/live.m3u" target="_blank" class="btn btn-sm" style="text-decoration:none;" title="Preview">&#x1F441;</a>
-                    </div>
-                </div>
-            `).join('');
-        }
-
         async function loadChannels() {
             try {
                 const res = await fetch(`${API_BASE}/channel`);
@@ -1713,7 +1454,7 @@
                 buildFeedSidebar(_activeCat ? visible.filter(ch => ch.category === _activeCat) : visible, !!_activeCat);
             } catch (e) { log(`Failed to load channels: ${e.message}`, 'error'); }
             loadPlexLibraryDropdown();
-            refreshLiveM3uPreview();
+            loadLocalFolderDropdown();
         }
 
         function renderChannels(channels) {
@@ -1859,15 +1600,6 @@
                     <button class="lock-toggle-btn ${ch.locked?'locked':''}" onclick="toggleChannelLock(${ch.id},${ch.locked})">${ch.locked?'&#x1F512;':'&#x1F513;'}</button>
                     <button class="toggle-switch ${ch.enabled?'active':''}" onclick="toggleChannel(${ch.id},${!ch.enabled})" title="${ch.enabled?'Disable':'Enable'}"></button>
                     <button class="btn-icon btn-icon-danger" onclick="deleteChannel(${ch.id},'${escapeHtml(ch.name).replace(/'/g,"\\'")}')">&#x1F5D1;</button>
-                    <button class="btn-epg ${ch.locked?'adult':''}"
-                        title="${ch.locked?'Add to Adult EPG (PIN required)':'Add to Main EPG'}"
-                        data-chid="${ch.id}"
-                        data-chname="${escapeHtml(ch.name)}"
-                        data-genres="${escapeHtml(ch.genre_tags||'')}"
-                        data-locked="${ch.locked?'true':'false'}"
-                        onclick="openEpgQuickModalFromBtn(this)">
-                        ${ch.locked?'&#x1F512; Adult EPG':'&#x1F4FA; EPG'}
-                    </button>
                 </div>
             </div>`;
         }
@@ -2082,6 +1814,91 @@
             const selectedOpt = genreSel.options[genreSel.selectedIndex];
             const genreTitle = selectedOpt ? (selectedOpt.getAttribute('data-title') || selectedOpt.text.split(' (')[0]) : '';
             nameInput.value = genreTitle ? `${libTitle} — ${genreTitle}` : libTitle;
+        }
+
+        // -----------------------------------------------------------------------
+        // Local Folder Channel Add — Session 45
+        // -----------------------------------------------------------------------
+
+        async function loadLocalFolderDropdown() {
+            const form = document.getElementById('localFolderAddForm');
+            const sel = document.getElementById('localFolderSelect');
+            if (!form || !sel) return;
+            try {
+                const res = await fetch(`${API_BASE}/channel/local-folders`);
+                if (!res.ok) { form.style.display = 'none'; return; }
+                const data = await res.json();
+                const folders = data.folders || [];
+                if (!folders.length) { form.style.display = 'none'; return; }
+                sel.innerHTML = folders.map(f =>
+                    `<option value="${escapeHtml(f.path)}" data-name="${escapeHtml(f.name)}">`+
+                    `${escapeHtml(f.label)} (${f.file_count} file${f.file_count !== 1 ? 's' : ''})</option>`
+                ).join('');
+                form.style.display = 'block';
+                onLocalFolderChange();
+            } catch (e) {
+                if (form) form.style.display = 'none';
+            }
+        }
+
+        function onLocalFolderChange() {
+            const sel = document.getElementById('localFolderSelect');
+            const nameInput = document.getElementById('localFolderNameInput');
+            if (!sel || !nameInput) return;
+            const opt = sel.options[sel.selectedIndex];
+            if (opt) nameInput.value = opt.getAttribute('data-name') || '';
+        }
+
+        async function addLocalFolderChannel() {
+            const sel = document.getElementById('localFolderSelect');
+            const nameInput = document.getElementById('localFolderNameInput');
+            const catInput = document.getElementById('localFolderCatInput');
+            const tagsInput = document.getElementById('localFolderTagsInput');
+            const lockInput = document.getElementById('localFolderLockInput');
+            const btn = document.getElementById('btnAddLocalFolder');
+            if (!sel || !sel.value) { log('Select a folder first.', 'warn'); return; }
+            const folderPath = sel.value;
+            const name = nameInput ? nameInput.value.trim() : '';
+            const category = catInput ? catInput.value : 'adult';
+            const genre_tags = tagsInput ? tagsInput.value.trim() : '';
+            const locked = lockInput ? lockInput.checked : false;
+            btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Adding...';
+            try {
+                // Step 1: Add the channel using the folder path as the URL
+                const res = await fetch(`${API_BASE}/channel`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url: folderPath, name: name || null, category, genre_tags })
+                });
+                if (!res.ok) { const err = await res.json(); throw new Error(err.detail || 'Add failed'); }
+                const data = await res.json();
+                const channelId = data.channel.id;
+                log(`Added local folder channel: ${data.channel.name}`, 'success');
+
+                // Step 2: Lock if requested
+                if (locked && _pinToken) {
+                    await fetch(`${API_BASE}/channel/${channelId}/lock`, {
+                        method: 'PATCH',
+                        headers: { 'Content-Type': 'application/json', 'X-WatchDawg-Token': _pinToken },
+                        body: JSON.stringify({ locked: true })
+                    });
+                }
+
+                // Step 3: Scrape immediately to populate video records
+                log(`Scanning folder: ${data.channel.name}...`);
+                const scrapeRes = await fetch(`${API_BASE}/channel/${channelId}/scrape`, { method: 'POST' });
+                if (scrapeRes.ok) {
+                    const scrapeData = await scrapeRes.json();
+                    log(`Scanned: ${scrapeData.result.new} files added from ${data.channel.name}`, 'success');
+                }
+
+                // Reset form
+                if (nameInput) nameInput.value = '';
+                if (tagsInput) tagsInput.value = '';
+                if (lockInput) lockInput.checked = false;
+                await loadChannels();
+            } catch (e) { log(`Failed to add local folder: ${e.message}`, 'error'); }
+            finally { btn.disabled = false; btn.innerHTML = '&#x2795; Add Folder'; }
         }
 
         async function addPlexLibraryChannel() {
@@ -3891,776 +3708,5 @@
     </div>
     <button id="debugToggleBtn" onclick="toggleDebugConsole()" title="Debug Console">&#x1F41B;</button>
 
-
-    <!-- ================================================================
-         EPG JavaScript — Session 39
-         ================================================================ -->
-    <script>
-    // -----------------------------------------------------------------------
-    // State
-    // -----------------------------------------------------------------------
-    let epgCurrentTab = 'main';
-    let epgPlexLibraries = [];
-    let epgChannels = [];
-
-    // -----------------------------------------------------------------------
-    // Page load
-    // -----------------------------------------------------------------------
-    let _plexCardOpen = false;
-
-    function togglePlexCard() {
-        _plexCardOpen = !_plexCardOpen;
-        document.getElementById('epgPlexCardBody').style.display = _plexCardOpen ? 'block' : 'none';
-        document.getElementById('plexCardChevron').innerHTML = _plexCardOpen ? '&#x25B2;' : '&#x25BC;';
-    }
-
-    function loadEpgPage() {
-        loadPlexStatus();
-        loadEpgChannels(epgCurrentTab);
-        loadXmltvSources();
-    }
-
-    // -----------------------------------------------------------------------
-    // XMLTV Source Management — Session 44
-    // -----------------------------------------------------------------------
-    const _XMLTV_API = window.location.origin;
-
-    async function loadXmltvSources() {
-        try {
-            const res  = await fetch(`${_XMLTV_API}/epg/xmltv-sources`);
-            const data = await res.json();
-            renderXmltvSources(data.sources || []);
-        } catch(e) {
-            document.getElementById('xmltvSourcesList').innerHTML =
-                '<span style="color:var(--accent-red);">Failed to load XMLTV sources</span>';
-        }
-    }
-
-    function renderXmltvSources(sources) {
-        const el = document.getElementById('xmltvSourcesList');
-        if (!sources.length) {
-            el.innerHTML = '<span style="color:var(--text-muted);">No XMLTV sources yet — paste a URL above and click Import.</span>';
-            return;
-        }
-        el.innerHTML = sources.map(src => `
-            <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--border-subtle);">
-                <div>
-                    <div style="font-weight:600;color:var(--text-primary);">${escapeHtml(src.label)}</div>
-                    <div style="font-size:11px;color:var(--text-muted);font-family:'JetBrains Mono',monospace;">${escapeHtml(src.url)}</div>
-                    <div style="font-size:11px;color:var(--text-muted);margin-top:2px;">
-                        ${src.epg_type === 'adult' ? '&#x1F51E; Adult EPG' : '&#x1F4FA; Main EPG'}
-                        ${src.channel_filter ? '&nbsp;·&nbsp; filter: <strong>' + escapeHtml(src.channel_filter) + '</strong>' : ''}
-                        &nbsp;·&nbsp;
-                        ${src.last_imported_at ? 'Last import: ' + new Date(src.last_imported_at).toLocaleString() : 'Never imported'}
-                    </div>
-                </div>
-                <div style="display:flex;gap:6px;flex-shrink:0;">
-                    <button class="btn btn-sm" onclick="reimportXmltvSource(${src.id}, '${escapeHtml(src.url).replace(/'/g,"\'")}', '${src.epg_type}', '${escapeHtml(src.label).replace(/'/g,"\'")}', ${src.channel_filter ? "'" + escapeHtml(src.channel_filter).replace(/'/g,"\'") + "'" : 'null'})">&#x21BB; Sync</button>
-                    <button class="btn-icon btn-icon-danger" onclick="deleteXmltvSource(${src.id}, '${escapeHtml(src.label).replace(/'/g,"\'")}')">&#x1F5D1;</button>
-                </div>
-            </div>
-        `).join('');
-    }
-
-    function _xmltvLog(msg, type) {
-        console.log('[XMLTV]', type, msg);
-        // Try the global log function if available
-        try { if (typeof log === 'function') log(msg, type); } catch(_) {}
-    }
-
-    async function importXmltvSource() {
-        const url            = document.getElementById('xmltvUrlInput').value.trim();
-        const label          = document.getElementById('xmltvLabelInput').value.trim() || null;
-        const epg_type       = document.getElementById('xmltvEpgType').value;
-        const channel_filter = document.getElementById('xmltvChannelFilterInput').value.trim() || null;
-        if (!url) { _xmltvLog('Enter an XMLTV URL.', 'warn'); return; }
-        _xmltvLog('Importing XMLTV...', 'info');
-        try {
-            const res  = await fetch(`${_XMLTV_API}/epg/import-xmltv`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ url, label, epg_type, channel_filter }),
-            });
-            const data = await res.json();
-            if (!res.ok) { _xmltvLog(`XMLTV import failed: ${data.detail || 'error'}`, 'error'); return; }
-            _xmltvLog(`XMLTV import complete: ${data.channels_upserted} channels, ${data.slots_inserted} slots${channel_filter ? ' (filter: ' + channel_filter + ')' : ''}`, 'success');
-            document.getElementById('xmltvUrlInput').value = '';
-            document.getElementById('xmltvLabelInput').value = '';
-            document.getElementById('xmltvChannelFilterInput').value = '';
-            await loadXmltvSources();
-            loadEpgChannels(epgCurrentTab);
-        } catch(e) { _xmltvLog(`XMLTV import failed: ${e.message}`, 'error'); }
-    }
-
-    async function reimportXmltvSource(id, url, epg_type, label, channel_filter) {
-        _xmltvLog(`Syncing XMLTV "${label}"...`, 'info');
-        try {
-            const res  = await fetch(`${_XMLTV_API}/epg/import-xmltv`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ url, label, epg_type, channel_filter: channel_filter || null }),
-            });
-            const data = await res.json();
-            if (!res.ok) { _xmltvLog(`XMLTV sync failed: ${data.detail || 'error'}`, 'error'); return; }
-            _xmltvLog(`XMLTV sync complete: ${data.channels_upserted} channels, ${data.slots_inserted} slots`, 'success');
-            await loadXmltvSources();
-            loadEpgChannels(epgCurrentTab);
-        } catch(e) { _xmltvLog(`XMLTV sync failed: ${e.message}`, 'error'); }
-    }
-
-    async function deleteXmltvSource(id, label) {
-        if (!confirm(`Delete XMLTV source "${label}" and all its EPG channels?`)) return;
-        try {
-            const res  = await fetch(`${_XMLTV_API}/epg/xmltv-sources/${id}`, { method: 'DELETE' });
-            const data = await res.json();
-            if (!res.ok) { _xmltvLog(`Delete failed: ${data.detail || 'error'}`, 'error'); return; }
-            _xmltvLog(`XMLTV source "${label}" deleted — ${data.channels_deleted} channels removed`, 'success');
-            await loadXmltvSources();
-            loadEpgChannels(epgCurrentTab);
-        } catch(e) { _xmltvLog(`Delete failed: ${e.message}`, 'error'); }
-    }
-
-    function switchEpgTab(type) {
-        epgCurrentTab = type;
-        document.getElementById('epgTabMain').className = type === 'main' ? 'btn btn-primary' : 'btn btn-sm';
-        document.getElementById('epgTabAdult').className = type === 'adult' ? 'btn btn-primary' : 'btn btn-sm';
-        loadEpgChannels(type);
-    }
-
-    // -----------------------------------------------------------------------
-    // Plex Connection
-    // -----------------------------------------------------------------------
-    async function loadPlexStatus() {
-        const statusEl = document.getElementById('epgPlexStatus');
-        const connectForm = document.getElementById('epgPlexConnectForm');
-        const librariesEl = document.getElementById('epgPlexLibraries');
-        const actionsEl = document.getElementById('epgPlexConnectedActions');
-        try {
-            const res = await fetch('/plex/status');
-            const data = await res.json();
-            const inlineEl = document.getElementById('epgPlexStatusInline');
-            if (data.status === 'connected') {
-                statusEl.innerHTML = `<span style="color:var(--success-green);">&#x2705; Connected to <strong>${data.server_name}</strong> at ${data.plex_url}</span>`;
-                if (inlineEl) inlineEl.innerHTML = `<span style="color:var(--success-green);">&#x2705; ${data.server_name}</span>`;
-                connectForm.style.display = 'none';
-                actionsEl.style.display = 'block';
-                loadPlexLibraries();
-            } else if (data.status === 'error') {
-                statusEl.innerHTML = `<span style="color:var(--error-red);">&#x26A0; ${data.server_name} — ${data.detail}</span>`;
-                if (inlineEl) inlineEl.innerHTML = `<span style="color:var(--accent-red);">&#x26A0; Error</span>`;
-                connectForm.style.display = 'block';
-                actionsEl.style.display = 'none';
-                librariesEl.style.display = 'none';
-            } else {
-                statusEl.innerHTML = `<span style="color:var(--text-muted);">Plex not configured. Enter your server details below.</span>`;
-                if (inlineEl) inlineEl.innerHTML = `<span style="color:var(--text-muted);">Not configured</span>`;
-                connectForm.style.display = 'block';
-                actionsEl.style.display = 'none';
-                librariesEl.style.display = 'none';
-            }
-        } catch(e) {
-            statusEl.innerHTML = `<span style="color:var(--error-red);">Error checking Plex status: ${e.message}</span>`;
-        }
-    }
-
-    async function connectPlex() {
-        const ip = document.getElementById('plexIpInput').value.trim();
-        const port = parseInt(document.getElementById('plexPortInput').value) || 32400;
-        const token = document.getElementById('plexTokenInput').value.trim();
-        if (!ip || !token) { alert('Plex IP and Token are required.'); return; }
-        try {
-            const res = await fetch('/plex/connect', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ plex_ip: ip, plex_port: port, plex_token: token })
-            });
-            const data = await res.json();
-            if (!res.ok) { alert('Connection failed: ' + (data.detail || res.statusText)); return; }
-            document.getElementById('plexTokenInput').value = '';
-            if (typeof logMessage === 'function') logMessage('Plex connected: ' + data.server_name, 'success');
-            loadPlexStatus();
-        } catch(e) { alert('Error: ' + e.message); }
-    }
-
-    async function disconnectPlex() {
-        if (!confirm('Disconnect Plex? Plex-sourced EPG channels will be paused.')) return;
-        await fetch('/plex/disconnect', { method: 'DELETE' });
-        if (typeof logMessage === 'function') logMessage('Plex disconnected.', 'info');
-        loadPlexStatus();
-    }
-
-    async function loadPlexLibraries() {
-        const librariesEl = document.getElementById('epgPlexLibraries');
-        const listEl = document.getElementById('epgPlexLibraryList');
-        try {
-            const res = await fetch('/plex/libraries');
-            const data = await res.json();
-            if (!res.ok || !data.libraries) { librariesEl.style.display = 'none'; return; }
-            epgPlexLibraries = data.libraries;
-            listEl.innerHTML = epgPlexLibraries.map(lib => `
-                <div style="background:var(--bg-surface);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);padding:8px 12px;font-size:12px;">
-                    <div style="font-weight:600;${lib.is_adult ? 'color:var(--accent-orange);' : ''}">${lib.is_adult ? '&#x1F512; ' : ''}${lib.title}</div>
-                    <div style="color:var(--text-muted);margin-top:2px;">${lib.type} &bull; ${lib.count.toLocaleString()} items</div>
-                </div>
-            `).join('');
-            librariesEl.style.display = 'block';
-
-            // Populate library picker in modal
-            const sel = document.getElementById('epgModalPlexLibrary');
-            sel.innerHTML = '<option value="">Select library...</option>' +
-                epgPlexLibraries.map(lib =>
-                    `<option value="${lib.key}">${lib.is_adult ? '\u{1F512} ' : ''}${lib.title} (${lib.type}, ${lib.count} items)</option>`
-                ).join('');
-        } catch(e) {
-            librariesEl.style.display = 'none';
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // EPG Channel List
-    // -----------------------------------------------------------------------
-    async function loadEpgChannels(epgType) {
-        epgType = epgType || epgCurrentTab;
-        const listEl = document.getElementById('epgChannelList');
-        listEl.innerHTML = '<div style="color:var(--text-muted);text-align:center;padding:30px;">Loading...</div>';
-        try {
-            const res = await fetch(`/epg/channels?epg_type=${epgType}`);
-            const data = await res.json();
-            epgChannels = data.channels || [];
-            document.getElementById('navCountEpg').textContent = epgChannels.length;
-
-            if (epgChannels.length === 0) {
-                listEl.innerHTML = `
-                    <div style="text-align:center;padding:40px;color:var(--text-muted);">
-                        <div style="font-size:32px;margin-bottom:12px;">&#x1F4FA;</div>
-                        <div style="font-size:14px;">No ${epgType === 'adult' ? 'Adult ' : ''}EPG channels yet.</div>
-                        <div style="font-size:12px;margin-top:6px;">Click <strong>+ New Channel</strong> to create your first EPG channel.</div>
-                    </div>`;
-                return;
-            }
-
-            listEl.innerHTML = epgChannels.map(ch => renderEpgChannelCard(ch)).join('');
-        } catch(e) {
-            listEl.innerHTML = `<div style="color:var(--error-red);text-align:center;padding:20px;">Error loading EPG channels: ${e.message}</div>`;
-        }
-    }
-
-    function renderEpgChannelCard(ch) {
-        const sourceLabels = {
-            'plex_movie': '&#x1F3AC; Plex Movies',
-            'plex_tv': '&#x1F4FA; Plex TV',
-            'watchdawg': '&#x1F9F2; WatchDawg',
-            'iptv_favorites': '&#x1F4E1; IPTV Live',
-        };
-        const sourceLabel = sourceLabels[ch.source_type] || ch.source_type;
-        const genreTag = ch.genre_filter ? `<span style="background:var(--accent-orange-dim);color:var(--accent-orange);padding:1px 8px;border-radius:10px;font-size:11px;">${ch.genre_filter}</span>` : '';
-        const rotationIcon = ch.rotation_style === 'shuffle' ? '&#x1F500;' : '&#x27A1;';
-        const enabledStyle = ch.enabled ? '' : 'opacity:0.5;';
-
-        return `
-        <div style="background:var(--bg-card);border:1px solid var(--border-subtle);border-radius:var(--radius);padding:14px 16px;display:flex;align-items:center;gap:14px;${enabledStyle}">
-            <div style="font-size:22px;font-family:'JetBrains Mono',monospace;font-weight:700;color:var(--accent-orange);min-width:50px;">CH ${ch.channel_number}</div>
-            <div style="flex:1;">
-                <div style="font-size:14px;font-weight:600;margin-bottom:4px;">${ch.name}</div>
-                <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-                    <span style="font-size:12px;color:var(--text-muted);">${sourceLabel}</span>
-                    ${genreTag}
-                    <span style="font-size:11px;color:var(--text-muted);">${rotationIcon} ${ch.rotation_style}</span>
-                    ${ch.primetime_boost ? '<span style="font-size:11px;color:gold;">&#x2728; Primetime</span>' : ''}
-                    ${ch.source_type === 'plex_tv' ? `<span style="font-size:11px;color:var(--text-muted);">${ch.episodes_per_day} ep/day</span>` : ''}
-                    ${!ch.enabled ? '<span style="font-size:11px;color:var(--error-red);">&#x23F8; Paused</span>' : ''}
-                </div>
-            </div>
-            <div style="display:flex;gap:6px;flex-shrink:0;">
-                <button class="btn btn-sm" onclick="previewEpgChannel(${ch.id})" title="Preview schedule">&#x1F441;</button>
-                <button class="btn btn-sm" onclick="toggleEpgChannel(${ch.id}, ${ch.enabled})" title="${ch.enabled ? 'Pause' : 'Enable'}">${ch.enabled ? '&#x23F8;' : '&#x25B6;'}</button>
-                <button class="btn btn-sm" onclick="editEpgChannel(${ch.id})" title="Edit">&#x270F;</button>
-                <button class="btn btn-sm" style="color:var(--error-red);" onclick="deleteEpgChannel(${ch.id})">&#x1F5D1;</button>
-            </div>
-        </div>`;
-    }
-
-    // -----------------------------------------------------------------------
-    // Modal — Create / Edit
-    // -----------------------------------------------------------------------
-    async function showEpgChannelModal(channelId) {
-        document.getElementById('epgModalChannelId').value = '';
-        document.getElementById('epgModalTitle').textContent = 'New EPG Channel';
-        document.getElementById('epgModalName').value = '';
-        document.getElementById('epgModalLogo').value = '';
-        document.getElementById('epgModalPrimetime').checked = false;
-        document.getElementById('epgModalRotation').value = 'shuffle';
-        document.getElementById('epgModalEpBudget').value = '2';
-        document.getElementById('epgModalType').value = epgCurrentTab;
-        document.getElementById('epgModalSourceType').value = 'plex_movie';
-
-        // Suggest next channel number
-        try {
-            const res = await fetch(`/epg/next-channel-number?epg_type=${epgCurrentTab}`);
-            const data = await res.json();
-            document.getElementById('epgModalNumber').value = data.next_channel_number;
-        } catch(e) {
-            document.getElementById('epgModalNumber').value = epgCurrentTab === 'main' ? 101 : 901;
-        }
-
-        onEpgSourceTypeChange();
-        await populatePlexLibraryDropdown();
-
-        document.getElementById('epgChannelModal').style.display = 'flex';
-    }
-
-    async function editEpgChannel(channelId) {
-        const ch = epgChannels.find(c => c.id === channelId);
-        if (!ch) return;
-
-        document.getElementById('epgModalChannelId').value = ch.id;
-        document.getElementById('epgModalTitle').textContent = `Edit — CH ${ch.channel_number} ${ch.name}`;
-        document.getElementById('epgModalNumber').value = ch.channel_number;
-        document.getElementById('epgModalName').value = ch.name;
-        document.getElementById('epgModalType').value = ch.epg_type;
-        document.getElementById('epgModalSourceType').value = ch.source_type;
-        document.getElementById('epgModalLogo').value = ch.logo_url || '';
-        document.getElementById('epgModalPrimetime').checked = ch.primetime_boost;
-        document.getElementById('epgModalRotation').value = ch.rotation_style;
-        document.getElementById('epgModalEpBudget').value = ch.episodes_per_day;
-
-        onEpgSourceTypeChange();
-        await populatePlexLibraryDropdown();
-
-        if (ch.source_type === 'watchdawg') {
-            // loadWatchdawgSources is already called by onEpgSourceTypeChange above.
-            // After sources load, restore the pinned source selection if one was set.
-            if (ch.watchdawg_source_id) {
-                // Give the async load a moment then set the value
-                setTimeout(() => {
-                    const sel = document.getElementById('epgModalWatchdawgSource');
-                    sel.value = String(ch.watchdawg_source_id);
-                    // Reload genre tags for the selected source
-                    loadWatchdawgGenres(ch.watchdawg_source_id).then(() => {
-                        if (ch.genre_filter) {
-                            document.getElementById('epgModalGenre').value = ch.genre_filter;
-                        }
-                    });
-                }, 800);
-            } else if (ch.genre_filter) {
-                // All Sources selected — set genre after genres load
-                setTimeout(() => {
-                    document.getElementById('epgModalGenre').value = ch.genre_filter;
-                }, 800);
-            }
-        }
-
-        // Session 43: restore private folder picker when editing local_private channel
-        if (ch.source_type === 'local_private' && ch.plex_library_key) {
-            await loadPrivateFolders();
-            document.getElementById('epgModalPrivateFolder').value = ch.plex_library_key;
-        } else if (ch.plex_library_key) {
-            document.getElementById('epgModalPlexLibrary').value = ch.plex_library_key;
-            await loadEpgModalGenres();
-            if (ch.genre_filter) {
-                document.getElementById('epgModalGenre').value = ch.genre_filter;
-            }
-        }
-
-        document.getElementById('epgChannelModal').style.display = 'flex';
-    }
-
-    function closeEpgChannelModal() {
-        document.getElementById('epgChannelModal').style.display = 'none';
-    }
-
-    function onEpgTypeChange() {
-        // When epg type changes, reload the WatchDawg source list if that source type is active
-        const sourceType = document.getElementById('epgModalSourceType').value;
-        if (sourceType === 'watchdawg') {
-            loadWatchdawgSources();
-        }
-    }
-
-    function onEpgSourceTypeChange() {
-        const sourceType = document.getElementById('epgModalSourceType').value;
-        const isPlexType = sourceType === 'plex_movie' || sourceType === 'plex_tv';
-        const isWatchdawg = sourceType === 'watchdawg';
-        const isTv = sourceType === 'plex_tv';
-        const isIptv = sourceType === 'iptv_favorites';
-        const isLocalPrivate = sourceType === 'local_private';  // Session 43
-
-        document.getElementById('epgModalPlexLibraryRow').style.display = isPlexType ? 'block' : 'none';
-        document.getElementById('epgModalWatchdawgSourceRow').style.display = isWatchdawg ? 'block' : 'none';
-        document.getElementById('epgModalPrivateFolderRow').style.display = isLocalPrivate ? 'block' : 'none';
-        document.getElementById('epgModalGenreRow').style.display = (isIptv || isLocalPrivate) ? 'none' : 'block';
-        document.getElementById('epgModalEpBudgetRow').style.display = isTv ? 'block' : 'none';
-        document.getElementById('epgModalRotationRow').style.display = isIptv ? 'none' : 'block';
-
-        if (isWatchdawg) { loadWatchdawgSources(); }
-        if (isLocalPrivate) { loadPrivateFolders(); }
-        if (!isPlexType && !isWatchdawg) {
-            document.getElementById('epgModalGenre').innerHTML = '<option value="">All Genres</option>';
-        }
-    }
-
-    // Session 40: load WatchDawg source channels into the picker dropdown
-    async function loadWatchdawgSources() {
-        const epgType = document.getElementById('epgModalType').value;
-        const sel = document.getElementById('epgModalWatchdawgSource');
-        sel.innerHTML = '<option value="">Loading sources...</option>';
-        try {
-            const res = await fetch(`/epg/watchdawg-sources?epg_type=${epgType}`);
-            const data = await res.json();
-            const sources = data.sources || [];
-            if (sources.length === 0) {
-                sel.innerHTML = '<option value="">No sources with resolved videos found</option>';
-            } else {
-                sel.innerHTML = '<option value="">All Sources</option>' +
-                    sources.map(s =>
-                        `<option value="${s.id}">${s.name} (${s.video_count} videos${s.genre_tags ? ' · ' + s.genre_tags : ''})</option>`
-                    ).join('');
-            }
-        } catch(e) {
-            sel.innerHTML = '<option value="">All Sources</option>';
-        }
-        // After loading sources, load genres for the "All Sources" selection
-        await loadWatchdawgGenres(null);
-    }
-
-    // Session 40: called when the user changes the WatchDawg source picker
-    async function onWatchdawgSourceChange() {
-        const sourceId = document.getElementById('epgModalWatchdawgSource').value;
-        await loadWatchdawgGenres(sourceId || null);
-    }
-
-    // Session 40: populate genre dropdown from WatchDawg channel genre_tags
-    async function loadWatchdawgGenres(sourceId) {
-        const epgType = document.getElementById('epgModalType').value;
-        const genreSel = document.getElementById('epgModalGenre');
-        let url = `/epg/watchdawg-genres?epg_type=${epgType}`;
-        if (sourceId) url += `&source_id=${sourceId}`;
-        try {
-            const res = await fetch(url);
-            const data = await res.json();
-            const genres = data.genres || [];
-            if (genres.length === 0) {
-                genreSel.innerHTML = '<option value="">All Genres (no tags found)</option>';
-            } else {
-                genreSel.innerHTML = '<option value="">All Genres</option>' +
-                    genres.map(g => `<option value="${g}">${g}</option>`).join('');
-            }
-        } catch(e) {
-            genreSel.innerHTML = '<option value="">All Genres</option>';
-        }
-    }
-
-    // Session 43: load /watchdawg/Private subfolders into the folder picker dropdown
-    async function loadPrivateFolders() {
-        const sel = document.getElementById('epgModalPrivateFolder');
-        sel.innerHTML = '<option value="">Loading folders...</option>';
-        try {
-            const res = await fetch('/epg/private-folders');
-            const data = await res.json();
-            const folders = data.folders || [];
-            if (folders.length === 0) {
-                sel.innerHTML = '<option value="">No folders found in /watchdawg/Private/</option>';
-            } else {
-                sel.innerHTML = '<option value="">Select folder...</option>' +
-                    folders.map(f => `<option value="${f.path}">${f.name} (${f.file_count} files)</option>`).join('');
-            }
-        } catch(e) {
-            sel.innerHTML = '<option value="">Error loading folders</option>';
-        }
-    }
-
-    async function populatePlexLibraryDropdown() {
-        if (epgPlexLibraries.length === 0) {
-            try {
-                const res = await fetch('/plex/libraries');
-                const data = await res.json();
-                if (data.libraries) epgPlexLibraries = data.libraries;
-            } catch(e) {}
-        }
-        const sel = document.getElementById('epgModalPlexLibrary');
-        sel.innerHTML = '<option value="">Select library...</option>' +
-            epgPlexLibraries.map(lib =>
-                `<option value="${lib.key}">${lib.is_adult ? '\u{1F512} ' : ''}${lib.title} (${lib.type})</option>`
-            ).join('');
-    }
-
-    async function loadEpgModalGenres() {
-        const libraryKey = document.getElementById('epgModalPlexLibrary').value;
-        const genreSel = document.getElementById('epgModalGenre');
-        if (!libraryKey) { genreSel.innerHTML = '<option value="">All Genres</option>'; return; }
-        try {
-            const res = await fetch(`/plex/libraries/${libraryKey}/genres`);
-            const data = await res.json();
-            genreSel.innerHTML = '<option value="">All Genres</option>' +
-                (data.genres || []).map(g =>
-                    `<option value="${g.id}" data-title="${escapeHtml(g.title)}">${escapeHtml(g.title)} (${g.count})</option>`
-                ).join('');
-        } catch(e) {
-            genreSel.innerHTML = '<option value="">All Genres</option>';
-        }
-    }
-
-    async function saveEpgChannel() {
-        const channelId = document.getElementById('epgModalChannelId').value;
-        const isEdit = !!channelId;
-
-        const watchdawgSourceRaw = document.getElementById('epgModalWatchdawgSource').value;
-
-        const sourceType = document.getElementById('epgModalSourceType').value;
-        const isLocalPrivate = sourceType === 'local_private';
-
-        const payload = {
-            channel_number: parseInt(document.getElementById('epgModalNumber').value),
-            name: document.getElementById('epgModalName').value.trim(),
-            epg_type: document.getElementById('epgModalType').value,
-            source_type: sourceType,
-            plex_library_key: isLocalPrivate ? null : (document.getElementById('epgModalPlexLibrary').value || null),
-            genre_filter: document.getElementById('epgModalGenre').value || null,
-            episodes_per_day: parseInt(document.getElementById('epgModalEpBudget').value) || 2,
-            rotation_style: document.getElementById('epgModalRotation').value,
-            primetime_boost: document.getElementById('epgModalPrimetime').checked,
-            logo_url: document.getElementById('epgModalLogo').value.trim() || null,
-            enabled: true,
-            watchdawg_source_id: watchdawgSourceRaw ? parseInt(watchdawgSourceRaw) : null,
-            // Session 43: local_private folder path
-            local_folder_path: isLocalPrivate ? (document.getElementById('epgModalPrivateFolder').value || null) : null,
-        };
-
-        if (!payload.name) { alert('Channel name is required.'); return; }
-        if (!payload.channel_number) { alert('Channel number is required.'); return; }
-
-        try {
-            const url = isEdit ? `/epg/channels/${channelId}` : '/epg/channels';
-            const method = isEdit ? 'PATCH' : 'POST';
-            const res = await fetch(url, {
-                method, headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify(payload)
-            });
-            const data = await res.json();
-            if (!res.ok) { alert('Error: ' + (data.detail || res.statusText)); return; }
-
-            if (typeof logMessage === 'function') logMessage('EPG channel ' + (isEdit ? 'updated' : 'created') + ': CH ' + payload.channel_number + ' ' + payload.name, 'success');
-            closeEpgChannelModal();
-            loadEpgChannels(payload.epg_type);
-        } catch(e) { alert('Error: ' + e.message); }
-    }
-
-    // -----------------------------------------------------------------------
-    // Channel actions
-    // -----------------------------------------------------------------------
-    async function toggleEpgChannel(channelId, currentlyEnabled) {
-        await fetch(`/epg/channels/${channelId}/toggle`, { method: 'PATCH' });
-        if (typeof logMessage === 'function') logMessage('EPG channel ' + (currentlyEnabled ? 'paused' : 'enabled') + '.', 'info');
-        loadEpgChannels(epgCurrentTab);
-    }
-
-    async function deleteEpgChannel(channelId) {
-        const ch = epgChannels.find(c => c.id === channelId);
-        const name = ch ? ch.name : ('Channel ' + channelId);
-        if (!confirm(`Delete EPG channel "${name}"? This also deletes its schedule. Use the pause button to temporarily disable instead.`)) return;
-        const res = await fetch(`/epg/channels/${channelId}`, { method: 'DELETE' });
-        if (res.ok) {
-            log('EPG channel deleted: ' + name, 'success');
-        } else {
-            const err = await res.json().catch(() => ({}));
-            alert('Delete failed: ' + (err.detail || res.status));
-        }
-        loadEpgChannels(epgCurrentTab);
-    }
-
-    async function previewEpgChannel(channelId) {
-        const ch = epgChannels.find(c => c.id === channelId);
-        const name = ch ? `CH ${ch.channel_number} — ${ch.name}` : `Channel ${channelId}`;
-        try {
-            const res = await fetch(`/epg/channels/${channelId}/preview`);
-            const data = await res.json();
-            if (!data.upcoming || data.upcoming.length === 0) {
-                alert(`${name}
-
-No schedule generated yet.
-
-Click "Rebuild Schedules" to generate.`);
-                return;
-            }
-            const lines = data.upcoming.map((s, i) =>
-                `${i+1}. ${s.title}${s.subtitle ? ' — ' + s.subtitle : ''} (${Math.round(s.duration_seconds/60)} min)`
-            ).join('\n');
-            alert(name + '\n\nNext up:\n' + lines);
-        } catch(e) { alert('Error fetching preview: ' + e.message); }
-    }
-
-    async function rebuildEpgSchedules() {
-        const epgType = epgCurrentTab;
-        try {
-            const res = await fetch(`/epg/schedule/rebuild?epg_type=${epgType}`, { method: 'POST' });
-            const data = await res.json();
-            if (typeof logMessage === 'function') logMessage('EPG schedule rebuild queued: ' + (data.channels_queued || 0) + ' channels.', 'success');
-        } catch(e) { alert('Error: ' + e.message); }
-    }
-
-    // -----------------------------------------------------------------------
-    // Hook into existing switchPage function
-    // Uses DOMContentLoaded to ensure the original switchPage exists first
-    // -----------------------------------------------------------------------
-    document.addEventListener('DOMContentLoaded', function() {
-        const _origSwitchPage = window.switchPage;
-        window.switchPage = function(page, btn) {
-            if (typeof _origSwitchPage === 'function') _origSwitchPage(page, btn);
-            if (page === 'epg') setTimeout(loadEpgPage, 80);
-        };
-        // If EPG is already the active page on load, trigger it
-        if (document.getElementById('page-epg') && 
-            document.getElementById('page-epg').classList.contains('active')) {
-            setTimeout(loadEpgPage, 100);
-        }
-    });
-    </script>
-
-    <!-- ================================================================
-         Add to EPG Quick Modal — Session 40
-         Triggered from channel card "📺 EPG" / "🔒 Adult EPG" buttons.
-         Unlocked channels → Main EPG. Locked channels → Adult EPG (PIN gated).
-         ================================================================ -->
-    <div class="epg-quick-modal-overlay" id="epgQuickModalOverlay" onclick="if(event.target===this)closeEpgQuickModal()">
-        <div class="epg-quick-modal">
-            <h4 id="epgQmTitle">📺 Add to EPG</h4>
-            <div class="epg-qm-meta" id="epgQmMeta"></div>
-
-            <input type="hidden" id="epgQmChannelId">
-            <input type="hidden" id="epgQmEpgType">
-            <input type="hidden" id="epgQmGenreTags">
-
-            <div>
-                <label>Channel Number</label>
-                <input type="number" id="epgQmNumber" min="1" max="9999" placeholder="101">
-            </div>
-
-            <div>
-                <label>Rotation Style</label>
-                <select id="epgQmRotation">
-                    <option value="shuffle">Shuffle — random order, reshuffled each loop</option>
-                    <option value="sequential">Sequential — plays in order, loops at end</option>
-                </select>
-            </div>
-
-            <div class="epg-qm-check-row">
-                <input type="checkbox" id="epgQmPrimetime" style="accent-color:var(--accent-orange);width:16px;height:16px;">
-                <div>
-                    <label for="epgQmPrimetime" style="text-transform:none;letter-spacing:0;font-size:13px;cursor:pointer;margin:0;">Primetime Boost (7–11 PM)</label>
-                    <div style="font-size:11px;color:var(--text-muted);">Fills evening slots with highest-rated content.</div>
-                </div>
-            </div>
-
-            <div class="epg-qm-actions">
-                <button class="btn btn-sm" onclick="closeEpgQuickModal()">Cancel</button>
-                <button class="btn btn-primary" onclick="confirmAddToEpg()">Add to EPG</button>
-            </div>
-        </div>
-    </div>
-
-    <script>
-    // ================================================================
-    // Add to EPG — Quick Modal JS (Session 40)
-    // ================================================================
-
-    // Wrapper called from channel card button — reads channel info from data
-    // attributes so apostrophes and special chars in names never break JS syntax.
-    function openEpgQuickModalFromBtn(btn) {
-        const channelId  = parseInt(btn.dataset.chid);
-        const channelName = btn.dataset.chname || '';
-        const genreTags  = btn.dataset.genres || '';
-        const locked     = btn.dataset.locked === 'true';
-        openEpgQuickModal(channelId, channelName, genreTags, locked);
-    }
-
-    // Open the mini-modal for a specific channel card.
-    // locked=true  → Adult EPG (orange header, CH# starts at 901)
-    // locked=false → Main EPG  (blue header, CH# starts at 101)
-    async function openEpgQuickModal(channelId, channelName, genreTags, locked) {
-        // Adult EPG requires PIN to be unlocked
-        if (locked && !_isUnlocked) {
-            alert('Unlock with your PIN first to add content to the Adult EPG.');
-            return;
-        }
-
-        const epgType = locked ? 'adult' : 'main';
-        const icon    = locked ? '🔒' : '📺';
-
-        document.getElementById('epgQmChannelId').value  = channelId;
-        document.getElementById('epgQmEpgType').value    = epgType;
-        document.getElementById('epgQmGenreTags').value  = genreTags || '';
-        document.getElementById('epgQmTitle').textContent = `${icon} Add to ${locked ? 'Adult ' : ''}EPG`;
-        document.getElementById('epgQmMeta').textContent  = channelName + (genreTags ? '  ·  ' + genreTags : '');
-        document.getElementById('epgQmPrimetime').checked = false;
-        document.getElementById('epgQmRotation').value    = 'shuffle';
-
-        // Auto-suggest next available channel number for this EPG type
-        try {
-            const res  = await fetch(`/epg/next-channel-number?epg_type=${epgType}`);
-            const data = await res.json();
-            document.getElementById('epgQmNumber').value = data.next_channel_number;
-        } catch(e) {
-            document.getElementById('epgQmNumber').value = locked ? 901 : 101;
-        }
-
-        document.getElementById('epgQuickModalOverlay').classList.add('active');
-    }
-
-    function closeEpgQuickModal() {
-        document.getElementById('epgQuickModalOverlay').classList.remove('active');
-    }
-
-    async function confirmAddToEpg() {
-        const channelId  = parseInt(document.getElementById('epgQmChannelId').value);
-        const epgType    = document.getElementById('epgQmEpgType').value;
-        const genreTags  = document.getElementById('epgQmGenreTags').value.trim();
-        const chNumber   = parseInt(document.getElementById('epgQmNumber').value);
-        const rotation   = document.getElementById('epgQmRotation').value;
-        const primetime  = document.getElementById('epgQmPrimetime').checked;
-
-        if (!chNumber || chNumber < 1) { alert('Enter a valid channel number.'); return; }
-
-        // Derive a display name from the channel card — stored in epgQmMeta
-        // Format: "Channel Name  ·  genre tags"  — take the part before the ·
-        const meta = document.getElementById('epgQmMeta').textContent;
-        const channelName = meta.split('·')[0].trim() || 'EPG Channel';
-
-        const payload = {
-            channel_number:      chNumber,
-            name:                channelName,
-            epg_type:            epgType,
-            source_type:         'watchdawg',
-            watchdawg_source_id: channelId,
-            genre_filter:        genreTags || null,
-            rotation_style:      rotation,
-            primetime_boost:     primetime,
-            episodes_per_day:    2,
-            enabled:             true,
-            logo_url:            null,
-            plex_library_key:    null,
-        };
-
-        try {
-            const res  = await fetch('/epg/channels', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload),
-            });
-            const data = await res.json();
-            if (!res.ok) { alert('Error: ' + (data.detail || res.statusText)); return; }
-
-            if (typeof logMessage === 'function') {
-                logMessage(`CH ${chNumber} "${channelName}" added to ${epgType === 'adult' ? 'Adult ' : ''}EPG — schedule building in background.`, 'success');
-            }
-            closeEpgQuickModal();
-
-            // If the EPG page is currently visible, refresh it
-            if (document.getElementById('page-epg') &&
-                document.getElementById('page-epg').classList.contains('active')) {
-                if (typeof loadEpgChannels === 'function') loadEpgChannels(epgType);
-            }
-        } catch(e) { alert('Error: ' + e.message); }
-    }
-    </script>
 </body>
 </html>

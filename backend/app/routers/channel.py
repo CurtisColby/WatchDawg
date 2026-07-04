@@ -186,6 +186,43 @@ def detect_channel_type(url: str) -> dict:
             "unique_key": f"youtube_channel:{channel_path.lower()}",
         }
 
+    # --- Local folder (absolute path inside container or bare subfolder name) ---
+    # Accepts:
+    #   /watchdawg/Private/FolderName
+    #   /watchdawg/Public/FolderName
+    #   Private/FolderName
+    #   FolderName  (resolved under /watchdawg/)
+    # The path is normalised to an absolute path under /watchdawg/ at add time.
+    stripped = url.strip().rstrip("/")
+    if stripped.startswith("/watchdawg/") or (
+        not stripped.startswith("http") and "/" not in stripped and not stripped.startswith("r/")
+    ):
+        # Normalise to absolute path under /watchdawg/
+        from app.config import settings as _cfg
+        if stripped.startswith("/watchdawg/"):
+            abs_path = stripped
+        else:
+            # Bare subfolder name — check Private first, then Public, then root
+            private_candidate = f"{_cfg.private_downloads_path}/{stripped}"
+            public_candidate = f"{_cfg.public_downloads_path}/{stripped}"
+            root_candidate = f"{_cfg.downloads_path}/{stripped}"
+            import os as _os
+            if _os.path.isdir(private_candidate):
+                abs_path = private_candidate
+            elif _os.path.isdir(public_candidate):
+                abs_path = public_candidate
+            elif _os.path.isdir(root_candidate):
+                abs_path = root_candidate
+            else:
+                abs_path = private_candidate  # Default to Private for new paths
+        folder_name = abs_path.rstrip("/").split("/")[-1]
+        return {
+            "channel_type": "local_folder",
+            "url": abs_path,
+            "name": folder_name,
+            "unique_key": f"local_folder:{abs_path.lower()}",
+        }
+
     # --- Generic URL fallback ---
     parsed = urlparse(url)
     if parsed.scheme in ("http", "https") and parsed.netloc:
@@ -237,8 +274,196 @@ def get_provider_for_channel(channel: Channel):
             channel_id=channel.id,
         )
 
+    elif channel.channel_type == "local_folder":
+        return LocalFolderProvider(
+            folder_path=channel.url,
+            channel_name=channel.name,
+            channel_id=channel.id,
+        )
+
     else:
         raise ValueError(f"Unknown channel type: {channel.channel_type}")
+
+
+# ---------------------------------------------------------------------------
+# Local Folder Provider — Session 45
+#
+# Walks a mounted local directory and treats every video file as a discovered
+# video. Files are inserted with resolution_status="resolved" and
+# source_url=<absolute_file_path> so the resolver never tries to run yt-dlp.
+# The stream endpoint serves them via /library/stream/.
+#
+# Supported extensions: .mp4, .mkv, .webm, .m4v, .avi, .mov
+# ---------------------------------------------------------------------------
+
+_LOCAL_VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".m4v", ".avi", ".mov"}
+
+
+class LocalFolderProvider:
+    """
+    Provider that scans a local directory for video files.
+
+    Each file becomes a Video record with:
+    - source_provider = "local_folder"
+    - source_post_id  = relative path from /watchdawg/ (dedup key)
+    - source_url      = absolute path to the file (used for streaming)
+    - resolution_status pre-set to "resolved" (no yt-dlp needed)
+    - resolved_stream_url = /library/stream/<relative_path>
+
+    The scraper's _insert_video() sets resolution_status="pending" by default,
+    so we bypass the scraper for local files and insert directly in fetch_posts()
+    with resolved status.
+    """
+
+    provider_name = "local_folder"
+
+    def __init__(self, folder_path: str, channel_name: str, channel_id: int):
+        self.folder_path = folder_path.rstrip("/")
+        self.channel_name = channel_name
+        self.channel_id = channel_id
+
+    async def fetch_posts(self, limit: int = 5000):
+        """
+        Walk the folder and return one DiscoveredVideo per video file.
+        Sorted alphabetically. Capped at limit.
+        """
+        from app.providers.base import DiscoveredVideo
+        import os
+
+        discovered = []
+        if not os.path.isdir(self.folder_path):
+            logger.warning(
+                f"LocalFolderProvider: folder not found: {self.folder_path}"
+            )
+            return discovered
+
+        try:
+            entries = sorted(os.scandir(self.folder_path), key=lambda e: e.name.lower())
+        except OSError as e:
+            logger.error(f"LocalFolderProvider: cannot scan {self.folder_path}: {e}")
+            return discovered
+
+        from app.config import settings as _cfg
+        watchdawg_root = _cfg.downloads_path.rstrip("/")
+
+        for entry in entries:
+            if not entry.is_file():
+                continue
+            _, ext = os.path.splitext(entry.name)
+            if ext.lower() not in _LOCAL_VIDEO_EXTS:
+                continue
+
+            abs_path = entry.path
+            # Relative path from /watchdawg/ root — used as stream path and dedup key
+            if abs_path.startswith(watchdawg_root + "/"):
+                rel_path = abs_path[len(watchdawg_root) + 1:]
+            else:
+                rel_path = abs_path
+
+            title = os.path.splitext(entry.name)[0]
+            # Build the stream URL — served by /library/stream/
+            base_url = "http://192.168.50.42:6868"
+            import urllib.parse
+            stream_url = f"{base_url}/library/stream/{urllib.parse.quote(rel_path, safe='/')}"
+
+            dv = DiscoveredVideo(
+                source_provider="local_folder",
+                source_post_id=rel_path,       # unique per file
+                source_url=abs_path,           # absolute path for direct access
+                title=title,
+                artist=None,
+                thumbnail_url=None,
+                duration_seconds=None,
+                score=0,
+            )
+            # Attach extra fields for local files — used by _insert_local_video
+            dv._resolved_stream_url = stream_url
+            dv._abs_path = abs_path
+            discovered.append(dv)
+
+            if len(discovered) >= limit:
+                break
+
+        logger.info(
+            f"LocalFolderProvider: found {len(discovered)} video files in {self.folder_path}"
+        )
+        return discovered
+
+    async def close(self):
+        pass
+
+
+# --- Local folder scrape helper ---
+
+async def _scrape_local_folder_channel(
+    channel: "Channel",
+    db: AsyncSession,
+    limit: int = 5000,
+) -> dict:
+    """
+    Scrape a local_folder channel by scanning its directory and upserting
+    Video records directly — bypassing the normal scraper pipeline since
+    local files are already resolved and need no yt-dlp processing.
+
+    Returns a dict matching ScrapeResult.to_dict() format.
+    """
+    from app.models import Video
+    from sqlalchemy import select as _select
+
+    provider = LocalFolderProvider(
+        folder_path=channel.url,
+        channel_name=channel.name,
+        channel_id=channel.id,
+    )
+    discovered = await provider.fetch_posts(limit=limit)
+
+    # Get existing source_post_ids for this channel to avoid duplicates
+    existing_stmt = _select(Video.source_post_id).where(
+        Video.channel_id == channel.id,
+        Video.source_provider == "local_folder",
+    )
+    existing_result = await db.execute(existing_stmt)
+    existing_ids = {row[0] for row in existing_result.fetchall()}
+
+    new_count = 0
+    dupe_count = 0
+
+    for dv in discovered:
+        if dv.source_post_id in existing_ids:
+            dupe_count += 1
+            continue
+
+        db_video = Video(
+            source_provider="local_folder",
+            source_post_id=dv.source_post_id,
+            source_url=dv.source_url,
+            title=dv.title,
+            artist=dv.artist,
+            thumbnail_url=dv.thumbnail_url,
+            duration_seconds=dv.duration_seconds,
+            reddit_score=0,
+            resolution_status="resolved",
+            resolved_stream_url=dv._resolved_stream_url,
+            channel_id=channel.id,
+        )
+        db.add(db_video)
+        existing_ids.add(dv.source_post_id)
+        new_count += 1
+
+    await db.commit()
+
+    logger.info(
+        f"Local folder scan '{channel.name}': {new_count} new, {dupe_count} already known"
+    )
+    return {
+        "discovered": len(discovered),
+        "new": new_count,
+        "duplicates": dupe_count,
+        "skipped": 0,
+        "errors": 0,
+        "downloaded": 0,
+        "download_skipped": 0,
+    }
 
 
 # --- Genre tag normaliser ---
@@ -620,6 +845,22 @@ async def scrape_channel(
     if not channel.enabled:
         raise HTTPException(status_code=400, detail="Channel is disabled")
 
+    # Local folder channels bypass the normal scraper — files are already resolved
+    if channel.channel_type == "local_folder":
+        result_dict = await _scrape_local_folder_channel(channel, db)
+        channel.last_scraped_at = datetime.datetime.utcnow()
+        channel.last_scrape_count = result_dict["new"]
+        await db.commit()
+        logger.info(
+            f"Local folder scan '{channel.name}': {result_dict['new']} new files"
+        )
+        return {
+            "status": "complete",
+            "channel": channel.name,
+            "channel_type": channel.channel_type,
+            "result": result_dict,
+        }
+
     try:
         provider = get_provider_for_channel(channel)
     except ValueError as e:
@@ -943,6 +1184,59 @@ async def _run_mass_download(
 
 
 # ---------------------------------------------------------------------------
+# Local Folder Endpoints — Session 45
+# ---------------------------------------------------------------------------
+
+@router.get("/local-folders")
+async def list_local_folders():
+    """
+    List available subfolders under /watchdawg/ that contain video files.
+    Used by the web UI Add Local Folder form to populate the folder picker.
+
+    Returns folders from:
+    - /watchdawg/Private/  (locked content)
+    - /watchdawg/Public/   (unlocked content)
+    - /watchdawg/          (root level subfolders)
+    """
+    import os
+    from app.config import settings as _cfg
+
+    folders = []
+    roots_to_scan = [
+        (_cfg.private_downloads_path, "Private"),
+        (_cfg.public_downloads_path, "Public"),
+    ]
+
+    for root_path, label in roots_to_scan:
+        if not os.path.isdir(root_path):
+            continue
+        try:
+            for entry in sorted(os.scandir(root_path), key=lambda e: e.name.lower()):
+                if not entry.is_dir():
+                    continue
+                abs_path = entry.path
+                # Count video files in the folder
+                try:
+                    file_count = sum(
+                        1 for f in os.scandir(abs_path)
+                        if f.is_file() and os.path.splitext(f.name)[1].lower()
+                        in _LOCAL_VIDEO_EXTS
+                    )
+                except OSError:
+                    file_count = 0
+                folders.append({
+                    "name": entry.name,
+                    "path": abs_path,
+                    "label": f"{label}/{entry.name}",
+                    "file_count": file_count,
+                })
+        except OSError:
+            continue
+
+    return {"folders": folders}
+
+
+# ---------------------------------------------------------------------------
 # Live M3U Export — Session 45
 #
 # Every entry points to /channel/stream/{video_id} — resolved on demand at
@@ -1064,6 +1358,19 @@ async def stream_video_redirect(
     if video.resolution_status == "failed":
         logger.warning(f"STREAM REDIRECT | video {video_id} permanently failed — 404")
         raise HTTPException(status_code=404, detail=f"Video {video_id} is permanently unavailable")
+
+    # Local folder files: serve directly via /library/stream/ — no yt-dlp needed
+    if video.source_provider == "local_folder":
+        if video.resolved_stream_url:
+            logger.info(
+                f"STREAM REDIRECT | video {video_id} — local file → {video.resolved_stream_url[:80]}"
+            )
+            from fastapi.responses import RedirectResponse
+            return RedirectResponse(url=video.resolved_stream_url, status_code=302)
+        raise HTTPException(
+            status_code=404,
+            detail=f"Local file not found for video {video_id}"
+        )
 
     logger.info(f"STREAM REDIRECT | video {video_id} | title={(video.title or '')[:60]}")
 

@@ -62,10 +62,6 @@ import com.watchdawg.tv.ui.home.HomeViewModel
 import com.watchdawg.tv.ui.library.FavoritesViewModel
 import com.watchdawg.tv.ui.library.LibraryScreen
 import com.watchdawg.tv.ui.library.LibraryViewModel
-import com.watchdawg.tv.ui.epg.AdultEpgScreen
-import com.watchdawg.tv.ui.epg.AdultEpgViewModel
-import com.watchdawg.tv.ui.epg.EpgScreen
-import com.watchdawg.tv.ui.epg.EpgViewModel
 import com.watchdawg.tv.ui.livetv.LiveTvScreen
 import com.watchdawg.tv.ui.livetv.LiveTvViewModel
 import com.watchdawg.tv.ui.movies.MovieDetailScreen
@@ -157,10 +153,6 @@ private fun WatchDawgRoot(onFinish: () -> Unit) {
     val adultViewModel:   AdultViewModel   = viewModel(factory = factory)
     // Milestone I — Live TV: hoisted so channel list survives Back → re-enter
     val liveTvViewModel:  LiveTvViewModel  = viewModel(factory = factory)
-    // Session 39 — EPG: hoisted so channel index survives player → back → surf
-    val epgViewModel:     EpgViewModel     = viewModel(factory = factory)
-    // Session 43 — Adult EPG: hoisted separately so adult channel index is independent of main EPG
-    val adultEpgViewModel: AdultEpgViewModel = viewModel(factory = factory)
 
     var showPinPad     by remember { mutableStateOf(false) }
     var showExitDialog by remember { mutableStateOf(false) }
@@ -429,98 +421,6 @@ private fun WatchDawgRoot(onFinish: () -> Unit) {
                 )
             }
 
-            // ── EPG ──────────────────────────────────────────────────────────
-            composable(Routes.EPG) {
-                EpgScreen(
-                    viewModel = epgViewModel,
-                    onPlaySlot = { slot, channelId, offsetSeconds ->
-                        // Session 42 fix: route based on slot type.
-                        //
-                        // WatchDawg slots have videoId set and streamUrl blank —
-                        // the old URL queue approach dropped these from allUrls
-                        // (takeIf { isNotBlank } filtered them out) causing index
-                        // fallback to 0 which played whichever channel happened to
-                        // be first in the URL list regardless of what was tapped.
-                        //
-                        // Fix: check videoId first. If set, route through onPlayById
-                        // exactly as EpgScreen's internal handler does. Otherwise
-                        // play direct URL as a single-item queue (no cross-channel
-                        // queue needed — surfing handles adjacent channels itself).
-                        if (slot.videoId != null) {
-                            epgViewModel.setActiveChannel(channelId)
-                            com.watchdawg.tv.data.prefs.QueueHolder.epgSlotStartTimeUtc = slot.startTime
-                            QueueHolder.setIdQueue(listOf(slot.videoId), 0, hls = true)
-                            QueueHolder.resumePositionMs = offsetSeconds * 1000L
-                            QueueHolder.epgChannelNumber = slot.channelNumber
-                            QueueHolder.epgChannelName   = slot.channelName
-                            QueueHolder.epgSlotTitle     = slot.title
-                            navController.navigate(Routes.player(slot.videoId, 0))
-                        } else {
-                            epgViewModel.setActiveChannel(channelId)
-                            val tappedUrl = slot.streamUrl ?: ""
-                            if (tappedUrl.isBlank()) return@EpgScreen
-                            QueueHolder.setUrlQueue(listOf(tappedUrl), 0, isEpg = true, resumeMs = offsetSeconds * 1000L)
-                            QueueHolder.epgChannelNumber = slot.channelNumber
-                            QueueHolder.epgChannelName   = slot.channelName
-                            QueueHolder.epgSlotTitle     = slot.title
-                            navController.navigate(Routes.playerDirectQueue(0))
-                        }
-                    },
-                    onPlayById = { videoId, hlsMode, offsetSeconds ->
-                        // Session 40: WatchDawg EPG slots routed here from EpgScreen
-                        // internal handler (slot.videoId != null path).
-                        // Session 42: this path is now also used by onPlaySlot above
-                        // for direct taps so both paths are consistent.
-                        epgViewModel.setActiveChannel(videoId)
-                        QueueHolder.setIdQueue(listOf(videoId), 0, hls = hlsMode)
-                        QueueHolder.resumePositionMs = offsetSeconds * 1000L
-                        navController.navigate(Routes.player(videoId, 0))
-                    },
-                    onBack = { navController.popBackStack() },
-                )
-            }
-
-            // ── Adult EPG — Session 43 (Milestone A-1) ───────────────────────
-            // PIN gate is enforced inside AdultEpgScreen via PinPadOverlay.
-            // Navigation here is only possible from the Home Screen Adult EPG card,
-            // which is structurally absent when the PIN is locked (same as Adult card).
-            composable(Routes.ADULT_EPG) {
-                AdultEpgScreen(
-                    viewModel    = adultEpgViewModel,
-                    pinViewModel = pinViewModel,
-                    onPlaySlot   = { slot, channelId, offsetSeconds ->
-                        // Same routing logic as main EPG — slot type determines path.
-                        if (slot.videoId != null) {
-                            adultEpgViewModel.setActiveChannel(channelId)
-                            QueueHolder.epgSlotStartTimeUtc = slot.startTime
-                            QueueHolder.setIdQueue(listOf(slot.videoId), 0, hls = true, locked = true)
-                            QueueHolder.resumePositionMs = offsetSeconds * 1000L
-                            QueueHolder.epgChannelNumber = slot.channelNumber
-                            QueueHolder.epgChannelName   = slot.channelName
-                            QueueHolder.epgSlotTitle     = slot.title
-                            navController.navigate(Routes.player(slot.videoId, 0))
-                        } else {
-                            adultEpgViewModel.setActiveChannel(channelId)
-                            val tappedUrl = slot.streamUrl ?: ""
-                            if (tappedUrl.isBlank()) return@AdultEpgScreen
-                            QueueHolder.setUrlQueue(listOf(tappedUrl), 0, isEpg = true, resumeMs = offsetSeconds * 1000L)
-                            QueueHolder.isAdultEpgQueue  = true
-                            QueueHolder.epgChannelNumber = slot.channelNumber
-                            QueueHolder.epgChannelName   = slot.channelName
-                            QueueHolder.epgSlotTitle     = slot.title
-                            navController.navigate(Routes.playerDirectQueue(0))
-                        }
-                    },
-                    onPlayById   = { videoId, hlsMode, offsetSeconds ->
-                        adultEpgViewModel.setActiveChannel(videoId)
-                        QueueHolder.setIdQueue(listOf(videoId), 0, hls = hlsMode, locked = true)
-                        QueueHolder.resumePositionMs = offsetSeconds * 1000L
-                        navController.navigate(Routes.player(videoId, 0))
-                    },
-                    onBack = { navController.popBackStack() },
-                )
-            }
-
             // ── Settings ──────────────────────────────────────────────────────
             composable(Routes.SETTINGS) {
                 SettingsScreen()
@@ -590,10 +490,6 @@ private fun WatchDawgRoot(onFinish: () -> Unit) {
             ) { entry ->
                 val startIndex = entry.arguments?.getInt("startIndex") ?: 0
                 val urls = QueueHolder.urlQueue
-                val isEpg = QueueHolder.isEpgQueue
-                val isAdultEpg = QueueHolder.isAdultEpgQueue  // Session 43
-                // Session 38: read resume position set by EPG onPlaySlot (offsetSeconds).
-                // For non-EPG direct queues this is always 0L — no change in behaviour.
                 val resumeMs = QueueHolder.resumePositionMs.also { QueueHolder.resumePositionMs = 0L }
                 val vm: PlayerViewModel = viewModel(factory = factory)
                 PlayerScreen(
@@ -607,65 +503,6 @@ private fun WatchDawgRoot(onFinish: () -> Unit) {
                         Graph.playerManager(context).pause()
                         navController.popBackStack()
                     },
-                    // Session 38 — EPG channel surfing:
-                    // Session 42 fix: surf lambdas now route each slot individually
-                    // based on slot type (streamUrl vs videoId) instead of building
-                    // a URL queue across all channels. The old URL queue approach
-                    // silently dropped watchdawg slots (streamUrl is blank for those)
-                    // causing index fallback to 0 which played the wrong channel.
-                    // Session 43: dispatch to adultEpgViewModel when isAdultEpg is set.
-                    onSurfNext = if (isEpg) ({
-                        val slot = if (isAdultEpg) adultEpgViewModel.getAdjacentSlot(+1)
-                                   else            epgViewModel.getAdjacentSlot(+1)
-                        val popTarget = if (isAdultEpg) Routes.ADULT_EPG else Routes.EPG
-                        if (slot != null) {
-                            QueueHolder.epgChannelNumber = slot.channelNumber
-                            QueueHolder.epgChannelName   = slot.channelName
-                            QueueHolder.epgSlotTitle     = slot.title
-                            if (slot.videoId != null) {
-                                // WatchDawg slot — resolve fresh
-                                QueueHolder.epgSlotStartTimeUtc = slot.startTime
-                                QueueHolder.setIdQueue(listOf(slot.videoId), 0, hls = true, locked = isAdultEpg)
-                                QueueHolder.resumePositionMs = (slot.progressSeconds ?: 0).toLong() * 1000L
-                                navController.navigate(Routes.player(slot.videoId, 0)) {
-                                    popUpTo(popTarget) { inclusive = false }
-                                }
-                            } else if (!slot.streamUrl.isNullOrBlank()) {
-                                // Plex / IPTV / local_private slot — play direct URL
-                                QueueHolder.setUrlQueue(listOf(slot.streamUrl), 0, isEpg = true)
-                                if (isAdultEpg) QueueHolder.isAdultEpgQueue = true
-                                navController.navigate(Routes.playerDirectQueue(0)) {
-                                    popUpTo(popTarget) { inclusive = false }
-                                }
-                            }
-                        }
-                    }) else null,
-                    onSurfPrev = if (isEpg) ({
-                        val slot = if (isAdultEpg) adultEpgViewModel.getAdjacentSlot(-1)
-                                   else            epgViewModel.getAdjacentSlot(-1)
-                        val popTarget = if (isAdultEpg) Routes.ADULT_EPG else Routes.EPG
-                        if (slot != null) {
-                            QueueHolder.epgChannelNumber = slot.channelNumber
-                            QueueHolder.epgChannelName   = slot.channelName
-                            QueueHolder.epgSlotTitle     = slot.title
-                            if (slot.videoId != null) {
-                                // WatchDawg slot — resolve fresh
-                                QueueHolder.epgSlotStartTimeUtc = slot.startTime
-                                QueueHolder.setIdQueue(listOf(slot.videoId), 0, hls = true, locked = isAdultEpg)
-                                QueueHolder.resumePositionMs = (slot.progressSeconds ?: 0).toLong() * 1000L
-                                navController.navigate(Routes.player(slot.videoId, 0)) {
-                                    popUpTo(popTarget) { inclusive = false }
-                                }
-                            } else if (!slot.streamUrl.isNullOrBlank()) {
-                                // Plex / IPTV / local_private slot — play direct URL
-                                QueueHolder.setUrlQueue(listOf(slot.streamUrl), 0, isEpg = true)
-                                if (isAdultEpg) QueueHolder.isAdultEpgQueue = true
-                                navController.navigate(Routes.playerDirectQueue(0)) {
-                                    popUpTo(popTarget) { inclusive = false }
-                                }
-                            }
-                        }
-                    }) else null,
                 )
             }
         }
