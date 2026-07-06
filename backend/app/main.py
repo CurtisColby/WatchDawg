@@ -323,7 +323,6 @@ from app.routers.watchlist import router as watchlist_router    # noqa: E402
 from app.routers.history import router as history_router        # noqa: E402
 from app.routers.live_tv import router as live_tv_router        # noqa: E402
 from app.routers.plex import router as plex_router              # noqa: E402
-from app.routers.xtream import router as xtream_router          # noqa: E402
 from app.routers.web_ui import router as web_ui_router          # noqa: E402
 
 app.include_router(health_router)
@@ -339,7 +338,6 @@ app.include_router(watchlist_router)
 app.include_router(history_router)
 app.include_router(live_tv_router)
 app.include_router(plex_router)
-app.include_router(xtream_router)
 
 # Web UI must be registered LAST so its "/" route doesn't shadow the API
 app.include_router(web_ui_router)

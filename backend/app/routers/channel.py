@@ -48,6 +48,11 @@ router = APIRouter(prefix="/channel", tags=["channel"])
 # {channel_id: {"task": Task, "total": int, "completed": int, "skipped": int, "failed": int, "dir": str}}
 _active_downloads: dict = {}
 
+# Session 50 — last completed mass-download run per channel.
+# Lets the web UI show "Last run: X downloaded, Y skipped, Z failed" plus the
+# per-item results after the active entry has been cleaned up.
+_last_download_results: dict = {}
+
 
 # --- Request/Response Models ---
 
@@ -951,6 +956,12 @@ async def get_download_status(
         "skipped":       active["skipped"]   if active else 0,
         "failed":        active["failed"]    if active else 0,
         "total":         active["total"]     if active else 0,
+        # Session 50 — live per-item reporting for the web UI downloader view
+        "current_title":    active.get("current_title") if active else None,
+        "current_video_id": active.get("current_video_id") if active else None,
+        "quality":          active.get("quality") if active else None,
+        "recent":           active.get("recent", []) if active else [],
+        "last_run":         _last_download_results.get(channel_id),
     }
 
 
@@ -1055,6 +1066,11 @@ async def mass_download_channel(
         "skipped":   0,
         "failed":    0,
         "dir":       download_dir,
+        # Session 50 — live per-item reporting for the web UI downloader view
+        "current_title":    None,
+        "current_video_id": None,
+        "recent":           [],   # last N items: {video_id, title, status, size_mb}
+        "quality":          quality,
     }
 
     return {
@@ -1101,6 +1117,28 @@ async def _run_mass_download(
             _active_downloads[channel_id]["skipped"]   = skipped
             _active_downloads[channel_id]["failed"]    = failed
 
+    def _set_current(video_id, title):
+        """Session 50 — mark which file the downloader is grabbing right now."""
+        if channel_id in _active_downloads:
+            _active_downloads[channel_id]["current_video_id"] = video_id
+            _active_downloads[channel_id]["current_title"] = title
+
+    def _record_item(video_id, title, status, size_mb=None):
+        """Session 50 — append a finished item to the rolling results list."""
+        if channel_id in _active_downloads:
+            entry = _active_downloads[channel_id]
+            entry["recent"].append({
+                "video_id": video_id,
+                "title": title,
+                "status": status,          # "done" | "skipped" | "failed"
+                "size_mb": size_mb,
+            })
+            # Keep the list bounded so a 500-video run doesn't bloat memory
+            if len(entry["recent"]) > 50:
+                entry["recent"] = entry["recent"][-50:]
+            entry["current_video_id"] = None
+            entry["current_title"] = None
+
     try:
         for video_id, source_url, title in videos:
             out_path = os.path.join(download_dir, f"{video_id}.mp4")
@@ -1109,12 +1147,14 @@ async def _run_mass_download(
             if os.path.exists(out_path) and os.path.getsize(out_path) > 1_000_000:
                 skipped += 1
                 _update_progress()
+                _record_item(video_id, title, "skipped")
                 continue
 
             logger.info(
                 f"Mass download [{channel_name}] {completed + skipped + failed + 1}/{total}: "
                 f"video {video_id} '{(title or '')[:50]}'"
             )
+            _set_current(video_id, title)
 
             cmd = [
                 "yt-dlp",
@@ -1144,6 +1184,7 @@ async def _run_mass_download(
                         )
                         completed += 1
                         _update_progress()
+                        _record_item(video_id, title, "done", size_mb)
                     else:
                         err = stderr.decode(errors="ignore")[:200] if stderr else "unknown"
                         logger.warning(
@@ -1152,6 +1193,7 @@ async def _run_mass_download(
                         )
                         failed += 1
                         _update_progress()
+                        _record_item(video_id, title, "failed")
                         if os.path.exists(out_path):
                             os.remove(out_path)
                 except asyncio.TimeoutError:
@@ -1160,6 +1202,8 @@ async def _run_mass_download(
                     )
                     proc.kill()
                     failed += 1
+                    _update_progress()
+                    _record_item(video_id, title, "failed")
                     if os.path.exists(out_path):
                         os.remove(out_path)
             except Exception as e:
@@ -1167,6 +1211,8 @@ async def _run_mass_download(
                     f"Mass download [{channel_name}]: video {video_id} error — {e}"
                 )
                 failed += 1
+                _update_progress()
+                _record_item(video_id, title, "failed")
 
             # Brief pause between downloads to avoid hammering the source
             await asyncio.sleep(0.5)
@@ -1179,6 +1225,18 @@ async def _run_mass_download(
     except asyncio.CancelledError:
         logger.info(f"Mass download [{channel_name}] cancelled by user after {completed} completed.")
     finally:
+        # Session 50 — preserve a summary of this run so the web UI can show
+        # "Last run" results after the active entry is gone.
+        import datetime as _dt
+        entry = _active_downloads.get(channel_id, {})
+        _last_download_results[channel_id] = {
+            "completed":   completed,
+            "skipped":     skipped,
+            "failed":      failed,
+            "total":       total,
+            "recent":      list(entry.get("recent", [])),
+            "finished_at": _dt.datetime.utcnow().isoformat() + "Z",
+        }
         # Always clean up the active downloads registry
         _active_downloads.pop(channel_id, None)
 

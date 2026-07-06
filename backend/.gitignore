@@ -39,3 +39,5 @@ docker-compose.override.yml
 *~
 .DS_Store
 Thumbs.db
+cookies.txt
+app/routers/xtream.py

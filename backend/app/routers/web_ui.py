@@ -1,12 +1,10 @@
 """
 Web Test UI Router.
 
-Serves the browser-based test interface at the root URL (/).
-This replaces the JSON root endpoint and serves the full HTML
-control deck so you can test all API functionality from a browser.
+Serves the browser-based interface at the root URL (/).
 
-In production (Android TV phase), this could be disabled or replaced
-with an admin panel.
+Reads the page from app/templates/index.html on every request,
+so UI deploys are just a file copy + container restart.
 """
 
 import os
@@ -15,13 +13,13 @@ from fastapi.responses import HTMLResponse
 
 router = APIRouter(tags=["web_ui"])
 
-# Path to the templates directory
-TEMPLATE_DIR = os.path.dirname(os.path.dirname(__file__))
+# Path to the templates directory (app/templates/)
+TEMPLATE_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "templates")
 
 
 @router.get("/", response_class=HTMLResponse)
 async def serve_web_ui(request: Request):
-    """Serve the WatchDawg web test interface."""
+    """Serve the WatchDawg web interface."""
     template_path = os.path.join(TEMPLATE_DIR, "index.html")
     with open(template_path, "r") as f:
         html_content = f.read()

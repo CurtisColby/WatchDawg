@@ -65,9 +65,6 @@ YTDLP_TIMEOUT_SECONDS = 90
 # concurrent extractions to avoid hammering platforms.
 _process_pool = concurrent.futures.ProcessPoolExecutor(max_workers=4)
 
-# Default format selector — used by resolve_video() for general sources (YouTube etc.)
-# Prefers combined audio+video MP4 with explicit codec checks so YouTube DASH
-# video-only segments are never selected.
 FORMAT_SELECTOR = (
     # Prefer combined mp4 streams (video+audio) up to 1080p
     "best[height<=1080][ext=mp4][vcodec!*=none][acodec!*=none]/"
@@ -79,26 +76,11 @@ FORMAT_SELECTOR = (
     "best[protocol^=m3u8][vcodec!*=none][acodec!*=none]/"
     # Format 18 fallback — 360p combined mp4
     "18/"
-    # Split streams fallback for sources with no combined format.
+    # Vimeo and some sources only serve split streams (no combined format available).
+    # Fall back to best split pair so these videos resolve instead of failing entirely.
     "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
     "bestvideo+bestaudio/"
     "best[protocol!=http_dash_segments]/"
-    "best"
-)
-
-# Vimeo-specific format selector — used when source_url contains vimeo.com.
-# Vimeo progressive HTTP MP4s (http-360p/540p/720p/1080p) are combined audio+video
-# but yt-dlp reports acodec=none on them, causing FORMAT_SELECTOR to skip them and
-# fall through to HLS sub-playlists which are video-only. Selecting by protocol=https
-# bypasses the acodec check and gets the combined progressive MP4 directly.
-VIMEO_FORMAT_SELECTOR = (
-    "best[height<=1080][ext=mp4][protocol=https]/"
-    "best[height<=1080][ext=mp4][protocol=http]/"
-    "best[ext=mp4][protocol=https]/"
-    "best[ext=mp4][protocol=http]/"
-    "best[protocol=m3u8_native][vcodec!*=none][acodec!*=none]/"
-    "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
-    "bestvideo+bestaudio/"
     "best"
 )
 
@@ -227,15 +209,8 @@ def _extract_sync_worker(url: str, cookies_path: Optional[str]) -> Tuple[Optiona
     """
     import yt_dlp
 
-    # Use Vimeo-specific format selector for Vimeo URLs — their progressive HTTP MP4s
-    # have acodec=none reported by yt-dlp even though they contain audio, so the
-    # standard FORMAT_SELECTOR skips them and falls through to HLS sub-playlists
-    # (video-only). VIMEO_FORMAT_SELECTOR uses protocol=https to bypass the acodec
-    # check and get the combined progressive MP4 directly.
-    _format_selector = VIMEO_FORMAT_SELECTOR if "vimeo.com" in url else FORMAT_SELECTOR
-
     ydl_opts = {
-        "format": _format_selector,
+        "format": FORMAT_SELECTOR,
         "quiet": True,
         "no_warnings": True,
         "extract_flat": False,
@@ -561,10 +536,6 @@ class ResolverService:
             if stream_info.uploader and not video.artist:
                 video.artist = stream_info.uploader
 
-            # Capture audio_url from split-stream resolution — not stored in DB,
-            # passed through to stream_video_redirect for routing decisions.
-            resolved_audio_url = stream_info.audio_url if hasattr(stream_info, "audio_url") else None
-
             await self._db.commit()
 
             # Auto-dedup: if this is the lower-scored duplicate, redirect to keeper
@@ -579,7 +550,7 @@ class ResolverService:
             except Exception as exc:
                 logger.warning(f"Auto-dedup check failed for video {video_id}: {exc}")
 
-            return self._build_result(video, audio_url=resolved_audio_url)
+            return self._build_result(video)
 
         elif is_permanent:
             logger.warning(
@@ -709,18 +680,12 @@ class ResolverService:
             "no_fingerprint_count": no_fingerprint,
         }
 
-    def _build_result(self, video: Video, audio_url: Optional[str] = None) -> dict:
-        """
-        Serialize a resolved Video to a result dict.
-        audio_url is passed through when yt-dlp returned a split stream —
-        not stored in DB, only used by stream_video_redirect routing.
-        """
+    def _build_result(self, video: Video) -> dict:
         return {
             "id": video.id,
             "title": video.title,
             "artist": video.artist,
             "stream_url": video.resolved_stream_url,
-            "audio_url": audio_url,
             "format": video.resolved_format,
             "resolved_at": video.resolved_at.isoformat() if video.resolved_at else None,
             "source_url": video.source_url,
