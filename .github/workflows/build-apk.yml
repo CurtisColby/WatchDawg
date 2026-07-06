@@ -1,0 +1,49 @@
+# WatchDawg — Android TV Client APK Builder
+#
+# Builds a debug APK automatically on every push to main (and on demand
+# via the "Run workflow" button on GitHub's Actions tab).
+#
+# Where to get the APK after a build finishes:
+#   GitHub repo page -> Actions tab -> click the newest run ->
+#   scroll to "Artifacts" at the bottom -> download "watchdawg-debug-apk"
+#   -> unzip it -> adb install -r app-debug.apk
+
+name: Build WatchDawg APK
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - "android/**"
+      - ".github/workflows/build-apk.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle (with dependency caching)
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Make gradlew executable
+        run: chmod +x android/gradlew
+
+      - name: Build debug APK
+        working-directory: android
+        run: ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: watchdawg-debug-apk
+          path: android/app/build/outputs/apk/debug/*.apk
+          retention-days: 14

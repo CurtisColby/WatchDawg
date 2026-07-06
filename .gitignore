@@ -3,7 +3,10 @@
 **/cookies.txt
 
 # Database — stays local
-**/data/
+# (Session 51 fix: was "**/data/", which silently excluded the Android
+#  client's entire com.watchdawg.tv.data package from the repo.
+#  Scoped to the backend's database folder only.)
+backend/data/
 **/*.db
 **/*.db-shm
 **/*.db-wal
