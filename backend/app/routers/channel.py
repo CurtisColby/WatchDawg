@@ -1319,11 +1319,29 @@ def _m3u_group_for_channel(channel) -> str:
 
 
 def _is_hls_stream(url: str) -> bool:
-    """Return True if the URL points to an HLS manifest."""
+    """
+    Return True if the URL points to an HLS manifest.
+
+    Handles both direct CDN URLs (path ends in .m3u8) and proxy-wrapped URLs
+    where the real CDN URL is URL-encoded inside the ?url= query parameter
+    (e.g. http://host/proxy/stream?url=https%3A%2F%2F...media.m3u8%3F...).
+    """
     if not url:
         return False
     path = url.split("?")[0].lower()
-    return path.endswith(".m3u8") or "m3u8" in path
+    if path.endswith(".m3u8") or "m3u8" in path:
+        return True
+    # Proxy-wrapped URL: the CDN URL lives URL-encoded in the query string.
+    # Decode once and check the inner URL's path the same way.
+    if "/proxy/stream" in path and "?" in url:
+        import urllib.parse as _up
+        query = url.split("?", 1)[1]
+        params = _up.parse_qs(query)
+        inner = (params.get("url") or [""])[0]
+        if inner:
+            inner_path = inner.split("?")[0].lower()
+            return inner_path.endswith(".m3u8") or "m3u8" in inner_path
+    return False
 
 
 @router.get("/all/live.m3u", response_class=Response)
@@ -1388,12 +1406,20 @@ async def stream_video_redirect(
     On-demand resolve-and-redirect for IPTV clients (TiviMate).
 
     Routing logic:
-    - HLS stream (m3u8 URL): always route through /proxy/stream.
-      HLS manifests already contain both audio and video tracks — the DASH
-      manifest approach is only needed for truly split MP4 files.
-    - Split MP4 stream (audio_url present, non-HLS): route to DASH manifest
-      so ExoPlayer merges both tracks.
+    - Split HLS stream (audio_url present AND video stream is HLS): some
+      Vimeo videos have no combined rendition — yt-dlp returns separate
+      video-only and audio-only HLS streams. Generic IPTV players can't
+      sync two tracks themselves, so route to /channel/stream/{id}/muxed
+      for a server-side ffmpeg remux into one continuous stream.
+    - Combined HLS stream (no separate audio_url): route through /proxy/stream.
+      The manifest already contains both audio and video tracks.
+    - Split MP4 stream (audio_url present, non-HLS, e.g. YouTube): route to
+      DASH manifest so ExoPlayer merges both tracks.
     - Combined stream: route through /proxy/stream.
+
+    Uses resolve_video_for_tv() rather than the standard resolver so a
+    separately-resolved audio_url is actually available for this routing
+    decision — the standard resolver/cache only ever persists one URL.
 
     Timeout: 25s hard limit on yt-dlp. Falls back to stale cached URL if
     available rather than returning a 502.
@@ -1436,7 +1462,7 @@ async def stream_video_redirect(
     resolution = None
     try:
         resolution = await _asyncio.wait_for(
-            resolver.resolve_video(video_id, force=False),
+            resolver.resolve_video_for_tv(video_id),
             timeout=25.0,
         )
     except _asyncio.TimeoutError:
@@ -1454,10 +1480,19 @@ async def stream_video_redirect(
     cdn_url = resolution["stream_url"]
     audio_url = resolution.get("audio_url")
 
-    # HLS streams (Vimeo): always proxy directly — the combined Vimeo HLS
-    # manifest already contains both audio and video tracks. TiviMate plays
-    # it correctly through the proxy (which injects Vimeo Referer headers).
-    # This is the same path the Android app uses when selecting HLS — it works.
+    # Split HLS: Vimeo serves separate video-only and audio-only HLS sub-playlists
+    # with no combined rendition. Build a synthetic HLS master manifest that
+    # declares both renditions so TiviMate can sync them natively — no ffmpeg.
+    if audio_url and _is_hls_stream(cdn_url):
+        master_url = f"{base_url}/channel/stream/{video_id}/master.m3u8"
+        logger.info(f"STREAM REDIRECT | video {video_id} — split HLS → master manifest")
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse(url=master_url, status_code=302)
+
+    # Combined HLS streams (Vimeo): proxy directly — the manifest already
+    # contains both audio and video tracks. TiviMate plays it correctly
+    # through the proxy (which injects Vimeo Referer headers). This is the
+    # same path the Android app uses when selecting HLS — it works.
     # Never use master playlist or DASH for HLS; those only work for split MP4.
     if _is_hls_stream(cdn_url):
         proxy_url = f"{proxy_base}?url={urllib.parse.quote(cdn_url, safe='')}"
@@ -1477,6 +1512,87 @@ async def stream_video_redirect(
     logger.info(f"STREAM REDIRECT | video {video_id} — combined → proxy → {cdn_url[:80]}")
     from fastapi.responses import RedirectResponse
     return RedirectResponse(url=proxy_url, status_code=302)
+
+
+@router.get("/stream/{video_id}/master.m3u8")
+async def stream_video_master_manifest(
+    video_id: int,
+    db: AsyncSession = Depends(get_db_session),
+):
+    """
+    Generate a synthetic HLS master manifest for split video+audio streams.
+
+    Some Vimeo videos have no combined rendition — yt-dlp returns separate
+    video-only and audio-only HLS sub-playlists. A generic IPTV player like
+    TiviMate cannot play two separate sub-playlists simultaneously, but it
+    CAN play a standard HLS master manifest that declares both renditions via
+    #EXT-X-MEDIA and #EXT-X-STREAM-INF tags. The player fetches both
+    sub-playlists in parallel and syncs them natively — no ffmpeg needed.
+
+    Both sub-playlist URLs are already proxied through /proxy/stream by
+    resolve_video_for_tv(), so Vimeo CDN Referer injection is handled there.
+
+    For combined streams (no separate audio_url), returns a minimal single-
+    rendition master manifest that still works correctly — TiviMate treats
+    it as a normal HLS stream.
+    """
+    from app.services.resolver import ResolverService
+    import asyncio as _asyncio
+    from fastapi.responses import PlainTextResponse
+
+    resolver = ResolverService(db)
+    resolution = await resolver.resolve_video_for_tv(video_id)
+
+    if resolution is None or not resolution.get("stream_url"):
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not resolve video {video_id} for HLS master manifest",
+        )
+
+    video_url = resolution["stream_url"]
+    audio_url = resolution.get("audio_url")
+
+    # The resolver wraps Vimeo CDN URLs through localhost for internal use —
+    # replace localhost with the real PlexServer IP so TiviMate (running on
+    # a different device) can actually reach the proxy endpoints.
+    base_url = "http://192.168.50.42:6868"
+    if video_url:
+        video_url = video_url.replace("http://localhost:6868", base_url)
+    if audio_url:
+        audio_url = audio_url.replace("http://localhost:6868", base_url)
+
+    if audio_url:
+        # Split stream: declare audio rendition + video stream referencing it.
+        # CODECS omitted intentionally — TiviMate's parser rejects mismatched
+        # codec strings; letting it sniff from the sub-playlists is more robust.
+        manifest = (
+            "#EXTM3U\n"
+            f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Audio",'
+            f'DEFAULT=YES,AUTOSELECT=YES,URI="{audio_url}"\n'
+            f'#EXT-X-STREAM-INF:BANDWIDTH=4000000,AUDIO="audio"\n'
+            f"{video_url}\n"
+        )
+        logger.info(
+            f"MASTER MANIFEST | video {video_id} — split HLS "
+            f"(video+audio declared)"
+        )
+    else:
+        # Combined stream: single-rendition master, no audio group needed
+        manifest = (
+            "#EXTM3U\n"
+            "#EXT-X-STREAM-INF:BANDWIDTH=4000000\n"
+            f"{video_url}\n"
+        )
+        logger.info(
+            f"MASTER MANIFEST | video {video_id} — combined HLS "
+            f"(single rendition)"
+        )
+
+    return PlainTextResponse(
+        content=manifest,
+        media_type="application/vnd.apple.mpegurl",
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+    )
 
 
 @router.get("/{channel_id}/live.m3u", response_class=Response)

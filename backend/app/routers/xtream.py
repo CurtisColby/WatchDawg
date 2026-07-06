@@ -161,11 +161,22 @@ def _locked_value_for_profile(profile: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def _eligible_video_filter(stmt):
-    """Apply the standard catalog-eligibility filters to a Video select."""
+    """
+    Apply catalog-eligibility filters to a Video select.
+
+    Only resolved videos and local downloaded files are served — unresolved
+    or pending videos are excluded so TiviMate never waits on a live yt-dlp
+    call at play time. Videos the background scheduler hasn't resolved yet
+    simply don't appear in the catalog until the next refresh.
+    """
+    from sqlalchemy import or_
     return stmt.where(
         Video.source_url.isnot(None),
         Video.source_url != "",
-        Video.resolution_status != "failed",
+        or_(
+            Video.resolution_status == "resolved",
+            Video.source_provider == "local_folder",
+        ),
     )
 
 

@@ -296,28 +296,46 @@ def _extract_sync_worker(url: str, cookies_path: Optional[str]) -> Tuple[Optiona
         return None, f"Transient: {error_msg[:300]}", False
 
 
-def _extract_tv_sync_worker(url: str, cookies_path: Optional[str]) -> Tuple[Optional[dict], Optional[str], bool]:
+def _extract_tv_sync_worker(url: str, cookies_path: Optional[str], prefer_hls: bool = False) -> Tuple[Optional[dict], Optional[str], bool]:
     """
     TV-specific yt-dlp extraction. Returns both video_url and audio_url separately
     so the client can pass them to VLC or another external player that can merge
     split streams natively — something ExoPlayer cannot do without a manifest.
 
-    Format selector targets the best split stream (bestvideo+bestaudio) with no
-    height cap. For YouTube this gets 1080p/1440p/4K video + separate audio.
-    For sources that only have combined streams, audio_url will be None and
-    stream_url covers both tracks.
+    prefer_hls=True: used for Vimeo, which serves HLS-only split streams.
+    Explicitly filters for m3u8_native protocol so we always get HLS sub-playlist
+    URLs rather than progressive MP4 URLs — required for the master manifest
+    approach where TiviMate fetches both sub-playlists in parallel.
+
+    prefer_hls=False (default): used for YouTube and others that serve split
+    progressive MP4 (video-only + audio-only) — these go through the DASH
+    manifest path which ExoPlayer handles natively.
 
     Returns (stream_info_dict | None, error_msg | None, is_permanent: bool).
     """
     import yt_dlp
 
-    TV_FORMAT_SELECTOR = (
-        "bestvideo[vcodec^=avc1]+bestaudio[ext=m4a]/"
-        "bestvideo[vcodec^=avc1]+bestaudio/"
-        "bestvideo+bestaudio[ext=m4a]/"
-        "bestvideo+bestaudio/"
-        "best"
-    )
+    if prefer_hls:
+        # Vimeo: explicitly prefer HLS split streams so URLs are m3u8 sub-playlists
+        # that can be declared in a synthetic HLS master manifest. Without the
+        # protocol filter yt-dlp may pick progressive MP4 which can't go into
+        # an #EXT-X-STREAM-INF entry.
+        TV_FORMAT_SELECTOR = (
+            "bestvideo[vcodec^=avc1][protocol^=m3u8]+bestaudio[protocol^=m3u8]/"
+            "bestvideo[vcodec^=avc1]+bestaudio[ext=m4a]/"
+            "bestvideo[vcodec^=avc1]+bestaudio/"
+            "bestvideo+bestaudio[ext=m4a]/"
+            "bestvideo+bestaudio/"
+            "best"
+        )
+    else:
+        TV_FORMAT_SELECTOR = (
+            "bestvideo[vcodec^=avc1]+bestaudio[ext=m4a]/"
+            "bestvideo[vcodec^=avc1]+bestaudio/"
+            "bestvideo+bestaudio[ext=m4a]/"
+            "bestvideo+bestaudio/"
+            "best"
+        )
 
     ydl_opts = {
         "format": TV_FORMAT_SELECTOR,
@@ -696,13 +714,9 @@ class ResolverService:
         """
         TV-specific resolution that returns both video_url and audio_url separately.
 
-        This allows the Android TV client to pass split stream URLs directly to
-        VLC (or another external player) which can merge them natively — giving
-        full quality (1080p/1440p/4K) without any server-side transcoding.
-
-        Does NOT cache the result — TV URLs are fetched fresh each time since
-        we need both URLs and the DB only stores one stream_url. The TTL on
-        YouTube URLs is ~6 hours so repeated plays within that window are fast.
+        Caches both stream_url and audio_url in the DB so repeat plays are instant.
+        The cache TTL matches _is_cache_valid() — 20 minutes for HLS/adaptive URLs
+        (Vimeo signed tokens), 3 hours for progressive MP4 (YouTube).
 
         Returns a dict with stream_url (video), audio_url (audio, may be None
         for combined streams), and the usual metadata fields.
@@ -719,70 +733,77 @@ class ResolverService:
             logger.debug(f"TV resolve: skipping permanently failed video {video_id}")
             return None
 
-        # Only YouTube uses the split extractor (bestvideo+bestaudio → DASH manifest).
-        # Vimeo and Reddit serve combined streams and must use the standard resolver
-        # so their CDN URLs are proxied correctly through /proxy/stream.
-        is_youtube = (
-            "youtube.com" in (video.source_url or "") or
-            "youtu.be" in (video.source_url or "") or
-            video.source_provider == "youtube"
-        )
-
-        if not is_youtube:
+        # Cache hit: if both stream_url and audio_url are stored and still valid,
+        # return immediately — no yt-dlp call needed. audio_url may be None for
+        # combined-stream providers; that's a valid cached result too.
+        if self._is_cache_valid(video) and video.resolved_audio_url is not None:
             logger.info(
-                f"TV resolve: non-YouTube source ({video.source_provider}) for video {video_id} "
-                f"— using standard resolver"
+                f"TV resolve cache hit (split): video {video_id} "
+                f"'{(video.title or '')[:60]}'"
             )
-            stream_info, error_msg, is_permanent = await self._extract_with_ytdlp(video.source_url)
-            if stream_info is None:
-                if is_permanent:
-                    logger.warning(f"TV resolve: video {video_id} permanently gone — {error_msg}")
-                    await self._delete_video(video)
-                    await self._db.commit()
-                else:
-                    logger.warning(f"TV resolve: transient error for video {video_id}: {error_msg}")
-                return None
-            # Non-YouTube resolve: check if yt-dlp returned a split stream
-            # (FORMAT_SELECTOR now falls back to bestvideo+bestaudio for Vimeo
-            # videos that have no combined format). If split, extract audio URL
-            # from requested_formats[1] so ExoPlayer gets both tracks.
-            import urllib.parse as _urlparse
-
-            stream_url = stream_info.stream_url
-            audio_url = stream_info.get("audio_url") if isinstance(stream_info, dict) else None
-
-            # Vimeo CDN URLs require Referer: https://vimeo.com/ — ExoPlayer
-            # on Android cannot inject this header, so route through backend proxy.
-            if _is_vimeo_cdn_url(stream_url):
-                proxy_base = f"http://localhost:{settings.app_port}/proxy/stream"
-                stream_url = f"{proxy_base}?url={_urlparse.quote(stream_url, safe='')}"
-                logger.info(f"TV resolve: Vimeo video stream wrapped through proxy for video {video_id}")
-            if audio_url and _is_vimeo_cdn_url(audio_url):
-                proxy_base = f"http://localhost:{settings.app_port}/proxy/stream"
-                audio_url = f"{proxy_base}?url={_urlparse.quote(audio_url, safe='')}"
-                logger.info(f"TV resolve: Vimeo audio stream wrapped through proxy for video {video_id}")
-
             return {
                 "id": video.id,
                 "title": video.title,
                 "artist": video.artist,
-                "stream_url": stream_url,
-                "audio_url": audio_url,
-                "format": stream_info.format_note,
+                "stream_url": video.resolved_stream_url,
+                "audio_url": video.resolved_audio_url,
+                "format": video.resolved_format,
                 "source_url": video.source_url,
                 "thumbnail_url": video.thumbnail_url,
             }
 
-        logger.info(f"TV resolve: YouTube — extracting split URLs for video {video_id} '{(video.title or '')[:60]}'")
+        # Cache hit: combined stream (audio_url was never set, meaning this
+        # provider returned a single combined URL last time). Use the sentinel
+        # value "" (empty string) to distinguish "cached combined" from
+        # "never resolved" (NULL). If the stream URL is still valid, serve it.
+        if self._is_cache_valid(video) and video.resolved_audio_url == "":
+            logger.info(
+                f"TV resolve cache hit (combined): video {video_id} "
+                f"'{(video.title or '')[:60]}'"
+            )
+            return {
+                "id": video.id,
+                "title": video.title,
+                "artist": video.artist,
+                "stream_url": video.resolved_stream_url,
+                "audio_url": None,
+                "format": video.resolved_format,
+                "source_url": video.source_url,
+                "thumbnail_url": video.thumbnail_url,
+            }
 
+        # Use the split extractor (bestvideo+bestaudio) for all providers —
+        # not just YouTube. Vimeo increasingly serves video-only and audio-only
+        # HLS streams with no combined rendition, so the standard single-URL
+        # resolver produces video-with-no-audio. Running the TV sync worker
+        # for all providers ensures we always get both URLs when they exist.
+        # The TV sync worker's TV_FORMAT_SELECTOR already handles fallback to
+        # combined streams when no split rendition exists, so this is safe for
+        # providers that do serve combined streams (we just get audio_url=None).
+        logger.info(
+            f"TV resolve: extracting split URLs for video {video_id} "
+            f"(provider={video.source_provider}) '{(video.title or '')[:60]}'"
+        )
+
+        # Vimeo needs HLS-preferring format selection so both URLs come back
+        # as m3u8 sub-playlists, compatible with the synthetic master manifest.
+        is_vimeo = (
+            "vimeo.com" in (video.source_url or "") or
+            video.source_provider == "vimeo"
+        )
+
+        import functools
         loop = asyncio.get_event_loop()
         try:
             result_dict, error_msg, is_permanent = await asyncio.wait_for(
                 loop.run_in_executor(
                     _process_pool,
-                    _extract_tv_sync_worker,
-                    video.source_url,
-                    self._cookies_path,
+                    functools.partial(
+                        _extract_tv_sync_worker,
+                        video.source_url,
+                        self._cookies_path,
+                        is_vimeo,  # prefer_hls
+                    ),
                 ),
                 timeout=float(YTDLP_TIMEOUT_SECONDS),
             )
@@ -805,14 +826,46 @@ class ResolverService:
         audio_url = result_dict.get("audio_url")
         logger.info(
             f"TV resolve: video {video_id} | height={result_dict.get('height')} | "
-            f"split={'yes' if audio_url else 'no'}"
+            f"split={'yes' if audio_url else 'no'} | provider={video.source_provider}"
         )
+
+        stream_url = result_dict["stream_url"]
+
+        # Vimeo CDN URLs require Referer: https://vimeo.com/ — generic players
+        # like TiviMate cannot inject this header, so wrap through backend proxy.
+        # (YouTube CDN URLs are signed tokens that work without special headers.)
+        import urllib.parse as _urlparse
+        if _is_vimeo_cdn_url(stream_url):
+            proxy_base = f"http://localhost:{settings.app_port}/proxy/stream"
+            stream_url = f"{proxy_base}?url={_urlparse.quote(stream_url, safe='')}"
+            logger.info(f"TV resolve: Vimeo video stream wrapped through proxy for video {video_id}")
+        if audio_url and _is_vimeo_cdn_url(audio_url):
+            proxy_base = f"http://localhost:{settings.app_port}/proxy/stream"
+            audio_url = f"{proxy_base}?url={_urlparse.quote(audio_url, safe='')}"
+            logger.info(f"TV resolve: Vimeo audio stream wrapped through proxy for video {video_id}")
+
+        # Cache both URLs in the DB so repeat plays within the TTL window are instant.
+        # Use empty string "" as the sentinel for "resolved as combined stream" so we
+        # can distinguish it from NULL meaning "never resolved via TV path".
+        try:
+            video.resolved_stream_url = stream_url
+            video.resolved_audio_url = audio_url if audio_url is not None else ""
+            video.resolved_format = result_dict.get("format_note") or video.resolved_format
+            video.resolved_at = datetime.datetime.utcnow()
+            video.resolution_status = "resolved"
+            await self._db.commit()
+            logger.info(
+                f"TV resolve: cached split URLs for video {video_id} "
+                f"(audio={'yes' if audio_url else 'combined'})"
+            )
+        except Exception as e:
+            logger.warning(f"TV resolve: failed to cache URLs for video {video_id}: {e}")
 
         return {
             "id": video.id,
             "title": video.title,
             "artist": video.artist,
-            "stream_url": result_dict["stream_url"],
+            "stream_url": stream_url,
             "audio_url": audio_url,
             "format": result_dict.get("format_note"),
             "source_url": video.source_url,

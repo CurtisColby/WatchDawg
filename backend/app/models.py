@@ -37,6 +37,12 @@ Session 38 additions:
                                root that spawned them during full-channel enumeration.
                                NULL for all standalone channels (all existing data unaffected).
                                Migration: ALTER TABLE channels ADD COLUMN parent_channel_id INTEGER DEFAULT NULL
+
+Session 52 additions:
+- Video.resolved_audio_url   — stores the separately-resolved audio-only HLS URL for
+                               Vimeo split-stream content (video-only + audio-only HLS).
+                               NULL for combined streams (YouTube MP4, local files, etc.).
+                               Migration: ALTER TABLE videos ADD COLUMN resolved_audio_url TEXT
 """
 
 import datetime
@@ -122,6 +128,7 @@ class Video(Base):
     duration_seconds = Column(Float, nullable=True)
     reddit_score = Column(Integer, nullable=True)
     resolved_stream_url = Column(Text, nullable=True)
+    resolved_audio_url = Column(Text, nullable=True)   # split-stream audio (Vimeo HLS, etc.)
     resolved_format = Column(String(50), nullable=True)
     resolved_at = Column(DateTime, nullable=True)
     resolution_status = Column(String(20), nullable=False, default="pending")
