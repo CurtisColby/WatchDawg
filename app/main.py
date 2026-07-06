@@ -19,6 +19,11 @@ Milestone B migrations added:
 - watch_history table
 - watchlist table
 - live_tv_channels table
+
+Session 35 migrations added:
+- live_tv_sources table
+- live_tv_channels.is_favorite column
+- live_tv_channels.sort_order column
 """
 
 import logging
@@ -133,6 +138,65 @@ async def _run_migrations():
                     created_at DATETIME NOT NULL
                 )
             """))
+
+            # ----------------------------------------------------------------
+            # Session 35: live_tv_channels new columns
+            # ----------------------------------------------------------------
+            result = await db.execute(text("PRAGMA table_info(live_tv_channels)"))
+            live_tv_columns = [row[1] for row in result.fetchall()]
+
+            if "is_favorite" not in live_tv_columns:
+                await db.execute(
+                    text("ALTER TABLE live_tv_channels ADD COLUMN is_favorite INTEGER NOT NULL DEFAULT 0")
+                )
+                logger.info("Migration applied: live_tv_channels.is_favorite")
+
+            if "sort_order" not in live_tv_columns:
+                await db.execute(
+                    text("ALTER TABLE live_tv_channels ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 999")
+                )
+                logger.info("Migration applied: live_tv_channels.sort_order")
+
+            # ----------------------------------------------------------------
+            # Session 35: live_tv_sources table
+            # ----------------------------------------------------------------
+            await db.execute(text("""
+                CREATE TABLE IF NOT EXISTS live_tv_sources (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    label TEXT NOT NULL,
+                    url TEXT NOT NULL UNIQUE,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    channel_count INTEGER NOT NULL DEFAULT 0,
+                    created_at DATETIME NOT NULL,
+                    last_imported_at DATETIME
+                )
+            """))
+            logger.info("Migration checked: live_tv_sources table")
+
+            # Session 44: live_tv_sources.group_filter column
+            # ----------------------------------------------------------------
+            result = await db.execute(text("PRAGMA table_info(live_tv_sources)"))
+            lts_cols = {row[1] for row in result.fetchall()}
+            if "group_filter" not in lts_cols:
+                await db.execute(
+                    text("ALTER TABLE live_tv_sources ADD COLUMN group_filter TEXT DEFAULT NULL")
+                )
+                logger.info("Migration applied: live_tv_sources.group_filter")
+
+            # ----------------------------------------------------------------
+            # Session 39: plex_config table
+            # ----------------------------------------------------------------
+            await db.execute(text("""
+                CREATE TABLE IF NOT EXISTS plex_config (
+                    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                    plex_url_encrypted  TEXT NOT NULL,
+                    token_encrypted     TEXT NOT NULL,
+                    server_name         TEXT,
+                    connected_at        DATETIME NOT NULL,
+                    last_verified_at    DATETIME
+                )
+            """))
+            logger.info("Migration checked: plex_config table")
 
             await db.commit()
             logger.info("All migrations complete.")
@@ -258,6 +322,7 @@ from app.routers.proxy import router as proxy_router            # noqa: E402
 from app.routers.watchlist import router as watchlist_router    # noqa: E402
 from app.routers.history import router as history_router        # noqa: E402
 from app.routers.live_tv import router as live_tv_router        # noqa: E402
+from app.routers.plex import router as plex_router              # noqa: E402
 from app.routers.web_ui import router as web_ui_router          # noqa: E402
 
 app.include_router(health_router)
@@ -272,6 +337,7 @@ app.include_router(proxy_router)
 app.include_router(watchlist_router)
 app.include_router(history_router)
 app.include_router(live_tv_router)
+app.include_router(plex_router)
 
 # Web UI must be registered LAST so its "/" route doesn't shadow the API
 app.include_router(web_ui_router)

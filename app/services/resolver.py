@@ -76,6 +76,10 @@ FORMAT_SELECTOR = (
     "best[protocol^=m3u8][vcodec!*=none][acodec!*=none]/"
     # Format 18 fallback — 360p combined mp4
     "18/"
+    # Vimeo and some sources only serve split streams (no combined format available).
+    # Fall back to best split pair so these videos resolve instead of failing entirely.
+    "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
+    "bestvideo+bestaudio/"
     "best[protocol!=http_dash_segments]/"
     "best"
 )
@@ -240,10 +244,15 @@ def _extract_sync_worker(url: str, cookies_path: Optional[str]) -> Tuple[Optiona
             return None, "yt-dlp returned no info", False
 
         stream_url = info.get("url")
+        audio_url = None
+        requested_formats = info.get("requested_formats", [])
         if not stream_url:
-            formats = info.get("requested_formats", [])
-            if formats:
-                stream_url = formats[0].get("url")
+            if requested_formats:
+                stream_url = requested_formats[0].get("url")
+                # If yt-dlp selected a split stream (bestvideo+bestaudio),
+                # capture the audio URL from the second requested format.
+                if len(requested_formats) >= 2:
+                    audio_url = requested_formats[1].get("url")
         if not stream_url:
             all_formats = info.get("formats", [])
             if all_formats:
@@ -253,13 +262,14 @@ def _extract_sync_worker(url: str, cookies_path: Optional[str]) -> Tuple[Optiona
 
         ext = info.get("ext", "unknown")
         height = info.get("height") or (
-            info.get("requested_formats", [{}])[0].get("height")
-            if info.get("requested_formats") else None
+            requested_formats[0].get("height")
+            if requested_formats else None
         )
         format_note = f"{ext}/{height}p" if height else ext
 
         return {
             "stream_url": stream_url,
+            "audio_url": audio_url,
             "format_note": format_note,
             "width": info.get("width"),
             "height": height,
@@ -732,12 +742,32 @@ class ResolverService:
                 else:
                     logger.warning(f"TV resolve: transient error for video {video_id}: {error_msg}")
                 return None
+            # Non-YouTube resolve: check if yt-dlp returned a split stream
+            # (FORMAT_SELECTOR now falls back to bestvideo+bestaudio for Vimeo
+            # videos that have no combined format). If split, extract audio URL
+            # from requested_formats[1] so ExoPlayer gets both tracks.
+            import urllib.parse as _urlparse
+
+            stream_url = stream_info.stream_url
+            audio_url = stream_info.get("audio_url") if isinstance(stream_info, dict) else None
+
+            # Vimeo CDN URLs require Referer: https://vimeo.com/ — ExoPlayer
+            # on Android cannot inject this header, so route through backend proxy.
+            if _is_vimeo_cdn_url(stream_url):
+                proxy_base = f"http://localhost:{settings.app_port}/proxy/stream"
+                stream_url = f"{proxy_base}?url={_urlparse.quote(stream_url, safe='')}"
+                logger.info(f"TV resolve: Vimeo video stream wrapped through proxy for video {video_id}")
+            if audio_url and _is_vimeo_cdn_url(audio_url):
+                proxy_base = f"http://localhost:{settings.app_port}/proxy/stream"
+                audio_url = f"{proxy_base}?url={_urlparse.quote(audio_url, safe='')}"
+                logger.info(f"TV resolve: Vimeo audio stream wrapped through proxy for video {video_id}")
+
             return {
                 "id": video.id,
                 "title": video.title,
                 "artist": video.artist,
-                "stream_url": stream_info.stream_url,
-                "audio_url": None,
+                "stream_url": stream_url,
+                "audio_url": audio_url,
                 "format": stream_info.format_note,
                 "source_url": video.source_url,
                 "thumbnail_url": video.thumbnail_url,

@@ -5,6 +5,10 @@ Uses async SQLAlchemy with aiosqlite for non-blocking database access.
 Tables are created automatically on first startup.
 The database file is stored in /app/data/ which is volume-mounted
 for persistence across container restarts.
+
+Milestone R-1: run_migrations() performs safe ALTER TABLE additions for
+columns added after initial deployment. Each migration is wrapped in a
+try/except so it is safe to run on a DB that already has the column.
 """
 
 import logging
@@ -37,14 +41,48 @@ async_session_factory = async_sessionmaker(
 )
 
 
+async def run_migrations() -> None:
+    """
+    Apply incremental ALTER TABLE migrations that cannot be expressed via
+    SQLAlchemy's create_all (which only creates missing tables, never adds
+    columns to existing ones).
+
+    Each statement is wrapped in its own try/except so a column that already
+    exists simply logs a debug message and continues — safe to call on every
+    startup regardless of DB age.
+    """
+    migrations = [
+        # Milestone B
+        ("channels", "locked",     "ALTER TABLE channels ADD COLUMN locked INTEGER DEFAULT 0"),
+        ("channels", "category",   "ALTER TABLE channels ADD COLUMN category TEXT DEFAULT 'general'"),
+        ("videos",   "tmdb_poster_url",  "ALTER TABLE videos ADD COLUMN tmdb_poster_url TEXT"),
+        ("videos",   "tmdb_description", "ALTER TABLE videos ADD COLUMN tmdb_description TEXT"),
+        ("videos",   "tmdb_year",        "ALTER TABLE videos ADD COLUMN tmdb_year INTEGER"),
+        ("videos",   "tmdb_rating",      "ALTER TABLE videos ADD COLUMN tmdb_rating REAL"),
+        ("videos",   "tmdb_id",          "ALTER TABLE videos ADD COLUMN tmdb_id INTEGER"),
+        # Milestone R-1
+        ("channels", "genre_tags",  "ALTER TABLE channels ADD COLUMN genre_tags TEXT DEFAULT ''"),
+    ]
+
+    async with engine.begin() as conn:
+        for table, column, sql in migrations:
+            try:
+                await conn.execute(__import__("sqlalchemy").text(sql))
+                logger.info(f"Migration applied: {table}.{column}")
+            except Exception as exc:
+                # OperationalError: duplicate column name — expected on re-run
+                logger.debug(f"Migration skipped ({table}.{column}): {exc}")
+
+
 async def init_db() -> None:
     """
-    Create all tables if they don't exist.
+    Create all tables if they don't exist, then run incremental column migrations.
     Called once at application startup.
     """
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     logger.info("Database tables initialized successfully.")
+    await run_migrations()
 
 
 async def get_db_session() -> AsyncSession:

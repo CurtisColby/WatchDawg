@@ -279,7 +279,7 @@ async def resolve_video_dash_manifest(
     # Proxy both URLs through the backend so YouTube CDN auth headers are injected
     # correctly by /proxy/stream. ExoPlayer cannot send the required headers to
     # googlevideo.com directly — it would get a 403.
-    base_url = str(request.base_url).rstrip("/")
+    import os; base_url = os.environ.get("WATCHDAWG_BASE_URL", "").rstrip("/") or str(request.base_url).rstrip("/")
     proxied_video = f"{base_url}/proxy/stream?url={urllib.parse.quote(video_url, safe='')}"
 
     if audio_url:
@@ -367,7 +367,7 @@ async def resolve_video_seek(
             detail=f"Video {video_id} resolved but returned no stream URL.",
         )
 
-    base_url = str(request.base_url).rstrip("/")
+    import os; base_url = os.environ.get("WATCHDAWG_BASE_URL", "").rstrip("/") or str(request.base_url).rstrip("/")
     manifest_url = f"{base_url}/resolve/{video_id}/manifest.mpd"
     start_ms = t * 1000
 
@@ -417,7 +417,7 @@ async def resolve_video_playlist(
     audio_url = result.get("audio_url", "")
     title = result.get("title") or "WatchDawg"
 
-    base_url = str(request.base_url).rstrip("/")
+    import os; base_url = os.environ.get("WATCHDAWG_BASE_URL", "").rstrip("/") or str(request.base_url).rstrip("/")
     proxied_video = f"{base_url}/proxy/stream?url={urllib.parse.quote(video_url, safe='')}"
     proxied_audio = (
         f"{base_url}/proxy/stream?url={urllib.parse.quote(audio_url, safe='')}"

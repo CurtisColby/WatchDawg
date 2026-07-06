@@ -117,24 +117,116 @@ async def scheduled_scrape():
             logger.error(f"Scheduled scrape failed: {e}")
 
 
+# Locked-channel resolve quota per tick — resolved before general content.
+# Locked channels = adult/PIN-gated content. Pre-warming their cache means
+# TiviMate playback hits a warm cache hit (~instant) instead of waiting for
+# yt-dlp to run at play time.
+SCHEDULED_LOCKED_PENDING_LIMIT = 100   # pending locked videos per tick
+SCHEDULED_LOCKED_EXPIRED_LIMIT = 60    # expired locked videos per tick
+
+
+async def _resolve_locked_channels_priority(resolver: "ResolverService", db) -> dict:
+    """
+    Pre-warm the resolver cache for locked (adult/PIN-gated) channel content.
+
+    Runs BEFORE the general resolve pass each tick so locked content is
+    always warm in cache when TiviMate requests it.
+
+    Resolves:
+    - Pending videos from locked channels (up to SCHEDULED_LOCKED_PENDING_LIMIT)
+    - Expired resolved videos from locked channels (up to SCHEDULED_LOCKED_EXPIRED_LIMIT)
+    """
+    from app.models import Video
+    import datetime as _dt
+
+    # Get IDs of all locked channels
+    locked_ch_stmt = select(Channel).where(Channel.locked == True, Channel.enabled == True)
+    locked_ch_result = await db.execute(locked_ch_stmt)
+    locked_channels = locked_ch_result.scalars().all()
+
+    if not locked_channels:
+        return {"locked_pending": 0, "locked_expired": 0}
+
+    locked_ids = [ch.id for ch in locked_channels]
+    logger.info(
+        f"Scheduled resolve (locked priority): {len(locked_ids)} locked channels — "
+        f"pre-warming cache (pending={SCHEDULED_LOCKED_PENDING_LIMIT}, "
+        f"expired={SCHEDULED_LOCKED_EXPIRED_LIMIT})"
+    )
+
+    # Pending videos from locked channels
+    pending_stmt = (
+        select(Video)
+        .where(
+            Video.channel_id.in_(locked_ids),
+            Video.resolution_status == "pending",
+        )
+        .order_by(Video.reddit_score.desc().nullslast())
+        .limit(SCHEDULED_LOCKED_PENDING_LIMIT)
+    )
+    pending_result = await db.execute(pending_stmt)
+    pending_videos = pending_result.scalars().all()
+
+    # Expired resolved videos from locked channels
+    expiry_cutoff = _dt.datetime.utcnow() - _dt.timedelta(hours=2)
+    expired_stmt = (
+        select(Video)
+        .where(
+            Video.channel_id.in_(locked_ids),
+            Video.resolution_status == "resolved",
+            Video.resolved_at < expiry_cutoff,
+        )
+        .order_by(Video.reddit_score.desc().nullslast())
+        .limit(SCHEDULED_LOCKED_EXPIRED_LIMIT)
+    )
+    expired_result = await db.execute(expired_stmt)
+    expired_videos = expired_result.scalars().all()
+
+    all_priority = list(pending_videos) + list(expired_videos)
+    resolved_count = 0
+    for video in all_priority:
+        try:
+            result = await resolver.resolve_video(video.id, force=True)
+            if result is not None:
+                resolved_count += 1
+        except Exception as e:
+            logger.warning(f"Locked priority resolve failed for video {video.id}: {e}")
+        import asyncio as _asyncio
+        await _asyncio.sleep(0.5)
+
+    logger.info(
+        f"Scheduled resolve (locked priority): {resolved_count}/{len(all_priority)} resolved "
+        f"({len(pending_videos)} pending + {len(expired_videos)} expired)"
+    )
+    return {"locked_pending": len(pending_videos), "locked_expired": len(expired_videos), "resolved": resolved_count}
+
+
 async def scheduled_resolve():
     """
     Periodic resolve job. Runs every SCRAPE_INTERVAL_MINUTES alongside scrape.
 
-    Two-pass strategy:
+    Three-pass strategy:
+    0. Locked priority pass — pre-warm cache for locked (adult) channel content
+       FIRST so TiviMate playback always hits a warm cache.
     1. Pending pass  — resolve new pending videos (up to SCHEDULED_PENDING_LIMIT).
     2. Expired pass  — re-resolve 'resolved' videos whose cached stream URL is stale.
     3. DASH purge    — auto-purge any DASH-only videos that slipped through.
     """
     logger.info(
         f"Scheduled batch resolve starting "
-        f"(pending limit={SCHEDULED_PENDING_LIMIT}, expired limit={SCHEDULED_EXPIRED_LIMIT})..."
+        f"(locked_pending={SCHEDULED_LOCKED_PENDING_LIMIT}, "
+        f"locked_expired={SCHEDULED_LOCKED_EXPIRED_LIMIT}, "
+        f"pending limit={SCHEDULED_PENDING_LIMIT}, expired limit={SCHEDULED_EXPIRED_LIMIT})..."
     )
     async with async_session_factory() as db:
         try:
             resolver = ResolverService(db)
 
-            # Pass 1: pending videos
+            # Pass 0: locked channel priority pre-warm
+            locked_summary = await _resolve_locked_channels_priority(resolver, db)
+            logger.info(f"Scheduled resolve (locked priority pass): {locked_summary}")
+
+            # Pass 1: pending videos (general)
             summary = await resolver.resolve_batch(limit=SCHEDULED_PENDING_LIMIT)
             logger.info(f"Scheduled resolve (pending pass): {summary}")
 
