@@ -1,4 +1,5 @@
 # WatchDawg v32.1
+Do not try to install this its full of broken functions. Its not even Alpha stage its public so Fable 5 can look at it. I mean you can if you want and play with it but its a mess right now.
 
 Self-hosted Android TV media center — private backup repository.
 
