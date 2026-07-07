@@ -3,7 +3,8 @@ WatchDawg Background Scheduler.
 
 Runs periodic tasks inside the FastAPI process using APScheduler:
 1. Scrape job         — fetches new posts from all enabled channels.
-2. Resolve job        — resolves pending videos and refreshes expired URLs.
+2. Resolve job        — resolves pending videos (standard path) and keeps the
+                        TV-path URL cache warm for TiviMate (TV warm pass).
 3. Dedup job          — sweeps all resolved videos for CDN fingerprint duplicates.
 4. Quality upgrade    — re-resolves low-quality videos in chunks.
 5. Live TV probe      — probes live stream URLs for online status (every 15 min).
@@ -15,9 +16,12 @@ Batch size rationale (updated):
   - Scheduled pending resolve: 200 per tick (was 50).
     Each yt-dlp call takes ~2-5s. 200 calls = 7-17 min worst case,
     well within the 30-min tick window. Keeps new channels resolving fast.
-  - Scheduled expired resolve: 100 per tick (unchanged).
-    Expired re-resolve is lower priority — CDN tokens are still valid for
-    a few hours, so we don't need to rush these.
+  - Scheduled TV cache warm: 100 per tick.
+    Pre-resolves YouTube videos via the TV path (split video + audio URLs)
+    so TiviMate playback is always an instant cache hit. YouTube extraction
+    takes 10-30+ s each, so 100 per tick is the throughput ceiling; the
+    first ticks after deploy work through the backlog, then it's only
+    refreshing URLs older than the 3 h token TTL.
   - Dedup sweep: every 2 hours, no call limit (reads DB only, no network).
     Two-pass: source URL dedup (all statuses) + CDN fingerprint (resolved only).
   - Live TV probe: every 15 minutes, HEAD request per channel.
@@ -56,11 +60,19 @@ _quality_upgrade_offset = 0
 # Pending resolve batch size per scheduler tick.
 SCHEDULED_PENDING_LIMIT = 200
 
-# Expired re-resolve batch size per scheduler tick.
-SCHEDULED_EXPIRED_LIMIT = 100
+# TV cache warm batch size per scheduler tick — YouTube videos whose TV-path
+# URL pair (resolved_stream_url + resolved_audio_url) is missing or stale.
+# Warming these in the background is what makes TiviMate playback an instant
+# cache hit instead of a 25-40s yt-dlp wait (the YouTube 502 fix).
+SCHEDULED_TV_WARM_LIMIT = 100
 
 # Live TV health probe interval (minutes)
 LIVE_TV_PROBE_INTERVAL_MINUTES = 15
+
+# EPG schedule rebuild interval (hours). Gap-fill logic in the pseudo
+# scheduler means only channels with schedule windows shorter than 48h
+# actually write new rows — a fully covered rebuild is nearly free.
+EPG_REBUILD_INTERVAL_HOURS = 2
 
 
 async def scheduled_scrape():
@@ -167,14 +179,20 @@ async def _resolve_locked_channels_priority(resolver: "ResolverService", db) -> 
     pending_result = await db.execute(pending_stmt)
     pending_videos = pending_result.scalars().all()
 
-    # Expired resolved videos from locked channels
+    # Resolved locked videos needing a TV-path refresh: either never resolved
+    # via the TV path (resolved_audio_url NULL) or URLs older than 2h.
+    from sqlalchemy import or_ as _or
     expiry_cutoff = _dt.datetime.utcnow() - _dt.timedelta(hours=2)
     expired_stmt = (
         select(Video)
         .where(
             Video.channel_id.in_(locked_ids),
             Video.resolution_status == "resolved",
-            Video.resolved_at < expiry_cutoff,
+            _or(
+                Video.resolved_audio_url.is_(None),
+                Video.resolved_at.is_(None),
+                Video.resolved_at < expiry_cutoff,
+            ),
         )
         .order_by(Video.reddit_score.desc().nullslast())
         .limit(SCHEDULED_LOCKED_EXPIRED_LIMIT)
@@ -182,11 +200,20 @@ async def _resolve_locked_channels_priority(resolver: "ResolverService", db) -> 
     expired_result = await db.execute(expired_stmt)
     expired_videos = expired_result.scalars().all()
 
+    # Pending locked videos go through the STANDARD resolver (metadata
+    # backfill, permanent-failure marking, dedup). Already-resolved locked
+    # videos are refreshed through the TV path, which writes BOTH the video
+    # and audio URLs together — the standard resolver only writes the video
+    # URL and would leave a stale audio URL paired with it.
+    expired_ids = {v.id for v in expired_videos}
     all_priority = list(pending_videos) + list(expired_videos)
     resolved_count = 0
     for video in all_priority:
         try:
-            result = await resolver.resolve_video(video.id, force=True)
+            if video.id in expired_ids:
+                result = await resolver.resolve_video_for_tv(video.id)
+            else:
+                result = await resolver.resolve_video(video.id, force=True)
             if result is not None:
                 resolved_count += 1
         except Exception as e:
@@ -208,15 +235,21 @@ async def scheduled_resolve():
     Three-pass strategy:
     0. Locked priority pass — pre-warm cache for locked (adult) channel content
        FIRST so TiviMate playback always hits a warm cache.
-    1. Pending pass  — resolve new pending videos (up to SCHEDULED_PENDING_LIMIT).
-    2. Expired pass  — re-resolve 'resolved' videos whose cached stream URL is stale.
+    1. Pending pass  — resolve new pending videos via the standard resolver
+       (up to SCHEDULED_PENDING_LIMIT). Handles metadata backfill, permanent
+       failure marking, and dedup for brand-new videos.
+    2. TV warm pass  — resolve_video_for_tv() for YouTube videos whose
+       TV URL pair is missing (resolved_audio_url NULL) or stale, so
+       TiviMate playback always hits a warm cache (the YouTube 502 fix).
+       Replaces the old standard-path expired refresh, which left stale
+       audio URLs paired with fresh video URLs.
     3. DASH purge    — auto-purge any DASH-only videos that slipped through.
     """
     logger.info(
         f"Scheduled batch resolve starting "
         f"(locked_pending={SCHEDULED_LOCKED_PENDING_LIMIT}, "
         f"locked_expired={SCHEDULED_LOCKED_EXPIRED_LIMIT}, "
-        f"pending limit={SCHEDULED_PENDING_LIMIT}, expired limit={SCHEDULED_EXPIRED_LIMIT})..."
+        f"pending limit={SCHEDULED_PENDING_LIMIT}, tv warm limit={SCHEDULED_TV_WARM_LIMIT})..."
     )
     async with async_session_factory() as db:
         try:
@@ -230,9 +263,10 @@ async def scheduled_resolve():
             summary = await resolver.resolve_batch(limit=SCHEDULED_PENDING_LIMIT)
             logger.info(f"Scheduled resolve (pending pass): {summary}")
 
-            # Pass 2: expired resolved videos — re-resolve stale CDN URLs
-            expired_summary = await resolver.resolve_expired(limit=SCHEDULED_EXPIRED_LIMIT)
-            logger.info(f"Scheduled resolve (expired pass): {expired_summary}")
+            # Pass 2: TV cache warm — pre-resolve YouTube via the TV path so
+            # resolved_stream_url + resolved_audio_url are ready before play
+            warm_summary = await resolver.warm_tv_cache(limit=SCHEDULED_TV_WARM_LIMIT)
+            logger.info(f"Scheduled resolve (TV warm pass): {warm_summary}")
 
             # Pass 3: purge any DASH-only videos that slipped through.
             dash_purged = await resolver.purge_dash_videos()
@@ -314,6 +348,25 @@ async def scheduled_live_tv_probe():
         logger.error(f"Scheduled live TV probe failed: {e}")
 
 
+async def scheduled_epg_rebuild():
+    """
+    Periodic EPG schedule rebuild. Runs every EPG_REBUILD_INTERVAL_HOURS (2h).
+
+    Ported from the orphaned app/scheduler.py (Session 53) — it was never
+    merged into this live scheduler, so EPG schedules only rebuilt on manual
+    trigger. Rebuilds all enabled EPG channels; gap-fill logic means only
+    channels with schedule windows shorter than 48h actually write new rows,
+    so a fully covered rebuild is nearly free.
+    """
+    logger.info("Scheduled EPG rebuild starting...")
+    try:
+        from app.routers.epg import rebuild_all_epg_schedules
+        await rebuild_all_epg_schedules()
+        logger.info("Scheduled EPG rebuild complete.")
+    except Exception as e:
+        logger.error(f"Scheduled EPG rebuild failed: {e}")
+
+
 def start_scheduler():
     """
     Start the background scheduler with configured intervals.
@@ -322,13 +375,17 @@ def start_scheduler():
     interval_minutes = settings.scrape_interval_minutes
 
     # Scrape job
+    # NOTE: no next_run_time override. The old code passed next_run_time=None
+    # intending "don't run immediately on startup" — but in APScheduler that
+    # actually adds the job PAUSED, so it never ran at all. With no override,
+    # an IntervalTrigger fires first at startup + interval, which is the
+    # behavior the original comment wanted.
     scheduler.add_job(
         scheduled_scrape,
         trigger=IntervalTrigger(minutes=interval_minutes),
         id="scrape_job",
         name="Channel Scrape (All)",
         replace_existing=True,
-        next_run_time=None,  # Don't run immediately on startup
     )
 
     # Resolve job — runs on the same interval
@@ -338,7 +395,6 @@ def start_scheduler():
         id="resolve_job",
         name="Batch Resolve",
         replace_existing=True,
-        next_run_time=None,
     )
 
     # Dedup sweep — runs every DEDUP_INTERVAL_HOURS
@@ -348,7 +404,6 @@ def start_scheduler():
         id="dedup_job",
         name="CDN Duplicate Sweep",
         replace_existing=True,
-        next_run_time=None,
     )
 
     # Quality upgrade job
@@ -358,7 +413,6 @@ def start_scheduler():
         id="quality_upgrade_job",
         name="Quality Upgrade (Low-Res Re-resolve)",
         replace_existing=True,
-        next_run_time=None,
     )
 
     # Live TV health probe — every 15 minutes
@@ -368,7 +422,16 @@ def start_scheduler():
         id="live_tv_probe_job",
         name="Live TV Health Probe",
         replace_existing=True,
-        next_run_time=None,
+    )
+
+    # EPG schedule rebuild — every EPG_REBUILD_INTERVAL_HOURS.
+    # Keeps the 48h rolling schedules topped up for TiviMate's guide.
+    scheduler.add_job(
+        scheduled_epg_rebuild,
+        trigger=IntervalTrigger(hours=EPG_REBUILD_INTERVAL_HOURS),
+        id="epg_rebuild_job",
+        name="EPG Schedule Rebuild",
+        replace_existing=True,
     )
 
     scheduler.start()
@@ -376,12 +439,13 @@ def start_scheduler():
         f"Background scheduler started. "
         f"Scrape/resolve interval: {interval_minutes} minutes. "
         f"Pending resolve limit: {SCHEDULED_PENDING_LIMIT}/tick. "
-        f"Expired resolve limit: {SCHEDULED_EXPIRED_LIMIT}/tick. "
+        f"TV cache warm limit: {SCHEDULED_TV_WARM_LIMIT}/tick. "
         f"Dedup sweep interval: {DEDUP_INTERVAL_HOURS} hours. "
         f"Quality upgrade interval: {QUALITY_UPGRADE_INTERVAL_HOURS} hours "
         f"(chunk={QUALITY_UPGRADE_CHUNK_SIZE}, min={QUALITY_UPGRADE_MIN_HEIGHT}p). "
         f"Live TV probe interval: {LIVE_TV_PROBE_INTERVAL_MINUTES} minutes. "
-        f"All jobs start on next tick (trigger manually for first run)."
+        f"EPG rebuild interval: {EPG_REBUILD_INTERVAL_HOURS} hours. "
+        f"All jobs fire automatically, first run one interval after startup."
     )
 
 

@@ -1421,8 +1421,12 @@ async def stream_video_redirect(
     separately-resolved audio_url is actually available for this routing
     decision — the standard resolver/cache only ever persists one URL.
 
-    Timeout: 25s hard limit on yt-dlp. Falls back to stale cached URL if
-    available rather than returning a 502.
+    Timeout: 40s hard limit on yt-dlp (raised from 25s — YouTube extraction
+    with JS-challenge solving routinely takes 10-30+ s, so 25s clipped real
+    successes). This is only the safety net for cache MISSES: the scheduler's
+    TV warm pass pre-resolves YouTube in the background, so normal playback
+    is an instant cache hit and never waits here at all. Falls back to stale
+    cached URL if available rather than returning a 502.
     """
     from app.services.resolver import ResolverService
     import asyncio as _asyncio
@@ -1463,10 +1467,10 @@ async def stream_video_redirect(
     try:
         resolution = await _asyncio.wait_for(
             resolver.resolve_video_for_tv(video_id),
-            timeout=25.0,
+            timeout=40.0,
         )
     except _asyncio.TimeoutError:
-        logger.warning(f"STREAM REDIRECT | video {video_id} — yt-dlp timed out after 25s")
+        logger.warning(f"STREAM REDIRECT | video {video_id} — yt-dlp timed out after 40s")
 
     # Stale-cache fallback
     if resolution is None and video.resolved_stream_url:

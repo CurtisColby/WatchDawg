@@ -22,8 +22,8 @@ Credentials (all overridable via environment variables):
 Endpoints implemented (root-level, standard Xtream layout):
   GET/POST /player_api.php     — handshake + all catalog actions:
         (no action)            → user_info + server_info handshake
-        get_live_categories    → []   (live stays M3U-only in SurfTV)
-        get_live_streams       → []
+        get_live_categories    → one live category per profile (Session 53)
+        get_live_streams       → EPG pseudo-channels as live streams
         get_vod_categories     → one category per non-TV channel
         get_vod_streams        → movies (videos) per category
         get_vod_info           → single-movie detail
@@ -34,8 +34,10 @@ Endpoints implemented (root-level, standard Xtream layout):
         get_simple_data_table  → empty stub
   GET /movie/{user}/{pass}/{stream_id}.{ext}   — VOD playback
   GET /series/{user}/{pass}/{episode_id}.{ext} — episode playback
+  GET /live/{user}/{pass}/{epg_channel_id}.ts  — live playback (Session 53):
+        auth + epg_type gate, then 302 → /epg/stream/{id} (mid-show join)
   GET /get.php                 — minimal empty M3U (client probe stub)
-  GET /xmltv.php               — minimal empty XMLTV (client probe stub)
+  GET /xmltv.php               — real XMLTV guide from epg_schedules (Session 53)
 
 Playback design:
   The stream endpoints validate credentials and the channel lock state,
@@ -73,7 +75,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response
-from sqlalchemy import select, func
+from sqlalchemy import select, func, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -99,6 +101,88 @@ EXP_DATE = "1893456000"  # 2030-01-01
 # Single series category (all TV-category channels live under it).
 SERIES_CATEGORY_ID = "1"
 SERIES_CATEGORY_NAME = "WatchDawg Series"
+
+# ---------------------------------------------------------------------------
+# Live TV (Session 53) — EPG pseudo-channels served as Xtream live streams.
+#
+# Live category IDs use a high offset so they can never collide with VOD
+# category IDs (which are WatchDawg channel row IDs). The epg_type split
+# mirrors the VOD lock split: the public login sees 'main' EPG channels,
+# the private login sees 'adult' EPG channels — two separate sources in
+# TiviMate, exactly like VOD.
+# ---------------------------------------------------------------------------
+LIVE_CATEGORY_MAIN_ID = "900001"
+LIVE_CATEGORY_MAIN_NAME = "WatchDawg TV"
+LIVE_CATEGORY_ADULT_ID = "900002"
+LIVE_CATEGORY_ADULT_NAME = "Adult TV"
+
+# EPG source types that have a working schedule builder + stream path.
+# 'xmltv' rows are dead Tunarr-import artifacts (Tunarr is retired) —
+# nothing can build schedules for them or stream them, so they are
+# filtered out of everything TiviMate sees.
+LIVE_SERVABLE_SOURCE_TYPES = ("plex_movie", "plex_tv", "watchdawg", "local_private")
+
+# How far back / forward xmltv.php exports programme data. TiviMate keeps
+# a little history visible in the grid; the pseudo-scheduler builds 48h out.
+XMLTV_LOOKBACK_HOURS = 6
+XMLTV_LOOKAHEAD_HOURS = 48
+
+
+def _epg_type_for_profile(profile: str) -> str:
+    """Mirror of the VOD lock split: public → main, private → adult."""
+    return "adult" if profile == "private" else "main"
+
+
+def _live_category_for_profile(profile: str) -> tuple:
+    """(category_id, category_name) for this profile's live section."""
+    if profile == "private":
+        return (LIVE_CATEGORY_ADULT_ID, LIVE_CATEGORY_ADULT_NAME)
+    return (LIVE_CATEGORY_MAIN_ID, LIVE_CATEGORY_MAIN_NAME)
+
+
+async def _epg_channels_for_profile(db: AsyncSession, profile: str) -> list:
+    """
+    Enabled, servable EPG pseudo-channels visible to this profile,
+    as dicts: {id, number, name, logo}. Raw SQL because the epg_* tables
+    predate the ORM models and are addressed with text() throughout epg.py.
+    """
+    placeholders = ", ".join(f"'{s}'" for s in LIVE_SERVABLE_SOURCE_TYPES)
+    result = await db.execute(
+        text(f"""
+            SELECT id, channel_number, name, logo_url
+            FROM epg_channels
+            WHERE enabled = 1
+              AND epg_type = :etype
+              AND source_type IN ({placeholders})
+            ORDER BY channel_number ASC, name ASC
+        """),
+        {"etype": _epg_type_for_profile(profile)},
+    )
+    return [
+        {"id": row[0], "number": row[1], "name": row[2], "logo": row[3]}
+        for row in result.fetchall()
+    ]
+
+
+def _parse_epg_dt(value):
+    """
+    Parse an epg_schedules start/end time as stored by SQLite — may come
+    back as a datetime object or an ISO-ish string ('YYYY-MM-DD HH:MM:SS'
+    with optional microseconds). Returns a datetime or None.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime.datetime):
+        return value
+    try:
+        return datetime.datetime.fromisoformat(str(value))
+    except (ValueError, TypeError):
+        return None
+
+
+def _xmltv_time(dt: datetime.datetime) -> str:
+    """Format a UTC datetime in XMLTV's 'YYYYMMDDHHMMSS +0000' form."""
+    return dt.strftime("%Y%m%d%H%M%S") + " +0000"
 
 
 # ---------------------------------------------------------------------------
@@ -403,10 +487,51 @@ async def player_api(
         })
 
     # ------------------------------------------------------------------
-    # Live — deliberately empty (live stays M3U-only in SurfTV).
+    # Live categories — one per profile, from the EPG pseudo-channel
+    # system (Session 53). Empty if the profile has no servable channels.
     # ------------------------------------------------------------------
-    if action in ("get_live_categories", "get_live_streams"):
-        return JSONResponse([])
+    if action == "get_live_categories":
+        epg_channels = await _epg_channels_for_profile(db, profile)
+        if not epg_channels:
+            logger.info(f"XTREAM | {profile} live_categories → 0 (no servable EPG channels)")
+            return JSONResponse([])
+        cat_id, cat_name = _live_category_for_profile(profile)
+        logger.info(f"XTREAM | {profile} live_categories → 1 ({cat_name})")
+        return JSONResponse([
+            {"category_id": cat_id, "category_name": cat_name, "parent_id": 0}
+        ])
+
+    # ------------------------------------------------------------------
+    # Live streams — one per enabled, servable EPG pseudo-channel.
+    # stream_id = epg_channels.id (its own namespace: /live/ URLs never
+    # mix with /movie/ or /series/ ids). epg_channel_id links each stream
+    # to its <channel id="wd{id}"> element in xmltv.php.
+    # ------------------------------------------------------------------
+    if action == "get_live_streams":
+        cat_id, _cat_name = _live_category_for_profile(profile)
+        requested_cat = params.get("category_id")
+        if requested_cat and str(requested_cat) != cat_id:
+            return JSONResponse([])
+
+        epg_channels = await _epg_channels_for_profile(db, profile)
+        payload = []
+        for idx, ch in enumerate(epg_channels, start=1):
+            payload.append({
+                "num": ch["number"] if ch["number"] is not None else idx,
+                "name": ch["name"],
+                "stream_type": "live",
+                "stream_id": ch["id"],
+                "stream_icon": ch["logo"] or "",
+                "epg_channel_id": f"wd{ch['id']}",
+                "added": "0",
+                "category_id": cat_id,
+                "custom_sid": "",
+                "tv_archive": 0,
+                "direct_source": "",
+                "tv_archive_duration": 0,
+            })
+        logger.info(f"XTREAM | {profile} live_streams → {len(payload)}")
+        return JSONResponse(payload)
 
     # ------------------------------------------------------------------
     # VOD categories — one per non-TV channel with eligible content.
@@ -642,6 +767,49 @@ async def xtream_series(
     return await _play(username, password, stream_file, db)
 
 
+@router.get("/live/{username}/{password}/{stream_file}")
+async def xtream_live(
+    username: str,
+    password: str,
+    stream_file: str,
+    db: AsyncSession = Depends(get_db_session),
+):
+    """
+    Xtream live playback: /live/{user}/{pass}/{epg_channel_id}.ts
+
+    Authenticates, verifies the EPG channel exists / is enabled / belongs
+    to this profile's epg_type (main vs adult — same wall as the VOD lock
+    split), then 302-redirects to /epg/stream/{id}, which serves "what's
+    on now" with mid-show join (FFmpeg -ss seek, stream copy).
+    """
+    profile = resolve_profile(username, password)
+    if profile is None:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    channel_id = _parse_stream_id(stream_file)
+
+    result = await db.execute(
+        text("SELECT id, epg_type, enabled, name FROM epg_channels WHERE id = :id"),
+        {"id": channel_id},
+    )
+    row = result.fetchone()
+    # Nonexistent, disabled, or wrong-profile channels all 404 identically
+    # so the public login can't even confirm adult channel IDs exist.
+    if (
+        row is None
+        or not row[2]
+        or row[1] != _epg_type_for_profile(profile)
+    ):
+        raise HTTPException(status_code=404, detail="Channel not found")
+
+    target = f"{BASE_URL}/epg/stream/{channel_id}"
+    logger.info(
+        f"XTREAM | live — profile={profile} epg_channel={channel_id} "
+        f"name={(row[3] or '')[:40]}"
+    )
+    return RedirectResponse(url=target, status_code=302)
+
+
 # ---------------------------------------------------------------------------
 # Client probe stubs
 # ---------------------------------------------------------------------------
@@ -662,13 +830,92 @@ async def xtream_get_php(request: Request):
 
 
 @router.get("/xmltv.php")
-async def xtream_xmltv(request: Request):
-    """EPG probe stub — valid empty XMLTV document."""
+async def xtream_xmltv(
+    request: Request,
+    db: AsyncSession = Depends(get_db_session),
+):
+    """
+    Real XMLTV guide (Session 53) — generated from epg_schedules.
+
+    Exports every enabled, servable EPG channel for this profile plus its
+    programme slots from XMLTV_LOOKBACK_HOURS ago to XMLTV_LOOKAHEAD_HOURS
+    ahead. Channel ids ('wd{id}') match the epg_channel_id values emitted
+    by get_live_streams, which is how TiviMate joins guide data to streams.
+    """
+    from xml.sax.saxutils import escape, quoteattr
+
     params = dict(request.query_params)
     profile = resolve_profile(
         params.get("username", ""), params.get("password", "")
     )
     if profile is None:
         raise HTTPException(status_code=401, detail="Invalid credentials")
-    xml = '<?xml version="1.0" encoding="UTF-8"?>\n<tv generator-info-name="WatchDawg"></tv>\n'
-    return Response(content=xml, media_type="application/xml")
+
+    epg_channels = await _epg_channels_for_profile(db, profile)
+
+    now = datetime.datetime.utcnow()
+    window_start = now - datetime.timedelta(hours=XMLTV_LOOKBACK_HOURS)
+    window_end = now + datetime.timedelta(hours=XMLTV_LOOKAHEAD_HOURS)
+
+    placeholders = ", ".join(f"'{s}'" for s in LIVE_SERVABLE_SOURCE_TYPES)
+    result = await db.execute(
+        text(f"""
+            SELECT s.epg_channel_id, s.title, s.subtitle, s.description,
+                   s.thumbnail_url, s.start_time, s.end_time
+            FROM epg_schedules s
+            JOIN epg_channels c ON c.id = s.epg_channel_id
+            WHERE c.enabled = 1
+              AND c.epg_type = :etype
+              AND c.source_type IN ({placeholders})
+              AND s.end_time >= :window_start
+              AND s.start_time <= :window_end
+            ORDER BY s.epg_channel_id ASC, s.start_time ASC
+        """),
+        {
+            "etype": _epg_type_for_profile(profile),
+            "window_start": window_start,
+            "window_end": window_end,
+        },
+    )
+    slots = result.fetchall()
+
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<tv generator-info-name="WatchDawg">',
+    ]
+
+    for ch in epg_channels:
+        lines.append(f'  <channel id="wd{ch["id"]}">')
+        lines.append(f'    <display-name>{escape(ch["name"] or "")}</display-name>')
+        if ch["logo"]:
+            lines.append(f'    <icon src={quoteattr(ch["logo"])} />')
+        lines.append('  </channel>')
+
+    programme_count = 0
+    for slot in slots:
+        start_dt = _parse_epg_dt(slot[5])
+        end_dt = _parse_epg_dt(slot[6])
+        if start_dt is None or end_dt is None:
+            continue  # unparseable row — skip rather than corrupt the guide
+        lines.append(
+            f'  <programme start="{_xmltv_time(start_dt)}" '
+            f'stop="{_xmltv_time(end_dt)}" channel="wd{slot[0]}">'
+        )
+        lines.append(f'    <title>{escape(slot[1] or "Untitled")}</title>')
+        if slot[2]:
+            lines.append(f'    <sub-title>{escape(slot[2])}</sub-title>')
+        if slot[3]:
+            lines.append(f'    <desc>{escape(slot[3])}</desc>')
+        if slot[4]:
+            lines.append(f'    <icon src={quoteattr(slot[4])} />')
+        lines.append('  </programme>')
+        programme_count += 1
+
+    lines.append('</tv>')
+    lines.append('')
+
+    logger.info(
+        f"XTREAM | {profile} xmltv → {len(epg_channels)} channels, "
+        f"{programme_count} programmes"
+    )
+    return Response(content="\n".join(lines), media_type="application/xml")

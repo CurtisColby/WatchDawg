@@ -52,6 +52,7 @@ a{color:var(--info)}
 .status-row{display:flex;align-items:center;gap:8px;margin-top:6px}
 .dot{width:9px;height:9px;border-radius:50%;background:var(--faint);flex:none}
 .dot.good{background:var(--good)} .dot.bad{background:var(--bad)} .dot.warn{background:var(--warn)}
+code.cfg{background:rgba(0,0,0,.32);padding:2px 7px;border-radius:5px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;user-select:all;word-break:break-all}
 
 /* ---------- Main ---------- */
 #main{flex:1;padding:26px 32px 80px;max-width:1250px}
@@ -287,7 +288,7 @@ h2{font-size:16px;margin:26px 0 12px;color:var(--accent2)}
 <!-- ================= SETTINGS ================= -->
 <section class="page" id="page-settings">
   <h1>Settings &amp; Health</h1>
-  <div class="sub">PIN privacy lock, server status, cleanup tools, Plex connection, and live server logs.</div>
+  <div class="sub">PIN privacy lock, TV connection details, YouTube cookie status, server health, cleanup tools, Plex connection, and live server logs.</div>
 
   <div class="card">
     <h2 style="margin-top:0">🔒 PIN Lock</h2>
@@ -297,6 +298,35 @@ h2{font-size:16px;margin:26px 0 12px;color:var(--accent2)}
       <button class="btn primary" id="pin-unlock" data-tip="Unlock this browser session. Locked channels and private downloads become visible until you lock again or close the tab.">Unlock</button>
       <button class="btn" id="pin-lock" data-tip="Immediately lock this session again. Locked channels and Private/ files disappear from this browser.">Lock Session</button>
     </div>
+  </div>
+
+  <div class="card">
+    <h2 style="margin-top:0">📺 Connect Your TV (TiviMate)</h2>
+    <div class="muted" style="margin-bottom:10px">Add WatchDawg to TiviMate (or any Xtream-capable player) as an <b>Xtream Codes API</b> source. Add it twice — once with each login — to get both catalogs and both TV guides.</div>
+    <div style="line-height:1.9">
+      <div data-tip="The address of this server — TiviMate must be on the same network.">Server URL: <code class="cfg">http://192.168.50.42:6868</code></div>
+      <div data-tip="The everyday catalog: unlocked sources plus the WatchDawg TV live channels.">Public login: <code class="cfg">public</code> / <code class="cfg">watchdawg</code></div>
+      <div data-tip="The PIN-gated catalog: locked sources plus the Adult TV live channels. The password is your WATCHDAWG_PIN from the server's .env file — it isn't printed here so anyone on your network who opens this page can't read it.">Private login: <code class="cfg">private</code> / <i>your WATCHDAWG_PIN</i></div>
+    </div>
+    <div class="muted" style="margin-top:10px">The TV guide (EPG) loads automatically once a source is added — no separate EPG URL needed. For players that want a plain playlist instead of Xtream, the M3U URLs are:</div>
+    <div style="line-height:1.9;margin-top:6px">
+      <div data-tip="Every enabled source's videos as one playlist.">All sources: <code class="cfg">http://192.168.50.42:6868/channel/all/live.m3u</code></div>
+      <div data-tip="Just one source's videos. Find a source's id number on the Sources page.">One source: <code class="cfg">http://192.168.50.42:6868/channel/{id}/live.m3u</code></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2 style="margin-top:0">🍪 YouTube Cookies</h2>
+    <div class="row" style="margin-bottom:10px" data-tip="Live status, updated automatically. Green = the last YouTube lookup worked. Red = YouTube is rejecting requests and the cookies below need refreshing.">
+      <span class="dot" id="cookie-dot"></span><span id="cookie-status-txt" class="muted">Checking…</span>
+    </div>
+    <div class="muted" style="margin-bottom:6px"><b>Why:</b> YouTube expires exported browser cookies every few weeks. When that happens, YouTube videos get stuck resolving or won't play, and the status above turns red. Refreshing takes two minutes:</div>
+    <ol class="muted" style="margin:0 0 8px 18px;line-height:1.8">
+      <li>On a computer where you're <b>logged into YouTube</b>, go to <b>youtube.com</b> and export cookies with a cookie-export browser extension (Netscape format — e.g. “Get cookies.txt LOCALLY”). Export while on the YouTube tab.</li>
+      <li>Copy the file onto the server:<br><code class="cfg">sudo cp ~/Downloads/www.youtube.com_cookies.txt ~/watchdawg-backend/config/cookies.txt</code></li>
+      <li>Done — <b>no restart needed</b>. The status turns green on the next successful YouTube lookup (within one scheduler tick, or right away if you play a YouTube video).</li>
+    </ol>
+    <div class="muted">To verify by hand from the server:<br><code class="cfg">docker exec watchdawg-backend yt-dlp --cookies /config/cookies.txt --simulate --print title "https://www.youtube.com/watch?v=jNQXAC9IVRw"</code><br>— it should print a video title, not a “Sign in to confirm you're not a bot” error.</div>
   </div>
 
   <div class="card">
@@ -431,16 +461,52 @@ function go(page){
 $$(".nav-btn").forEach(b=>b.addEventListener("click", ()=>go(b.dataset.page)));
 
 /* ---------------- health + auth ---------------- */
+function _cookieAgo(iso){
+  if(!iso) return "unknown";
+  const mins = Math.round((Date.now() - new Date(iso).getTime())/60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return mins + " min ago";
+  const h = Math.round(mins/60);
+  if (h < 48) return h + " h ago";
+  return Math.round(h/24) + " days ago";
+}
+function updateCookieStatus(c){
+  // Returns true when cookies are stale (so the sidebar can flag it too).
+  const dot = $("#cookie-dot"), txt = $("#cookie-status-txt");
+  if (!dot || !txt) return false;
+  if (!c || c.state === "unknown"){
+    dot.className = "dot";
+    txt.textContent = "No YouTube activity since the server started — status appears after the next YouTube resolve (usually within one scheduler tick).";
+    return false;
+  }
+  if (c.state === "ok"){
+    dot.className = "dot good";
+    txt.textContent = "Cookies working — last successful YouTube resolve " + _cookieAgo(c.last_success) + ".";
+    return false;
+  }
+  dot.className = "dot bad";
+  const since = c.last_bot_error ? new Date(c.last_bot_error).toLocaleString([], {month:"short", day:"numeric", hour:"numeric", minute:"2-digit"}) : "recently";
+  txt.textContent = "⚠️ YouTube is rejecting requests — refresh your cookies using the steps below. Failing since " + since + " (" + (c.bot_error_count||0) + " failure" + (c.bot_error_count===1?"":"s") + ").";
+  return true;
+}
 async function refreshHealth(){
   try{
     const h = await api("/health", {}, true);
     const ok = h && h.status==="healthy";
+    const cookieStale = updateCookieStatus(h && h.youtube_cookies);
+    if (ok && cookieStale){
+      $("#health-dot").className = "dot warn";
+      $("#health-txt").textContent = "YouTube cookies stale";
+      $("#health-detail").textContent = "Backend and database are fine, but YouTube is rejecting requests — refresh your cookies (see the 🍪 YouTube Cookies card above).";
+      return;
+    }
     $("#health-dot").className = "dot " + (ok?"good":"warn");
     $("#health-txt").textContent = ok ? "Server healthy" : "Server degraded";
     $("#health-detail").textContent = ok
       ? "Backend is up and the database is connected."
       : "Backend responded but reported: " + esc((h&&h.status)||"unknown");
   }catch(e){
+    updateCookieStatus(null);
     $("#health-dot").className = "dot bad";
     $("#health-txt").textContent = "Server unreachable";
     $("#health-detail").textContent = "The backend did not respond. Check that the Docker container is running on the PlexServer.";

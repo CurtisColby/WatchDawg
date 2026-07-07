@@ -55,6 +55,91 @@ RESOLUTION_TTL_HOURS = 3
 # Short TTL for HLS/DASH adaptive URLs — Vimeo signed tokens expire ~15-30min.
 ADAPTIVE_TTL_MINUTES = 20
 
+# Per-video locks for TV-path resolution (resolve_video_for_tv).
+# TiviMate retries a slow video rapidly — without a lock, each retry spawns
+# another concurrent yt-dlp process for the SAME video, piling up work and
+# making the timeout worse. With the lock, the first request does the real
+# extraction; every concurrent request for the same video waits, then gets
+# an instant cache hit from the result the first one stored.
+# The dict lives at module level so all requests (and the background
+# scheduler) in this FastAPI process share the same locks. Entries are tiny
+# asyncio.Lock objects — a few thousand videos costs negligible memory.
+_tv_resolve_locks: dict = {}
+
+# ---------------------------------------------------------------------------
+# YouTube cookie health (Session 53).
+#
+# YouTube expires exported browser cookies every few weeks; when they go
+# stale, every extraction fails with "Sign in to confirm you're not a bot"
+# and the only symptom used to be buried log lines. This tracker records,
+# in the MAIN process (extraction workers run in a separate process pool,
+# so their module state is invisible here), the outcome of every YouTube
+# extraction as results come back. /health exposes it and the web UI's
+# Settings page shows a live flag, so nobody has to watch logs.
+#
+# Rule: cookies are considered stale when the most recent bot-check error
+# is newer than the most recent YouTube success. A single success resets
+# the flag — self-clearing after a cookie refresh, no button to press.
+# In-memory only: a restart resets to "unknown" until the next YouTube
+# extraction, which the TV warm pass provides within one scheduler tick.
+# ---------------------------------------------------------------------------
+_youtube_cookie_status = {
+    "last_success": None,     # datetime of last successful YouTube extraction
+    "last_bot_error": None,   # datetime of last bot-check rejection
+    "bot_error_count": 0,     # failures since the last success
+}
+
+_BOT_CHECK_SIGNATURES = ("sign in to confirm", "not a bot")
+
+
+def _is_youtube_source(url: Optional[str]) -> bool:
+    u = url or ""
+    return "youtube.com" in u or "youtu.be" in u
+
+
+def _record_youtube_result(source_url: Optional[str], error_msg: Optional[str]) -> None:
+    """
+    Record the outcome of a yt-dlp extraction for cookie-health tracking.
+    Call with error_msg=None on success. Non-YouTube sources are ignored;
+    non-bot-check errors (dead videos, timeouts) don't touch the status —
+    they say nothing about cookies.
+    """
+    if not _is_youtube_source(source_url):
+        return
+    now = datetime.datetime.utcnow()
+    if error_msg is None:
+        _youtube_cookie_status["last_success"] = now
+        _youtube_cookie_status["bot_error_count"] = 0
+        return
+    low = error_msg.lower()
+    if any(sig in low for sig in _BOT_CHECK_SIGNATURES):
+        _youtube_cookie_status["last_bot_error"] = now
+        _youtube_cookie_status["bot_error_count"] += 1
+        if _youtube_cookie_status["bot_error_count"] == 1:
+            logger.warning(
+                "YouTube cookie health: bot-check rejection detected — "
+                "cookies are likely stale (flagged on /health and the web UI)"
+            )
+
+
+def get_youtube_cookie_status() -> dict:
+    """Cookie health summary for /health. state: 'ok' | 'stale' | 'unknown'."""
+    s = _youtube_cookie_status
+    if s["last_success"] is None and s["last_bot_error"] is None:
+        state = "unknown"
+    elif s["last_bot_error"] is not None and (
+        s["last_success"] is None or s["last_bot_error"] > s["last_success"]
+    ):
+        state = "stale"
+    else:
+        state = "ok"
+    return {
+        "state": state,
+        "last_success": s["last_success"].isoformat() + "Z" if s["last_success"] else None,
+        "last_bot_error": s["last_bot_error"].isoformat() + "Z" if s["last_bot_error"] else None,
+        "bot_error_count": s["bot_error_count"],
+    }
+
 # Hard wall-clock timeout for a single yt-dlp extraction call.
 # If yt-dlp hasn't returned within this many seconds, the subprocess is killed
 # and the video is marked failed (transient). This prevents one hung YouTube
@@ -532,6 +617,9 @@ class ResolverService:
         # Resolve with yt-dlp (hard timeout via ProcessPoolExecutor)
         logger.info(f"Re-resolving video {video_id} (source: {video.source_url[:80]})")
         stream_info, error_msg, is_permanent = await self._extract_with_ytdlp(video.source_url)
+        _record_youtube_result(
+            video.source_url, None if stream_info is not None else error_msg
+        )
 
         if stream_info is not None:
             url_type = "HLS" if _is_hls_url(stream_info.stream_url) else \
@@ -710,6 +798,39 @@ class ResolverService:
             "thumbnail_url": video.thumbnail_url,
         }
 
+    def _tv_cache_result(self, video: Video) -> Optional[dict]:
+        """
+        Return the cached TV-path resolution for a video, or None on cache miss.
+
+        A valid TV cache requires BOTH a fresh resolved_at timestamp (checked
+        by _is_cache_valid — 20 min for HLS, 3 h for MP4) AND a non-NULL
+        resolved_audio_url. The audio column doubles as the "was this video
+        ever resolved via the TV path?" marker:
+          NULL  -> never TV-resolved (standard resolver only) -> cache miss
+          ""    -> TV-resolved as a combined stream (no separate audio)
+          "..." -> TV-resolved as split video + audio streams
+        """
+        if not self._is_cache_valid(video):
+            return None
+        if video.resolved_audio_url is None:
+            return None
+
+        kind = "split" if video.resolved_audio_url else "combined"
+        logger.info(
+            f"TV resolve cache hit ({kind}): video {video.id} "
+            f"'{(video.title or '')[:60]}'"
+        )
+        return {
+            "id": video.id,
+            "title": video.title,
+            "artist": video.artist,
+            "stream_url": video.resolved_stream_url,
+            "audio_url": video.resolved_audio_url or None,
+            "format": video.resolved_format,
+            "source_url": video.source_url,
+            "thumbnail_url": video.thumbnail_url,
+        }
+
     async def resolve_video_for_tv(self, video_id: int) -> Optional[dict]:
         """
         TV-specific resolution that returns both video_url and audio_url separately.
@@ -717,6 +838,12 @@ class ResolverService:
         Caches both stream_url and audio_url in the DB so repeat plays are instant.
         The cache TTL matches _is_cache_valid() — 20 minutes for HLS/adaptive URLs
         (Vimeo signed tokens), 3 hours for progressive MP4 (YouTube).
+
+        Concurrency: guarded by a per-video asyncio.Lock. When TiviMate fires
+        rapid retries at a slow video (or the background warm job and a live
+        playback request collide on the same video), only ONE yt-dlp
+        extraction runs; every other caller waits, then reads the freshly
+        cached result — no duplicate yt-dlp processes.
 
         Returns a dict with stream_url (video), audio_url (audio, may be None
         for combined streams), and the usual metadata fields.
@@ -733,44 +860,48 @@ class ResolverService:
             logger.debug(f"TV resolve: skipping permanently failed video {video_id}")
             return None
 
-        # Cache hit: if both stream_url and audio_url are stored and still valid,
-        # return immediately — no yt-dlp call needed. audio_url may be None for
-        # combined-stream providers; that's a valid cached result too.
-        if self._is_cache_valid(video) and video.resolved_audio_url is not None:
-            logger.info(
-                f"TV resolve cache hit (split): video {video_id} "
-                f"'{(video.title or '')[:60]}'"
-            )
-            return {
-                "id": video.id,
-                "title": video.title,
-                "artist": video.artist,
-                "stream_url": video.resolved_stream_url,
-                "audio_url": video.resolved_audio_url,
-                "format": video.resolved_format,
-                "source_url": video.source_url,
-                "thumbnail_url": video.thumbnail_url,
-            }
+        # Fast path: valid TV cache — return immediately, no lock, no yt-dlp.
+        cached = self._tv_cache_result(video)
+        if cached is not None:
+            return cached
 
-        # Cache hit: combined stream (audio_url was never set, meaning this
-        # provider returned a single combined URL last time). Use the sentinel
-        # value "" (empty string) to distinguish "cached combined" from
-        # "never resolved" (NULL). If the stream URL is still valid, serve it.
-        if self._is_cache_valid(video) and video.resolved_audio_url == "":
-            logger.info(
-                f"TV resolve cache hit (combined): video {video_id} "
-                f"'{(video.title or '')[:60]}'"
-            )
-            return {
-                "id": video.id,
-                "title": video.title,
-                "artist": video.artist,
-                "stream_url": video.resolved_stream_url,
-                "audio_url": None,
-                "format": video.resolved_format,
-                "source_url": video.source_url,
-                "thumbnail_url": video.thumbnail_url,
-            }
+        # Cache miss — serialize extraction per video ID so concurrent
+        # requests (TiviMate retries, warm job collisions) never spawn
+        # duplicate yt-dlp processes for the same video.
+        lock = _tv_resolve_locks.setdefault(video_id, asyncio.Lock())
+        async with lock:
+            # While we waited for the lock, another request may have finished
+            # resolving this exact video. Re-read the row and re-check the
+            # cache before doing any work of our own (double-checked locking).
+            try:
+                await self._db.refresh(video)
+            except Exception:
+                # Row vanished — a concurrent resolve found the video
+                # permanently gone and deleted it from the DB.
+                logger.warning(
+                    f"TV resolve: video {video_id} was deleted while waiting for lock"
+                )
+                return None
+
+            if video.resolution_status == "failed":
+                logger.debug(
+                    f"TV resolve: video {video_id} marked failed while waiting for lock"
+                )
+                return None
+
+            cached = self._tv_cache_result(video)
+            if cached is not None:
+                return cached
+
+            return await self._tv_extract_and_cache(video)
+
+    async def _tv_extract_and_cache(self, video: Video) -> Optional[dict]:
+        """
+        Run the split (video + audio) yt-dlp extraction for a video and cache
+        both URLs in the DB. Callers MUST hold the per-video TV resolve lock —
+        this is only called from resolve_video_for_tv().
+        """
+        video_id = video.id
 
         # Use the split extractor (bestvideo+bestaudio) for all providers —
         # not just YouTube. Vimeo increasingly serves video-only and audio-only
@@ -813,6 +944,10 @@ class ResolverService:
         except Exception as e:
             logger.error(f"TV resolve: extraction error for video {video_id}: {e}")
             return None
+
+        _record_youtube_result(
+            video.source_url, None if result_dict is not None else error_msg
+        )
 
         if result_dict is None:
             if is_permanent:
@@ -881,7 +1016,18 @@ class ResolverService:
         await self._db.delete(video)
 
     async def resolve_batch(self, limit: int = 10) -> dict:
-        """Resolve a batch of pending videos."""
+        """
+        Resolve a batch of PENDING videos via the standard resolver.
+
+        Pending-only by design: the standard resolver earns its keep on new
+        videos (thumbnail/duration backfill, permanent-failure marking,
+        auto-dedup) but it only writes resolved_stream_url — it never touches
+        resolved_audio_url. Letting it also REFRESH already-resolved videos
+        (as it used to) overwrites the video URL while leaving a stale audio
+        URL behind: a mismatched pair the TV cache check would happily serve
+        to TiviMate. All URL refreshes now go through warm_tv_cache() /
+        resolve_video_for_tv(), which always writes both URLs together.
+        """
         stmt = (
             select(Video)
             .where(Video.resolution_status == "pending")
@@ -891,20 +1037,7 @@ class ResolverService:
         result = await self._db.execute(stmt)
         videos = result.scalars().all()
 
-        expiry_cutoff = datetime.datetime.utcnow() - datetime.timedelta(hours=RESOLUTION_TTL_HOURS)
-        expired_stmt = (
-            select(Video)
-            .where(
-                Video.resolution_status == "resolved",
-                Video.resolved_at < expiry_cutoff,
-            )
-            .order_by(Video.reddit_score.desc().nullslast())
-            .limit(max(0, limit - len(videos)))
-        )
-        expired_result = await self._db.execute(expired_stmt)
-        expired_videos = expired_result.scalars().all()
-
-        all_videos = list(videos) + list(expired_videos)
+        all_videos = list(videos)
         summary = {"total": len(all_videos), "resolved": 0, "failed": 0, "deleted": 0}
 
         for video in all_videos:
@@ -927,14 +1060,53 @@ class ResolverService:
         )
         return summary
 
-    async def resolve_expired(self, limit: int = 100) -> dict:
-        """Re-resolve videos whose cached stream URLs have gone stale."""
+    async def warm_tv_cache(self, limit: int = 100) -> dict:
+        """
+        Background pre-warm of the TV-path URL cache (YouTube only).
+
+        This is the fix for TiviMate's YouTube 502s: playback goes through
+        resolve_video_for_tv(), whose cache is only warm when BOTH
+        resolved_stream_url and resolved_audio_url are populated and fresh.
+        YouTube extraction (with the Node.js JS-challenge solving) routinely
+        takes 10-30+ seconds — far too slow to run at play time. This job runs
+        it in the background instead, so by the time TiviMate presses play the
+        answer is already sitting in the DB (an instant cache hit).
+
+        Selects resolved videos that need warming:
+          - resolved_audio_url IS NULL  -> never resolved via the TV path, OR
+          - resolved_at older than the 3 h MP4 token TTL -> URLs going stale
+
+        Deliberately excluded:
+          - local_folder videos — no yt-dlp involved, served straight from disk
+          - Vimeo — its HLS tokens die in ~20 minutes, so pre-warming is
+            wasted work; Vimeo resolves fast at play time (no JS challenge)
+            and is verified working with audio on hardware.
+
+        Replaces the old resolve_expired() standard-path refresh, which
+        overwrote resolved_stream_url while leaving resolved_audio_url stale —
+        creating mismatched URL pairs the TV cache would then serve.
+        """
+        from sqlalchemy import or_
+
         expiry_cutoff = datetime.datetime.utcnow() - datetime.timedelta(hours=RESOLUTION_TTL_HOURS)
         stmt = (
             select(Video)
             .where(
                 Video.resolution_status == "resolved",
-                Video.resolved_at < expiry_cutoff,
+                # NULL-safe provider exclusion: a plain != comparison silently
+                # drops rows where source_provider is NULL (SQL three-valued
+                # logic), and older rows may have no provider set.
+                or_(
+                    Video.source_provider.is_(None),
+                    Video.source_provider.notin_(["local_folder", "vimeo"]),
+                ),
+                Video.source_url.isnot(None),
+                ~Video.source_url.like("%vimeo.com%"),
+                or_(
+                    Video.resolved_audio_url.is_(None),
+                    Video.resolved_at.is_(None),
+                    Video.resolved_at < expiry_cutoff,
+                ),
             )
             .order_by(Video.reddit_score.desc().nullslast())
             .limit(limit)
@@ -942,13 +1114,13 @@ class ResolverService:
         result = await self._db.execute(stmt)
         videos = result.scalars().all()
 
-        summary = {"total": len(videos), "resolved": 0, "failed": 0, "deleted": 0}
+        summary = {"total": len(videos), "warmed": 0, "failed": 0, "deleted": 0}
 
         for video in videos:
             video_id = video.id
-            result = await self.resolve_video(video_id, force=True)
+            result = await self.resolve_video_for_tv(video_id)
             if result is not None:
-                summary["resolved"] += 1
+                summary["warmed"] += 1
             else:
                 check = await self._db.execute(select(Video).where(Video.id == video_id))
                 if check.scalar_one_or_none() is None:
@@ -958,7 +1130,7 @@ class ResolverService:
             await asyncio.sleep(1.0)
 
         logger.info(
-            f"Expired resolve complete: {summary['resolved']} refreshed, "
+            f"TV cache warm complete: {summary['warmed']} warmed, "
             f"{summary['failed']} failed, {summary['deleted']} deleted "
             f"out of {summary['total']}"
         )

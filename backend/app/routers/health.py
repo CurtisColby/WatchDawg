@@ -23,8 +23,19 @@ async def health_check(db: AsyncSession = Depends(get_db_session)):
     except Exception:
         pass
 
+    # YouTube cookie health (Session 53) — lets the web UI flag stale
+    # cookies instead of the problem hiding in log lines. Import here
+    # (not at module level) so a resolver import problem can never take
+    # the health endpoint down with it.
+    try:
+        from app.services.resolver import get_youtube_cookie_status
+        youtube_cookies = get_youtube_cookie_status()
+    except Exception:
+        youtube_cookies = {"state": "unknown"}
+
     return {
         "status": "healthy" if db_ok else "degraded",
         "database": "connected" if db_ok else "unreachable",
         "service": "watchdawg-backend",
+        "youtube_cookies": youtube_cookies,
     }
