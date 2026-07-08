@@ -8,6 +8,11 @@ Endpoints:
 - GET  /resolve/{video_id}/playlist.m3u8 — Legacy M3U8 playlist (kept but not used).
 - POST /resolve/batch               — Resolve a batch of pending videos.
 - POST /resolve/stop                — Signal the running batch to stop after current video.
+- GET  /resolve/youtube-pause       — Return current YouTube back-off / pause state.
+- POST /resolve/youtube-pause       — Manually pause all YouTube yt-dlp activity (default 70 min).
+- DELETE /resolve/youtube-pause     — Cancel an active YouTube pause immediately.
+- GET  /resolve/cookie-stale        — Return current cookie-stale pause state (auto-set on bot-check).
+- DELETE /resolve/cookie-stale      — Manually clear the cookie-stale pause after refreshing cookies.
 - POST /resolve/reset-failed        — Reset failed videos back to pending for retry.
 - POST /resolve/backfill-thumbnails — Fetch missing thumbnails via yt-dlp metadata pass.
 - POST /resolve/purge-dash          — Delete all DASH-only videos (unplayable in browser).
@@ -51,7 +56,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db_session
 from app.models import Video
-from app.services.resolver import ResolverService
+from app.services.resolver import (
+    ResolverService,
+    activate_youtube_pause,
+    cancel_youtube_pause,
+    get_youtube_pause_state,
+    cancel_cookie_stale_pause,
+    get_cookie_stale_state,
+    YOUTUBE_BACKOFF_MINUTES,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -561,6 +574,87 @@ async def resolve_batch(
 
     _batch_abort_requested = False
     return {"status": "complete", "summary": summary}
+
+
+@router.get("/youtube-pause")
+async def get_youtube_pause():
+    """
+    Return the current YouTube back-off / pause state.
+
+    Response fields:
+      paused: bool
+      minutes_remaining: int | null   — minutes left on the cooldown
+      until_utc: str | null           — ISO timestamp when it expires
+    """
+    return get_youtube_pause_state()
+
+
+@router.post("/youtube-pause")
+async def pause_youtube(
+    minutes: int = Query(
+        YOUTUBE_BACKOFF_MINUTES,
+        description="How many minutes to pause YouTube extractions (default 70).",
+        ge=1,
+        le=480,
+    )
+):
+    """
+    Manually pause all YouTube yt-dlp activity for the given number of minutes.
+
+    The scheduler and play-time resolver both check this flag and skip YouTube
+    videos while it is active, preventing further rate-limit bans. Clears
+    automatically when the timer expires. Can be cancelled early with
+    DELETE /resolve/youtube-pause.
+    """
+    state = activate_youtube_pause(minutes)
+    logger.info(f"YouTube pause activated via API: {minutes} min")
+    return {"status": "paused", "message": f"YouTube extractions paused for {minutes} minutes.", **state}
+
+
+@router.delete("/youtube-pause")
+async def resume_youtube():
+    """
+    Cancel an active YouTube pause immediately and resume normal operation.
+    Safe to call even if no pause is active.
+    """
+    state = cancel_youtube_pause()
+    logger.info("YouTube pause cancelled via API.")
+    return {"status": "resumed", "message": "YouTube extractions resumed.", **state}
+
+
+@router.get("/cookie-stale")
+async def get_cookie_stale():
+    """
+    Return the current cookie-stale pause state.
+
+    This pause is separate from the timed YouTube back-off above. It is set
+    automatically the first time YouTube rejects a request with a bot-check
+    ("Sign in to confirm you're not a bot"), which means the exported cookies
+    have expired. While active, all YouTube extractions are skipped and the
+    affected videos stay PENDING (never marked failed), so the fail log does
+    not fill up over an expired cookie.
+
+    Response fields:
+      cookie_stale_paused: bool
+
+    Clears automatically the next time a YouTube extraction succeeds (i.e.
+    right after cookies.txt is refreshed), or manually via DELETE.
+    """
+    return get_cookie_stale_state()
+
+
+@router.delete("/cookie-stale")
+async def resume_cookie_stale():
+    """
+    Manually clear the cookie-stale pause and resume YouTube extractions.
+
+    Use this after refreshing cookies.txt if you don't want to wait for the
+    background warm pass to auto-clear it. Safe to call even if no pause is
+    active.
+    """
+    state = cancel_cookie_stale_pause()
+    logger.info("Cookie-stale pause cancelled via API.")
+    return {"status": "resumed", "message": "Cookie-stale pause cleared — YouTube extractions resumed.", **state}
 
 
 @router.post("/stop")

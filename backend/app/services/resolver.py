@@ -91,6 +91,279 @@ _youtube_cookie_status = {
 
 _BOT_CHECK_SIGNATURES = ("sign in to confirm", "not a bot")
 
+# ---------------------------------------------------------------------------
+# YouTube rate-limit back-off (Session 54).
+#
+# When YouTube rate-limits a session the error message contains the phrase
+# "rate-limited by YouTube for up to an hour." We track this in-process and
+# refuse to make ANY further YouTube yt-dlp calls until the cooldown expires.
+# This prevents the scheduler from hammering YouTube every 30 minutes while
+# already in the penalty box, which would extend the ban indefinitely.
+#
+# Back-off duration: YOUTUBE_BACKOFF_MINUTES (default 70 — slightly longer
+# than YouTube's stated "up to an hour" so we don't immediately re-trigger).
+# Self-clearing: once the cooldown expires the next extraction runs normally;
+# if it succeeds the back-off is forgotten. No button to press.
+#
+# Background jobs (resolve_batch, warm_tv_cache) check is_youtube_backed_off()
+# and skip YouTube videos silently during the cooldown — those videos stay
+# in their current status and will be picked up on the next tick after the
+# cooldown lifts. Play-time calls (resolve_video_for_tv) also check and
+# return None fast rather than poking YouTube and re-triggering the ban.
+# ---------------------------------------------------------------------------
+YOUTUBE_BACKOFF_MINUTES = 70
+
+_youtube_backoff_until: Optional[datetime.datetime] = None
+
+
+def _set_youtube_backoff() -> None:
+    """Start the rate-limit cooldown. Called when a rate-limit error is seen."""
+    global _youtube_backoff_until
+    until = datetime.datetime.utcnow() + datetime.timedelta(minutes=YOUTUBE_BACKOFF_MINUTES)
+    _youtube_backoff_until = until
+    logger.warning(
+        f"YouTube rate-limit back-off activated — skipping all YouTube "
+        f"extractions until {until.strftime('%H:%M UTC')} "
+        f"({YOUTUBE_BACKOFF_MINUTES} min cooldown)."
+    )
+
+
+def is_youtube_backed_off() -> bool:
+    """Return True if we are currently in the YouTube rate-limit cooldown."""
+    global _youtube_backoff_until
+    if _youtube_backoff_until is None:
+        return False
+    if datetime.datetime.utcnow() < _youtube_backoff_until:
+        return True
+    # Cooldown expired — clear it
+    _youtube_backoff_until = None
+    logger.info("YouTube rate-limit back-off expired — resuming YouTube extractions.")
+    return False
+
+
+def activate_youtube_pause(minutes: int = YOUTUBE_BACKOFF_MINUTES) -> dict:
+    """
+    Manually activate the YouTube back-off for the given number of minutes.
+
+    Called by POST /resolve/youtube-pause from the web UI or command line.
+    Identical effect to a rate-limit error triggering _set_youtube_backoff(),
+    except the duration is configurable and the source is logged as "manual".
+    Returns the pause state dict so the caller can confirm.
+    """
+    global _youtube_backoff_until
+    until = datetime.datetime.utcnow() + datetime.timedelta(minutes=minutes)
+    _youtube_backoff_until = until
+    logger.warning(
+        f"YouTube back-off manually activated — all YouTube extractions "
+        f"paused until {until.strftime('%H:%M UTC')} ({minutes} min)."
+    )
+    return get_youtube_pause_state()
+
+
+def cancel_youtube_pause() -> dict:
+    """
+    Cancel an active YouTube back-off immediately.
+
+    Called by DELETE /resolve/youtube-pause from the web UI Resume button.
+    Returns the pause state dict (will show paused=False).
+    """
+    global _youtube_backoff_until
+    _youtube_backoff_until = None
+    logger.info("YouTube back-off manually cancelled — resuming YouTube extractions now.")
+    return get_youtube_pause_state()
+
+
+def get_youtube_pause_state() -> dict:
+    """
+    Return current pause state for /health and the web UI.
+
+    paused: bool — whether the back-off is currently active
+    minutes_remaining: int | None — minutes left (None if not paused)
+    until_utc: str | None — ISO timestamp when pause expires (None if not paused)
+    """
+    now = datetime.datetime.utcnow()
+    if _youtube_backoff_until is not None and now < _youtube_backoff_until:
+        remaining = int((_youtube_backoff_until - now).total_seconds() / 60) + 1
+        return {
+            "paused": True,
+            "minutes_remaining": remaining,
+            "until_utc": _youtube_backoff_until.isoformat() + "Z",
+        }
+    return {
+        "paused": False,
+        "minutes_remaining": None,
+        "until_utc": None,
+    }
+
+
+def _is_rate_limit_error(error_msg: Optional[str]) -> bool:
+    """Return True if an error message matches a known rate-limit pattern."""
+    if not error_msg:
+        return False
+    low = error_msg.lower()
+    for keyword in RATE_LIMIT_SAFEGUARD_KEYWORDS:
+        if keyword in low:
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# YouTube cookie-stale pause (Session 56).
+#
+# Distinct from the rate-limit back-off above. When the exported browser
+# cookies expire, YouTube stops returning rate-limit phrases and instead
+# rejects every request with a bot-check challenge:
+#
+#   ERROR: [youtube] <id>: Sign in to confirm you're not a bot. Use
+#   --cookies-from-browser or --cookies for the authentication. See
+#   https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp
+#
+# Left unhandled, this error is classed as a plain transient failure and the
+# video is marked "failed" — one dead entry per resolve, permanently polluting
+# the fail log until manually cleared. A single stale cookie can bury hundreds
+# of otherwise-good videos this way.
+#
+# This pause is a circuit-breaker: the FIRST bot-check rejection flips a
+# boolean that makes every background/play-time path skip YouTube extraction
+# entirely (leaving those videos pending, never failed, never deleted), while
+# Vimeo and local content keep resolving normally. Unlike the rate-limit
+# back-off there is NO timer — a stale cookie does not fix itself on a clock.
+# It clears in exactly two ways:
+#   1. Automatically, the moment any YouTube extraction succeeds again (the
+#      success branch of _record_youtube_result), i.e. right after you refresh
+#      cookies.txt and the warm pass lands its first good resolve.
+#   2. Manually, via DELETE /resolve/cookie-stale (the web UI Resume button).
+#
+# In-memory only: a restart clears it until the next bot-check rejection.
+# ---------------------------------------------------------------------------
+
+# Apostrophe-free anchors — the live log uses a curly apostrophe in "you're",
+# so we deliberately match only up to "you" and rely on the yt-dlp cookie
+# guidance phrases, which are ASCII-stable regardless of quote style.
+COOKIE_STALE_KEYWORDS = (
+    "sign in to confirm you",
+    "--cookies for the authentication",
+    "--cookies-from-browser",
+    "how-do-i-pass-cookies",
+)
+
+_youtube_cookie_stale_paused: bool = False
+
+
+def _is_cookie_stale_error(error_msg: Optional[str]) -> bool:
+    """Return True if an error message is a YouTube bot-check / stale-cookie rejection."""
+    if not error_msg:
+        return False
+    low = error_msg.lower()
+    for keyword in COOKIE_STALE_KEYWORDS:
+        if keyword in low:
+            return True
+    return False
+
+
+def _set_cookie_stale_pause() -> None:
+    """Flip the cookie-stale pause on. Called when a bot-check rejection is seen."""
+    global _youtube_cookie_stale_paused
+    if not _youtube_cookie_stale_paused:
+        _youtube_cookie_stale_paused = True
+        logger.warning(
+            "YouTube cookie-stale pause ACTIVATED — cookies appear expired. "
+            "Skipping all YouTube extractions (videos stay pending, not failed) "
+            "until a fresh cookie succeeds or the web UI Resume button is used."
+        )
+
+
+def _clear_cookie_stale_pause(reason: str = "manual") -> None:
+    """Flip the cookie-stale pause off. Called on first success or manual resume."""
+    global _youtube_cookie_stale_paused
+    if _youtube_cookie_stale_paused:
+        _youtube_cookie_stale_paused = False
+        logger.info(
+            f"YouTube cookie-stale pause CLEARED ({reason}) — resuming YouTube extractions."
+        )
+
+
+def is_cookie_stale_paused() -> bool:
+    """Return True if YouTube extraction is currently paused due to stale cookies."""
+    return _youtube_cookie_stale_paused
+
+
+def cancel_cookie_stale_pause() -> dict:
+    """
+    Manually clear the cookie-stale pause.
+
+    Called by DELETE /resolve/cookie-stale from the web UI Resume button.
+    Safe to call even if no pause is active. Returns the state dict.
+    """
+    _clear_cookie_stale_pause(reason="manual resume")
+    return get_cookie_stale_state()
+
+
+def get_cookie_stale_state() -> dict:
+    """Return the current cookie-stale pause state for /health and the web UI."""
+    return {"cookie_stale_paused": _youtube_cookie_stale_paused}
+
+
+# ---------------------------------------------------------------------------
+# YouTube background-resolve switch (Session 56).
+#
+# The reason cookies keep dying is VOLUME: with ~12,000+ pending YouTube videos
+# and resolved URLs that expire in ~3 hours, the background resolve/warm passes
+# hammer YouTube thousands of times a day from one IP + one cookie — a textbook
+# automated-scraper pattern that YouTube responds to by killing the session.
+#
+# Since YouTube resolved URLs go stale within hours anyway, bulk pre-resolving
+# them is mostly wasted cookie-burn. This switch turns OFF all *background*
+# YouTube extraction (the scheduled pending pass and the TV warm pass), so the
+# cookie is only ever touched when a video is actually PLAYED.
+#
+# Deliberately does NOT affect:
+#   - Vimeo / local content — they don't use the cookie and pre-resolve as before.
+#   - resolve_video() / resolve_video_for_tv() — the on-demand PLAY-TIME paths.
+#     Pressing play on a YouTube video still resolves it live. This switch only
+#     stops the *speculative* background grind, not on-play resolution.
+#
+# Default: DISABLED (background YouTube resolve OFF). Flip to True — or wire the
+# planned Settings-page toggle to set_youtube_background_resolve(True) — to turn
+# the background passes back on (e.g. once ffmpeg remux-on-play lands and makes
+# a fuller YouTube catalog worthwhile).
+#
+# In-memory only, like the pauses above: a restart returns to this default.
+# ---------------------------------------------------------------------------
+_youtube_background_resolve_enabled: bool = False
+
+
+def is_youtube_background_resolve_enabled() -> bool:
+    """
+    Return True if background (scheduled/warm) YouTube extraction is allowed.
+
+    The single source of truth checked by resolve_batch() and warm_tv_cache().
+    Play-time paths do NOT check this — pressing play always resolves.
+    """
+    return _youtube_background_resolve_enabled
+
+
+def set_youtube_background_resolve(enabled: bool) -> dict:
+    """
+    Enable or disable background YouTube extraction.
+
+    Intended for a future Settings-page toggle (GET/POST endpoint). Returns the
+    state dict so the caller can confirm.
+    """
+    global _youtube_background_resolve_enabled
+    _youtube_background_resolve_enabled = bool(enabled)
+    logger.info(
+        f"YouTube background resolve {'ENABLED' if enabled else 'DISABLED'} "
+        f"— scheduled pending pass and TV warm pass will "
+        f"{'process' if enabled else 'skip'} YouTube videos."
+    )
+    return get_youtube_background_resolve_state()
+
+
+def get_youtube_background_resolve_state() -> dict:
+    """Return the current background-resolve switch state for /health and the web UI."""
+    return {"youtube_background_resolve_enabled": _youtube_background_resolve_enabled}
+
 
 def _is_youtube_source(url: Optional[str]) -> bool:
     u = url or ""
@@ -99,10 +372,13 @@ def _is_youtube_source(url: Optional[str]) -> bool:
 
 def _record_youtube_result(source_url: Optional[str], error_msg: Optional[str]) -> None:
     """
-    Record the outcome of a yt-dlp extraction for cookie-health tracking.
+    Record the outcome of a yt-dlp extraction for cookie-health tracking
+    and rate-limit back-off.
+
     Call with error_msg=None on success. Non-YouTube sources are ignored;
-    non-bot-check errors (dead videos, timeouts) don't touch the status —
-    they say nothing about cookies.
+    non-bot-check errors (dead videos, timeouts) don't touch the cookie
+    status — they say nothing about cookies. Rate-limit errors trigger
+    the back-off regardless of bot-check status.
     """
     if not _is_youtube_source(source_url):
         return
@@ -110,7 +386,17 @@ def _record_youtube_result(source_url: Optional[str], error_msg: Optional[str]) 
     if error_msg is None:
         _youtube_cookie_status["last_success"] = now
         _youtube_cookie_status["bot_error_count"] = 0
+        # A successful YouTube extraction means the cookie is good again —
+        # auto-clear the cookie-stale pause (self-healing after a refresh).
+        _clear_cookie_stale_pause(reason="successful YouTube resolve")
         return
+    # Rate-limit errors activate the back-off cooldown (separate from cookie health).
+    if _is_rate_limit_error(error_msg):
+        _set_youtube_backoff()
+    # Bot-check / stale-cookie rejection: activate the cookie-stale pause so the
+    # scheduler stops feeding YouTube videos into the "failed" bucket.
+    if _is_cookie_stale_error(error_msg):
+        _set_cookie_stale_pause()
     low = error_msg.lower()
     if any(sig in low for sig in _BOT_CHECK_SIGNATURES):
         _youtube_cookie_status["last_bot_error"] = now
@@ -123,7 +409,12 @@ def _record_youtube_result(source_url: Optional[str], error_msg: Optional[str]) 
 
 
 def get_youtube_cookie_status() -> dict:
-    """Cookie health summary for /health. state: 'ok' | 'stale' | 'unknown'."""
+    """
+    Cookie health + pause state summary for /health.
+    state: 'ok' | 'stale' | 'unknown'
+    Also includes the current pause state so the web UI gets everything
+    in one call.
+    """
     s = _youtube_cookie_status
     if s["last_success"] is None and s["last_bot_error"] is None:
         state = "unknown"
@@ -133,12 +424,16 @@ def get_youtube_cookie_status() -> dict:
         state = "stale"
     else:
         state = "ok"
-    return {
+    result = {
         "state": state,
         "last_success": s["last_success"].isoformat() + "Z" if s["last_success"] else None,
         "last_bot_error": s["last_bot_error"].isoformat() + "Z" if s["last_bot_error"] else None,
         "bot_error_count": s["bot_error_count"],
     }
+    result.update(get_youtube_pause_state())
+    result.update(get_cookie_stale_state())
+    result.update(get_youtube_background_resolve_state())
+    return result
 
 # Hard wall-clock timeout for a single yt-dlp extraction call.
 # If yt-dlp hasn't returned within this many seconds, the subprocess is killed
@@ -146,9 +441,11 @@ def get_youtube_cookie_status() -> dict:
 # video from blocking the entire batch queue for minutes.
 YTDLP_TIMEOUT_SECONDS = 90
 
-# Reusable process pool for yt-dlp calls — one worker per call, capped at 4
-# concurrent extractions to avoid hammering platforms.
-_process_pool = concurrent.futures.ProcessPoolExecutor(max_workers=4)
+# Reusable process pool for yt-dlp calls — capped at 2 concurrent extractions.
+# Was 4; reduced in Session 54 to avoid triggering YouTube rate limits.
+# 2 workers means at most 2 simultaneous yt-dlp processes hitting YouTube,
+# which combined with the inter-request sleep keeps us well under the limit.
+_process_pool = concurrent.futures.ProcessPoolExecutor(max_workers=2)
 
 FORMAT_SELECTOR = (
     # Prefer combined mp4 streams (video+audio) up to 1080p
@@ -668,6 +965,28 @@ class ResolverService:
             return None
 
         else:
+            # Rate-limit errors: leave the video as pending (or resolved if it
+            # was previously resolved) so the scheduler retries it after the
+            # back-off expires. Marking it failed would remove it from the
+            # pending queue permanently — it would never be retried.
+            if _is_rate_limit_error(error_msg):
+                logger.warning(
+                    f"Rate-limit error for video {video_id} — "
+                    f"leaving status unchanged so it retries after back-off. "
+                    f"Error: {error_msg[:200]}"
+                )
+                return None
+            # Stale-cookie (bot-check) errors: leave the video pending, exactly
+            # like rate-limit. Marking it failed would bury a good video in the
+            # fail log over an expired cookie. The pause was already activated by
+            # _record_youtube_result; the video retries once cookies are refreshed.
+            if _is_cookie_stale_error(error_msg):
+                logger.warning(
+                    f"Stale-cookie error for video {video_id} — "
+                    f"leaving status pending so it retries after cookie refresh. "
+                    f"Error: {error_msg[:200]}"
+                )
+                return None
             video.resolution_status = "failed"
             video.resolved_at = datetime.datetime.utcnow()
             video.resolution_error = error_msg or "Unknown error"
@@ -831,7 +1150,9 @@ class ResolverService:
             "thumbnail_url": video.thumbnail_url,
         }
 
-    async def resolve_video_for_tv(self, video_id: int) -> Optional[dict]:
+    async def resolve_video_for_tv(
+        self, video_id: int, allow_cookie_probe: bool = False
+    ) -> Optional[dict]:
         """
         TV-specific resolution that returns both video_url and audio_url separately.
 
@@ -844,6 +1165,11 @@ class ResolverService:
         playback request collide on the same video), only ONE yt-dlp
         extraction runs; every other caller waits, then reads the freshly
         cached result — no duplicate yt-dlp processes.
+
+        allow_cookie_probe: when True, bypass ONLY the stale-cookie skip guard
+        (never the rate-limit back-off, which is a real ban). Used by the
+        warm_tv_cache probe so a single YouTube extraction can test whether
+        refreshed cookies now work — a success auto-clears the pause.
 
         Returns a dict with stream_url (video), audio_url (audio, may be None
         for combined streams), and the usual metadata fields.
@@ -864,6 +1190,20 @@ class ResolverService:
         cached = self._tv_cache_result(video)
         if cached is not None:
             return cached
+
+        # Back-off guard: if YouTube has rate-limited us, don't make things worse
+        # by poking it again at play time. Return None (→ 502) and let the cache
+        # warm up once the cooldown expires, rather than extending the ban.
+        _cookie_stale_block = is_cookie_stale_paused() and not allow_cookie_probe
+        if _is_youtube_source(video.source_url) and (
+            is_youtube_backed_off() or _cookie_stale_block
+        ):
+            reason = "rate-limit back-off" if is_youtube_backed_off() else "stale-cookie pause"
+            logger.warning(
+                f"TV resolve: YouTube {reason} active — skipping extraction "
+                f"for video {video_id} '{(video.title or '')[:50]}'"
+            )
+            return None
 
         # Cache miss — serialize extraction per video ID so concurrent
         # requests (TiviMate retries, warm job collisions) never spawn
@@ -954,6 +1294,22 @@ class ResolverService:
                 logger.warning(f"TV resolve: video {video_id} permanently gone — {error_msg}")
                 await self._delete_video(video)
                 await self._db.commit()
+            elif _is_rate_limit_error(error_msg):
+                # Rate-limit: don't touch the video's status. Leave it for retry
+                # after the back-off expires. Back-off was already activated by
+                # _record_youtube_result above.
+                logger.warning(
+                    f"TV resolve: rate-limit error for video {video_id} — "
+                    f"leaving status unchanged for retry after back-off."
+                )
+            elif _is_cookie_stale_error(error_msg):
+                # Stale cookie: leave status unchanged for retry after refresh.
+                # The cookie-stale pause was already activated by
+                # _record_youtube_result above.
+                logger.warning(
+                    f"TV resolve: stale-cookie error for video {video_id} — "
+                    f"leaving status unchanged for retry after cookie refresh."
+                )
             else:
                 logger.warning(f"TV resolve: transient error for video {video_id}: {error_msg}")
             return None
@@ -1038,10 +1394,31 @@ class ResolverService:
         videos = result.scalars().all()
 
         all_videos = list(videos)
-        summary = {"total": len(all_videos), "resolved": 0, "failed": 0, "deleted": 0}
+        summary = {"total": len(all_videos), "resolved": 0, "failed": 0, "deleted": 0, "skipped_backoff": 0, "skipped_cookie_stale": 0, "skipped_youtube_bg": 0}
 
         for video in all_videos:
             video_id = video.id
+            is_yt = _is_youtube_source(video.source_url)
+
+            # Background YouTube resolve switch: when disabled (the default),
+            # skip YouTube videos entirely in this background pass — they stay
+            # pending and resolve on demand when actually played. Cookie-saver.
+            if is_yt and not is_youtube_background_resolve_enabled():
+                summary["skipped_youtube_bg"] += 1
+                continue
+
+            # During YouTube back-off, skip YouTube videos without touching their
+            # status — they stay pending and will be picked up after cooldown lifts.
+            if is_yt and is_youtube_backed_off():
+                summary["skipped_backoff"] += 1
+                continue
+
+            # During the cookie-stale pause, skip YouTube videos the same way —
+            # they stay pending (not failed) until cookies are refreshed.
+            if is_yt and is_cookie_stale_paused():
+                summary["skipped_cookie_stale"] += 1
+                continue
+
             result = await self.resolve_video(video_id, force=True)
             if result is not None:
                 summary["resolved"] += 1
@@ -1051,11 +1428,21 @@ class ResolverService:
                     summary["deleted"] += 1
                 else:
                     summary["failed"] += 1
-            await asyncio.sleep(1.0)
+
+            # Polite inter-request delay. YouTube needs a longer pause to avoid
+            # re-triggering rate limits; Vimeo/other sources use a short pause.
+            if is_yt:
+                import random
+                await asyncio.sleep(random.uniform(6.0, 10.0))
+            else:
+                await asyncio.sleep(1.0)
 
         logger.info(
             f"Batch resolve complete: {summary['resolved']} resolved, "
-            f"{summary['failed']} failed, {summary['deleted']} deleted "
+            f"{summary['failed']} failed, {summary['deleted']} deleted, "
+            f"{summary['skipped_backoff']} skipped (back-off), "
+            f"{summary['skipped_cookie_stale']} skipped (cookie-stale), "
+            f"{summary['skipped_youtube_bg']} skipped (yt-bg-off) "
             f"out of {summary['total']}"
         )
         return summary
@@ -1114,11 +1501,52 @@ class ResolverService:
         result = await self._db.execute(stmt)
         videos = result.scalars().all()
 
-        summary = {"total": len(videos), "warmed": 0, "failed": 0, "deleted": 0}
+        summary = {"total": len(videos), "warmed": 0, "failed": 0, "deleted": 0, "skipped_backoff": 0, "skipped_cookie_stale": 0, "skipped_youtube_bg": 0}
+
+        # When the cookie-stale pause is active, allow exactly ONE YouTube probe
+        # per warm run so a freshly-refreshed cookie can self-heal: a successful
+        # extraction auto-clears the pause (via _record_youtube_result) and the
+        # rest of the loop then proceeds normally. If the probe still fails, the
+        # pause is re-set and all remaining YouTube videos skip. This is what
+        # makes "auto-clear on first successful YouTube resolve" work without a
+        # manual button press, while never re-flooding YouTube during an outage.
+        cookie_probe_used = False
 
         for video in videos:
             video_id = video.id
-            result = await self.resolve_video_for_tv(video_id)
+            is_yt = _is_youtube_source(video.source_url)
+
+            # Background YouTube resolve switch: when disabled (the default),
+            # skip YouTube videos entirely in the warm pass too. YouTube still
+            # resolves on demand at play time via resolve_video_for_tv(); this
+            # only stops speculative background warming. Checked first so it
+            # also suppresses the cookie-stale probe (no background YouTube work
+            # of any kind while the switch is off).
+            if is_yt and not is_youtube_background_resolve_enabled():
+                summary["skipped_youtube_bg"] += 1
+                continue
+
+            # During YouTube back-off, skip YouTube videos — they stay in their
+            # current status and warm_tv_cache will pick them up after cooldown.
+            if is_yt and is_youtube_backed_off():
+                summary["skipped_backoff"] += 1
+                continue
+
+            # During the cookie-stale pause, skip YouTube videos — except allow
+            # a single probe (the first one) so a refreshed cookie can clear it.
+            probe_this = False
+            if is_yt and is_cookie_stale_paused():
+                if cookie_probe_used:
+                    summary["skipped_cookie_stale"] += 1
+                    continue
+                cookie_probe_used = True
+                probe_this = True
+                logger.info(
+                    f"TV cache warm: cookie-stale pause active — probing video "
+                    f"{video_id} to test whether cookies have been refreshed."
+                )
+
+            result = await self.resolve_video_for_tv(video_id, allow_cookie_probe=probe_this)
             if result is not None:
                 summary["warmed"] += 1
             else:
@@ -1127,11 +1555,20 @@ class ResolverService:
                     summary["deleted"] += 1
                 else:
                     summary["failed"] += 1
-            await asyncio.sleep(1.0)
+
+            # Polite inter-request delay — YouTube needs a longer gap.
+            if is_yt:
+                import random
+                await asyncio.sleep(random.uniform(6.0, 10.0))
+            else:
+                await asyncio.sleep(1.0)
 
         logger.info(
             f"TV cache warm complete: {summary['warmed']} warmed, "
-            f"{summary['failed']} failed, {summary['deleted']} deleted "
+            f"{summary['failed']} failed, {summary['deleted']} deleted, "
+            f"{summary['skipped_backoff']} skipped (back-off), "
+            f"{summary['skipped_cookie_stale']} skipped (cookie-stale), "
+            f"{summary['skipped_youtube_bg']} skipped (yt-bg-off) "
             f"out of {summary['total']}"
         )
         return summary

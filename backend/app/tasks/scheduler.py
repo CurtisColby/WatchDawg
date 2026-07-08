@@ -128,12 +128,21 @@ async def scheduled_resolve():
 
     Two-pass strategy:
     1. Pending pass  — resolve new pending videos (up to SCHEDULED_PENDING_LIMIT).
-    2. Expired pass  — re-resolve 'resolved' videos whose cached stream URL is stale.
-    3. DASH purge    — auto-purge any DASH-only videos that slipped through.
+    2. DASH purge    — auto-purge any DASH-only videos that slipped through.
+
+    NOTE (Session 56): the old "expired pass" (resolver.resolve_expired) was
+    removed. That method no longer exists on ResolverService — it was replaced
+    by warm_tv_cache() during an earlier refactor, but the call site here was
+    never updated. It threw AttributeError every tick, which the except block
+    below caught and ROLLED BACK — discarding Pass 1's committed work along with
+    it. That silent rollback was starving Vimeo background resolving. Removing
+    the dead pass lets Pass 1 (pending) actually commit. Stale-CDN-URL refresh
+    is a separate future task (Vimeo HLS tokens expire ~20 min and warrant a
+    dedicated re-resolver, not this general pass).
     """
     logger.info(
         f"Scheduled batch resolve starting "
-        f"(pending limit={SCHEDULED_PENDING_LIMIT}, expired limit={SCHEDULED_EXPIRED_LIMIT})..."
+        f"(pending limit={SCHEDULED_PENDING_LIMIT})..."
     )
     async with async_session_factory() as db:
         try:
@@ -143,11 +152,7 @@ async def scheduled_resolve():
             summary = await resolver.resolve_batch(limit=SCHEDULED_PENDING_LIMIT)
             logger.info(f"Scheduled resolve (pending pass): {summary}")
 
-            # Pass 2: expired resolved videos — re-resolve stale CDN URLs
-            expired_summary = await resolver.resolve_expired(limit=SCHEDULED_EXPIRED_LIMIT)
-            logger.info(f"Scheduled resolve (expired pass): {expired_summary}")
-
-            # Pass 3: purge any DASH-only videos that slipped through.
+            # Pass 2: purge any DASH-only videos that slipped through.
             dash_purged = await resolver.purge_dash_videos()
             if dash_purged:
                 logger.info(f"Scheduled resolve (DASH purge): {dash_purged} DASH-only videos removed")
@@ -375,7 +380,6 @@ def start_scheduler():
         f"Background scheduler started. "
         f"Scrape/resolve interval: {interval_minutes} minutes. "
         f"Pending resolve limit: {SCHEDULED_PENDING_LIMIT}/tick. "
-        f"Expired resolve limit: {SCHEDULED_EXPIRED_LIMIT}/tick. "
         f"Dedup sweep interval: {DEDUP_INTERVAL_HOURS} hours. "
         f"Quality upgrade interval: {QUALITY_UPGRADE_INTERVAL_HOURS} hours "
         f"(chunk={QUALITY_UPGRADE_CHUNK_SIZE}, min={QUALITY_UPGRADE_MIN_HEIGHT}p). "

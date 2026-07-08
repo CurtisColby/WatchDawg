@@ -324,6 +324,10 @@ h2{font-size:16px;margin:26px 0 12px;color:var(--accent2)}
       <button class="btn small" id="yt-pause-btn" data-tip="Stop the backend from making any YouTube requests for 70 minutes. Use this when YouTube has rate-limited you to let the ban expire without making it worse.">⏸ Pause YouTube (1 hr)</button>
       <span id="yt-pause-status" class="muted" style="font-size:13px"></span>
     </div>
+    <div class="row" id="cookie-stale-row" style="display:none;margin-bottom:12px;gap:10px;align-items:center;flex-wrap:wrap" data-tip="Set automatically the moment YouTube rejects a request because the cookies expired. While active, YouTube videos are left alone (kept pending, not marked failed) so the fail log doesn't fill up. Clears itself once a refreshed cookie works, or use this button after refreshing.">
+      <span class="muted" id="cookie-stale-txt" style="font-size:13px">⚠️ YouTube resolves auto-paused — cookies are stale. Refresh cookies.txt below, then this clears itself on the next successful lookup.</span>
+      <button class="btn small danger" id="cookie-stale-resume-btn">▶ Resume YouTube resolves</button>
+    </div>
     <div class="muted" style="margin-bottom:6px"><b>Why:</b> YouTube expires exported browser cookies every few weeks. When that happens, YouTube videos get stuck resolving or won't play, and the status above turns red. Refreshing takes two minutes:</div>
     <ol class="muted" style="margin:0 0 8px 18px;line-height:1.8">
       <li>On a computer where you're <b>logged into YouTube</b>, go to <b>youtube.com</b> and export cookies with a cookie-export browser extension (Netscape format — e.g. “Get cookies.txt LOCALLY”). Export while on the YouTube tab.</li>
@@ -506,6 +510,11 @@ function updateYtPause(c){
     btn.textContent = "⏸ Pause YouTube (1 hr)";
     btn.classList.remove("danger");
     statusTxt.textContent = "";
+  }
+  // Cookie-stale auto-pause row — shown only while the pause is active.
+  const staleRow = $("#cookie-stale-row");
+  if (staleRow){
+    staleRow.style.display = (c && c.cookie_stale_paused) ? "flex" : "none";
   }
 }
 async function refreshHealth(){
@@ -1060,6 +1069,20 @@ $("#yt-pause-btn").onclick = async function(){
   }
   this.disabled = false;
 };
+const cookieStaleResumeBtn = $("#cookie-stale-resume-btn");
+if (cookieStaleResumeBtn){
+  cookieStaleResumeBtn.onclick = async function(){
+    this.disabled = true;
+    try {
+      await api("/resolve/cookie-stale", {method:"DELETE"});
+      toast("Cookie-stale pause cleared — YouTube resolves resumed.", "ok");
+      await refreshHealth();
+    } catch(e) {
+      toast("Could not clear the cookie-stale pause.", "bad");
+    }
+    this.disabled = false;
+  };
+}
 async function refreshSkipCount(){
   try{ const r = await api("/skip/count", {}, true); $("#skip-count").textContent = r.skip_list_count != null ? r.skip_list_count : "?"; }catch(e){ $("#skip-count").textContent = "?"; }
 }
