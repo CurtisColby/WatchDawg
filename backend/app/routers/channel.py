@@ -1397,6 +1397,153 @@ async def export_all_channels_live_m3u(
     )
 
 
+# ---------------------------------------------------------------------------
+# Public / Private split M3U exports — Session 55
+#
+# Two additional playlists that split the catalog by the channel-level `locked`
+# flag, so the public (unlocked) and private (PIN-locked) content can be added
+# to TiviMate (or OwnTV) as separate playlists instead of the all-in-one
+# /channel/all/live.m3u.
+#
+#   Public  → channels where enabled AND NOT locked
+#   Private → channels where enabled AND locked
+#
+# Strict split: a channel appears in exactly one of the two playlists, never
+# both. The original /all/live.m3u is left untouched and still serves
+# everything.
+#
+# Unlike /all/live.m3u (which serves any non-failed video), these two only
+# serve videos that are actually playable right now:
+#   resolution_status == "resolved"  OR  source_provider == "local_folder"
+# so scraped-but-unresolved (pending) and failed videos are skipped. This
+# matches the Session 52 Xtream catalog filter.
+#
+# ROUTE ORDER: these literal paths must stay ABOVE /{channel_id}/live.m3u so
+# FastAPI matches "public"/"private" as literals, not as an int channel_id.
+# ---------------------------------------------------------------------------
+
+@router.get("/public/live.m3u", response_class=Response)
+async def export_public_channels_live_m3u(
+    db: AsyncSession = Depends(get_db_session),
+):
+    """
+    Export all playable videos from enabled, UNLOCKED channels as one combined
+    live M3U playlist (the public stream). group-title driven by genre_tags or
+    category. Only resolved (or local-folder) videos are served — pending and
+    failed videos are skipped. Videos shuffled randomly in Python on every fetch.
+    Add http://192.168.50.42:6868/channel/public/live.m3u to TiviMate.
+    """
+    base_url = "http://192.168.50.42:6868"
+
+    ch_stmt = (
+        select(Channel)
+        .where(Channel.enabled == True, Channel.locked == False)
+        .order_by(Channel.name)
+    )
+    ch_result = await db.execute(ch_stmt)
+    channels = ch_result.scalars().all()
+
+    lines = ["#EXTM3U"]
+    for channel in channels:
+        group = _m3u_group_for_channel(channel)
+
+        video_stmt = (
+            select(Video)
+            .where(
+                Video.channel_id == channel.id,
+                Video.source_url.isnot(None),
+                Video.source_url != "",
+                (
+                    (Video.resolution_status == "resolved")
+                    | (Video.source_provider == "local_folder")
+                ),
+            )
+            .order_by(Video.created_at.desc())
+        )
+        video_result = await db.execute(video_stmt)
+        videos = list(video_result.scalars().all())
+        random.shuffle(videos)
+
+        for v in videos:
+            duration = v.duration_seconds or -1
+            title = (v.title or "Untitled").replace(",", " ")
+            logo = v.thumbnail_url or ""
+            stream_url = f"{base_url}/channel/stream/{v.id}"
+            lines.append(
+                f'#EXTINF:{duration} tvg-name="{title}" tvg-logo="{logo}" '
+                f'group-title="{group}",{title}'
+            )
+            lines.append(stream_url)
+
+    content_str = "\n".join(lines)
+    return Response(
+        content=content_str,
+        media_type="application/x-mpegurl",
+        headers={"Content-Disposition": 'inline; filename="watchdawg_public.m3u"'},
+    )
+
+
+@router.get("/private/live.m3u", response_class=Response)
+async def export_private_channels_live_m3u(
+    db: AsyncSession = Depends(get_db_session),
+):
+    """
+    Export all playable videos from enabled, LOCKED channels as one combined
+    live M3U playlist (the private stream). group-title driven by genre_tags or
+    category. Only resolved (or local-folder) videos are served — pending and
+    failed videos are skipped. Videos shuffled randomly in Python on every fetch.
+    Add http://192.168.50.42:6868/channel/private/live.m3u to TiviMate.
+    """
+    base_url = "http://192.168.50.42:6868"
+
+    ch_stmt = (
+        select(Channel)
+        .where(Channel.enabled == True, Channel.locked == True)
+        .order_by(Channel.name)
+    )
+    ch_result = await db.execute(ch_stmt)
+    channels = ch_result.scalars().all()
+
+    lines = ["#EXTM3U"]
+    for channel in channels:
+        group = _m3u_group_for_channel(channel)
+
+        video_stmt = (
+            select(Video)
+            .where(
+                Video.channel_id == channel.id,
+                Video.source_url.isnot(None),
+                Video.source_url != "",
+                (
+                    (Video.resolution_status == "resolved")
+                    | (Video.source_provider == "local_folder")
+                ),
+            )
+            .order_by(Video.created_at.desc())
+        )
+        video_result = await db.execute(video_stmt)
+        videos = list(video_result.scalars().all())
+        random.shuffle(videos)
+
+        for v in videos:
+            duration = v.duration_seconds or -1
+            title = (v.title or "Untitled").replace(",", " ")
+            logo = v.thumbnail_url or ""
+            stream_url = f"{base_url}/channel/stream/{v.id}"
+            lines.append(
+                f'#EXTINF:{duration} tvg-name="{title}" tvg-logo="{logo}" '
+                f'group-title="{group}",{title}'
+            )
+            lines.append(stream_url)
+
+    content_str = "\n".join(lines)
+    return Response(
+        content=content_str,
+        media_type="application/x-mpegurl",
+        headers={"Content-Disposition": 'inline; filename="watchdawg_private.m3u"'},
+    )
+
+
 @router.get("/stream/{video_id}", response_class=Response)
 async def stream_video_redirect(
     video_id: int,

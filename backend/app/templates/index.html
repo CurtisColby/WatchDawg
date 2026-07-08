@@ -320,6 +320,10 @@ h2{font-size:16px;margin:26px 0 12px;color:var(--accent2)}
     <div class="row" style="margin-bottom:10px" data-tip="Live status, updated automatically. Green = the last YouTube lookup worked. Red = YouTube is rejecting requests and the cookies below need refreshing.">
       <span class="dot" id="cookie-dot"></span><span id="cookie-status-txt" class="muted">Checking…</span>
     </div>
+    <div class="row" style="margin-bottom:12px;gap:10px;align-items:center">
+      <button class="btn small" id="yt-pause-btn" data-tip="Stop the backend from making any YouTube requests for 70 minutes. Use this when YouTube has rate-limited you to let the ban expire without making it worse.">⏸ Pause YouTube (1 hr)</button>
+      <span id="yt-pause-status" class="muted" style="font-size:13px"></span>
+    </div>
     <div class="muted" style="margin-bottom:6px"><b>Why:</b> YouTube expires exported browser cookies every few weeks. When that happens, YouTube videos get stuck resolving or won't play, and the status above turns red. Refreshing takes two minutes:</div>
     <ol class="muted" style="margin:0 0 8px 18px;line-height:1.8">
       <li>On a computer where you're <b>logged into YouTube</b>, go to <b>youtube.com</b> and export cookies with a cookie-export browser extension (Netscape format — e.g. “Get cookies.txt LOCALLY”). Export while on the YouTube tab.</li>
@@ -474,6 +478,7 @@ function updateCookieStatus(c){
   // Returns true when cookies are stale (so the sidebar can flag it too).
   const dot = $("#cookie-dot"), txt = $("#cookie-status-txt");
   if (!dot || !txt) return false;
+  updateYtPause(c);
   if (!c || c.state === "unknown"){
     dot.className = "dot";
     txt.textContent = "No YouTube activity since the server started — status appears after the next YouTube resolve (usually within one scheduler tick).";
@@ -488,6 +493,20 @@ function updateCookieStatus(c){
   const since = c.last_bot_error ? new Date(c.last_bot_error).toLocaleString([], {month:"short", day:"numeric", hour:"numeric", minute:"2-digit"}) : "recently";
   txt.textContent = "⚠️ YouTube is rejecting requests — refresh your cookies using the steps below. Failing since " + since + " (" + (c.bot_error_count||0) + " failure" + (c.bot_error_count===1?"":"s") + ").";
   return true;
+}
+function updateYtPause(c){
+  // Update pause button label + countdown from health data.
+  const btn = $("#yt-pause-btn"), statusTxt = $("#yt-pause-status");
+  if (!btn) return;
+  if (c && c.paused){
+    btn.textContent = "▶ Resume Now";
+    btn.classList.add("danger");
+    statusTxt.textContent = "⏸ Paused — resumes in " + (c.minutes_remaining||1) + " min";
+  } else {
+    btn.textContent = "⏸ Pause YouTube (1 hr)";
+    btn.classList.remove("danger");
+    statusTxt.textContent = "";
+  }
 }
 async function refreshHealth(){
   try{
@@ -1021,6 +1040,26 @@ window.removeFav = async (id)=>{
 
 /* ---------------- SETTINGS page ---------------- */
 $("#health-refresh").onclick = refreshHealth;
+$("#yt-pause-btn").onclick = async function(){
+  const isPaused = this.textContent.trim().startsWith("▶");
+  this.disabled = true;
+  try {
+    if (isPaused) {
+      // Cancel the pause
+      const r = await api("/resolve/youtube-pause", {method:"DELETE"});
+      toast("YouTube extractions resumed.", "ok");
+      updateYtPause(r);
+    } else {
+      // Activate the pause
+      const r = await api("/resolve/youtube-pause", {method:"POST"});
+      toast("YouTube paused for 70 minutes — the backend won't touch YouTube until the timer expires.", "ok");
+      updateYtPause(r);
+    }
+  } catch(e) {
+    toast("Could not update YouTube pause state.", "bad");
+  }
+  this.disabled = false;
+};
 async function refreshSkipCount(){
   try{ const r = await api("/skip/count", {}, true); $("#skip-count").textContent = r.skip_list_count != null ? r.skip_list_count : "?"; }catch(e){ $("#skip-count").textContent = "?"; }
 }
