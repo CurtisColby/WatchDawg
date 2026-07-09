@@ -1651,8 +1651,99 @@ async def stream_video_redirect(
         from fastapi.responses import RedirectResponse
         return RedirectResponse(url=proxy_url, status_code=302)
 
-    # Split MP4 (non-HLS, e.g. YouTube): DASH manifest merges both tracks.
+    # Split MP4 (non-HLS, e.g. YouTube): route by source.
+    #
+    # YouTube: DASH manifests are unplayable by OwnTV/ExoPlayer and TiviMate.
+    # Instead, run yt-dlp to download both streams and remux them into a
+    # combined MP4 via ffmpeg (-c copy, no transcode), then stream the file
+    # to the client. This is the ffmpeg remux-on-play path (Session 57).
+    #
+    # Non-YouTube split MP4: keep the existing DASH manifest path (untested
+    # but preserved for safety).
     if audio_url and not _is_hls_stream(audio_url):
+        is_youtube = (
+            "youtube.com" in (video.source_url or "")
+            or "youtu.be" in (video.source_url or "")
+        )
+
+        if is_youtube:
+            import os
+            from fastapi.responses import FileResponse
+            from starlette.background import BackgroundTask
+
+            tmp_path = f"/tmp/remux_{video_id}_{int(datetime.datetime.utcnow().timestamp())}.mp4"
+            logger.info(
+                f"STREAM REMUX | video {video_id} — "
+                f"starting yt-dlp download + ffmpeg merge for YouTube split stream"
+            )
+
+            try:
+                proc = await _asyncio.create_subprocess_exec(
+                    "yt-dlp",
+                    "--cookies", "/config/cookies.txt",
+                    "-f", "bestvideo[vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo+bestaudio",
+                    "--merge-output-format", "mp4",
+                    "--no-part",
+                    "-o", tmp_path,
+                    video.source_url,
+                    stdout=_asyncio.subprocess.PIPE,
+                    stderr=_asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await _asyncio.wait_for(
+                    proc.communicate(), timeout=300
+                )
+
+                if proc.returncode != 0 or not os.path.exists(tmp_path):
+                    error_output = (stderr or b"").decode()[:500]
+                    logger.error(
+                        f"STREAM REMUX | video {video_id} — yt-dlp failed "
+                        f"(exit={proc.returncode}): {error_output}"
+                    )
+                    # Clean up any partial file
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+                    raise HTTPException(
+                        status_code=502,
+                        detail=f"YouTube remux failed for video {video_id}",
+                    )
+
+                file_size = os.path.getsize(tmp_path)
+                logger.info(
+                    f"STREAM REMUX | video {video_id} — merge complete "
+                    f"({file_size / 1024 / 1024:.1f} MB), streaming to client"
+                )
+
+                def _cleanup_remux():
+                    try:
+                        os.unlink(tmp_path)
+                        logger.debug(f"STREAM REMUX | video {video_id} — temp file cleaned up")
+                    except OSError:
+                        pass
+
+                return FileResponse(
+                    path=tmp_path,
+                    media_type="video/mp4",
+                    filename=f"watchdawg_{video_id}.mp4",
+                    background=BackgroundTask(_cleanup_remux),
+                )
+
+            except _asyncio.TimeoutError:
+                logger.error(
+                    f"STREAM REMUX | video {video_id} — "
+                    f"yt-dlp timed out after 300s"
+                )
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise HTTPException(
+                    status_code=504,
+                    detail=f"YouTube remux timed out for video {video_id}",
+                )
+
+        # Non-YouTube split MP4: DASH manifest (existing behavior)
         manifest_url = f"{base_url}/resolve/{video_id}/manifest.mpd"
         logger.info(f"STREAM REDIRECT | video {video_id} — split MP4 → DASH manifest")
         from fastapi.responses import RedirectResponse

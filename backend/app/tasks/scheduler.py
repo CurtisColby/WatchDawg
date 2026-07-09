@@ -320,7 +320,7 @@ def start_scheduler():
         id="scrape_job",
         name="Channel Scrape (All)",
         replace_existing=True,
-        next_run_time=None,  # Don't run immediately on startup
+        next_run_time=datetime.datetime.now(),
     )
 
     # Resolve job — runs on the same interval
@@ -330,7 +330,7 @@ def start_scheduler():
         id="resolve_job",
         name="Batch Resolve",
         replace_existing=True,
-        next_run_time=None,
+        next_run_time=datetime.datetime.now(),
     )
 
     # Dedup sweep — runs every DEDUP_INTERVAL_HOURS
@@ -340,7 +340,7 @@ def start_scheduler():
         id="dedup_job",
         name="CDN Duplicate Sweep",
         replace_existing=True,
-        next_run_time=None,
+        next_run_time=datetime.datetime.now(),
     )
 
     # Quality upgrade job
@@ -350,7 +350,7 @@ def start_scheduler():
         id="quality_upgrade_job",
         name="Quality Upgrade (Low-Res Re-resolve)",
         replace_existing=True,
-        next_run_time=None,
+        next_run_time=datetime.datetime.now(),
     )
 
     # Live TV health probe — every 15 minutes
@@ -360,7 +360,7 @@ def start_scheduler():
         id="live_tv_probe_job",
         name="Live TV Health Probe",
         replace_existing=True,
-        next_run_time=None,
+        next_run_time=datetime.datetime.now(),
     )
 
     # yt-dlp auto-update — runs immediately at startup, then every 24 hours.
@@ -385,7 +385,7 @@ def start_scheduler():
         f"(chunk={QUALITY_UPGRADE_CHUNK_SIZE}, min={QUALITY_UPGRADE_MIN_HEIGHT}p). "
         f"Live TV probe interval: {LIVE_TV_PROBE_INTERVAL_MINUTES} minutes. "
         f"yt-dlp auto-update interval: {YTDLP_UPDATE_INTERVAL_HOURS} hours (runs at startup). "
-        f"Other jobs start on next tick (trigger manually for first run)."
+        f"All jobs run immediately at startup then repeat on their intervals."
     )
 
 

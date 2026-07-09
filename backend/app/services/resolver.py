@@ -1387,6 +1387,21 @@ class ResolverService:
         stmt = (
             select(Video)
             .where(Video.resolution_status == "pending")
+        )
+
+        # When background YouTube resolve is OFF (the default), exclude
+        # YouTube from the query itself so the batch slots fill with
+        # Vimeo/local content. Without this, YouTube's ~12k pending videos
+        # (higher scores) fill all 200 slots and get skipped in the loop,
+        # leaving zero slots for Vimeo.
+        if not is_youtube_background_resolve_enabled():
+            stmt = stmt.where(
+                ~Video.source_url.contains("youtube.com"),
+                ~Video.source_url.contains("youtu.be"),
+            )
+
+        stmt = (
+            stmt
             .order_by(Video.reddit_score.desc().nullslast())
             .limit(limit)
         )
