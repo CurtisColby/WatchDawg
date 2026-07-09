@@ -810,8 +810,22 @@ def _extract_tv_sync_worker(url: str, cookies_path: Optional[str], prefer_hls: b
         return None, f"Transient: {error_msg[:300]}", False
 
 
-def _fetch_thumbnail_sync_worker(url: str, cookies_path: Optional[str]) -> Optional[str]:
-    """Module-level thumbnail fetch — picklable for ProcessPoolExecutor."""
+def _fetch_thumbnail_sync_worker(url: str, cookies_path: Optional[str]):
+    """Module-level thumbnail fetch — picklable for ProcessPoolExecutor.
+
+    Session 58: returns a (thumbnail_url, outcome) tuple instead of a bare
+    Optional[str]. Outcomes:
+      "ok"        — thumbnail found (thumbnail_url is the URL)
+      "no_thumb"  — extraction succeeded but the video genuinely has no
+                    thumbnail; safe to mark terminally
+      "permanent" — the video is dead (404/private/removed); safe to mark
+                    terminally so it stops clogging the backfill queue
+      "transient" — rate limit, network error, timeout, or anything else
+                    temporary; caller must LEAVE thumbnail_url NULL so the
+                    video is retried on a later pass. The old behavior
+                    stamped 'unavailable' on these, permanently poisoning
+                    records during outages like a Vimeo 403 block.
+    """
     import yt_dlp
 
     ydl_opts = {
@@ -830,15 +844,28 @@ def _fetch_thumbnail_sync_worker(url: str, cookies_path: Optional[str]) -> Optio
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
         if info is None:
-            return None
+            return (None, "transient")
         thumbnails = info.get("thumbnails") or []
         if thumbnails:
             best = thumbnails[-1].get("url")
             if best:
-                return best
-        return info.get("thumbnail")
-    except Exception:
-        return None
+                return (best, "ok")
+        single = info.get("thumbnail")
+        if single:
+            return (single, "ok")
+        return (None, "no_thumb")
+    except Exception as e:
+        msg = str(e).lower()
+        # Rate-limit safeguard first — these messages can contain permanent-
+        # looking phrases like "video unavailable" (documented above for the
+        # resolve path; same logic applies here).
+        for kw in RATE_LIMIT_SAFEGUARD_KEYWORDS:
+            if kw in msg:
+                return (None, "transient")
+        for kw in PERMANENT_ERROR_KEYWORDS:
+            if kw in msg:
+                return (None, "permanent")
+        return (None, "transient")
 
 
 class StreamInfo:
@@ -1589,12 +1616,32 @@ class ResolverService:
         return summary
 
     async def backfill_thumbnails(self, limit: int = 50, channel_ids: Optional[list] = None) -> dict:
-        """Metadata-only yt-dlp pass to fill missing thumbnails, optionally scoped to channels."""
+        """Metadata-only yt-dlp pass to fill missing thumbnails, optionally scoped to channels.
+
+        Excludes local_folder videos — yt-dlp cannot fetch thumbnails for local
+        file paths. Use /library/generate-thumbnails for local content instead.
+
+        Session 58 fixes:
+        - NULL-provider trap: a plain != 'local_folder' comparison silently
+          dropped rows where source_provider is NULL (SQL three-valued logic),
+          so older scraped videos with no provider stamp were never backfilled.
+          Now NULL-provider rows are explicitly included.
+        - Outcome-aware marking: only genuinely thumbnail-less or permanently
+          dead videos get the terminal 'unavailable' stamp. Transient failures
+          (rate limits, 403 blocks, timeouts) leave thumbnail_url NULL so the
+          video is retried on a later pass instead of being poisoned forever.
+        """
         from sqlalchemy import or_
 
         stmt = (
             select(Video)
-            .where(or_(Video.thumbnail_url.is_(None), Video.thumbnail_url == ""))
+            .where(
+                or_(Video.thumbnail_url.is_(None), Video.thumbnail_url == ""),
+                or_(
+                    Video.source_provider.is_(None),
+                    Video.source_provider != "local_folder",
+                ),
+            )
             .order_by(Video.id.asc())
             .limit(limit)
         )
@@ -1603,6 +1650,10 @@ class ResolverService:
                 select(Video)
                 .where(
                     or_(Video.thumbnail_url.is_(None), Video.thumbnail_url == ""),
+                    or_(
+                        Video.source_provider.is_(None),
+                        Video.source_provider != "local_folder",
+                    ),
                     Video.channel_id.in_(channel_ids),
                 )
                 .order_by(Video.id.asc())
@@ -1611,12 +1662,12 @@ class ResolverService:
         result = await self._db.execute(stmt)
         videos = result.scalars().all()
 
-        summary = {"total": len(videos), "filled": 0, "skipped": 0, "failed": 0}
+        summary = {"total": len(videos), "filled": 0, "skipped": 0, "failed": 0, "deferred": 0}
 
         loop = asyncio.get_event_loop()
         for video in videos:
             try:
-                thumbnail_url = await asyncio.wait_for(
+                thumbnail_url, outcome = await asyncio.wait_for(
                     loop.run_in_executor(
                         _process_pool,
                         _fetch_thumbnail_sync_worker,
@@ -1625,12 +1676,26 @@ class ResolverService:
                     ),
                     timeout=60.0,
                 )
-                if thumbnail_url:
+                if outcome == "ok" and thumbnail_url:
                     video.thumbnail_url = thumbnail_url
                     summary["filled"] += 1
                     logger.info(f"Backfill thumbnail: video {video.id} -> {thumbnail_url[:80]}")
-                else:
+                elif outcome in ("no_thumb", "permanent"):
+                    # Terminal: the video has no thumbnail or is dead. Mark it
+                    # so it doesn't clog the queue on the next run. The catalog
+                    # treats this the same as no thumbnail.
+                    video.thumbnail_url = "unavailable"
                     summary["skipped"] += 1
+                    logger.info(
+                        f"Backfill thumbnail: video {video.id} marked unavailable ({outcome})"
+                    )
+                else:
+                    # Transient (rate limit / network / block): leave NULL so a
+                    # later pass retries. Do NOT stamp 'unavailable'.
+                    summary["deferred"] += 1
+                    logger.info(
+                        f"Backfill thumbnail: video {video.id} deferred (transient error)"
+                    )
             except asyncio.TimeoutError:
                 summary["failed"] += 1
                 logger.warning(f"Backfill thumbnail: timed out for video {video.id}")
@@ -1644,8 +1709,8 @@ class ResolverService:
         scope = f"channels {channel_ids}" if channel_ids else "all channels"
         logger.info(
             f"Thumbnail backfill complete ({scope}): {summary['filled']} filled, "
-            f"{summary['skipped']} skipped, {summary['failed']} failed "
-            f"out of {summary['total']}"
+            f"{summary['skipped']} skipped, {summary['deferred']} deferred, "
+            f"{summary['failed']} failed out of {summary['total']}"
         )
         return summary
 

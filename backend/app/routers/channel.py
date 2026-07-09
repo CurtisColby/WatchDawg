@@ -329,8 +329,11 @@ class LocalFolderProvider:
 
     async def fetch_posts(self, limit: int = 5000):
         """
-        Walk the folder and return one DiscoveredVideo per video file.
-        Sorted alphabetically. Capped at limit.
+        Recursively walk the folder and return one DiscoveredVideo per video
+        file, including files in subfolders (Session 58 — the old scan used
+        os.scandir and only saw the top level, leaving subfolder files
+        invisible to the catalog). Skips .temp partial downloads and sidecar
+        thumbnails. Sorted alphabetically by relative path. Capped at limit.
         """
         from app.providers.base import DiscoveredVideo
         import os
@@ -342,30 +345,39 @@ class LocalFolderProvider:
             )
             return discovered
 
+        all_files = []
         try:
-            entries = sorted(os.scandir(self.folder_path), key=lambda e: e.name.lower())
+            for dirpath, _dirnames, filenames in os.walk(self.folder_path):
+                for filename in filenames:
+                    # Skip yt-dlp partial downloads like "11508.temp.mp4"
+                    if ".temp" in filename.lower():
+                        continue
+                    # Skip sidecar thumbnails ("<video>.watchdawg_thumb.jpg")
+                    if filename.endswith(".watchdawg_thumb.jpg"):
+                        continue
+                    _, ext = os.path.splitext(filename)
+                    if ext.lower() not in _LOCAL_VIDEO_EXTS:
+                        continue
+                    all_files.append(os.path.join(dirpath, filename))
         except OSError as e:
             logger.error(f"LocalFolderProvider: cannot scan {self.folder_path}: {e}")
             return discovered
 
+        all_files.sort(key=lambda p: p.lower())
+
         from app.config import settings as _cfg
         watchdawg_root = _cfg.downloads_path.rstrip("/")
 
-        for entry in entries:
-            if not entry.is_file():
-                continue
-            _, ext = os.path.splitext(entry.name)
-            if ext.lower() not in _LOCAL_VIDEO_EXTS:
-                continue
-
-            abs_path = entry.path
+        for abs_path in all_files:
+            entry_name = os.path.basename(abs_path)
             # Relative path from /watchdawg/ root — used as stream path and dedup key
+
             if abs_path.startswith(watchdawg_root + "/"):
                 rel_path = abs_path[len(watchdawg_root) + 1:]
             else:
                 rel_path = abs_path
 
-            title = os.path.splitext(entry.name)[0]
+            title = os.path.splitext(entry_name)[0]
             # Build the stream URL — served by /library/stream/
             base_url = "http://192.168.50.42:6868"
             import urllib.parse
@@ -412,6 +424,7 @@ async def _scrape_local_folder_channel(
 
     Returns a dict matching ScrapeResult.to_dict() format.
     """
+    import os
     from app.models import Video
     from sqlalchemy import select as _select
 
@@ -438,13 +451,26 @@ async def _scrape_local_folder_channel(
             dupe_count += 1
             continue
 
+        # Session 58: if a sidecar thumbnail already exists on disk for this
+        # file, link it immediately so the catalog shows it without waiting
+        # for a thumbnail generation pass.
+        thumbnail_url = dv.thumbnail_url
+        _sidecar = dv.source_url + ".watchdawg_thumb.jpg"
+        if os.path.isfile(_sidecar):
+            from app.config import settings as _cfg2
+            import urllib.parse as _up
+            _root = _cfg2.downloads_path.rstrip("/")
+            if _sidecar.startswith(_root + "/"):
+                _rel = _sidecar[len(_root) + 1:]
+                thumbnail_url = f"/library/thumb/{_up.quote(_rel, safe='/')}"
+
         db_video = Video(
             source_provider="local_folder",
             source_post_id=dv.source_post_id,
             source_url=dv.source_url,
             title=dv.title,
             artist=dv.artist,
-            thumbnail_url=dv.thumbnail_url,
+            thumbnail_url=thumbnail_url,
             duration_seconds=dv.duration_seconds,
             reddit_score=0,
             resolution_status="resolved",

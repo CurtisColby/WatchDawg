@@ -310,45 +310,115 @@ async def list_library_genres(
 @router.post("/generate-thumbnails")
 async def generate_thumbnails(
     limit: int = Query(20, ge=1, le=200, description="Max files to process per run"),
+    db: AsyncSession = Depends(get_db_session),
 ):
-    """Generate thumbnail images for library files that have no thumbnail."""
+    """Generate thumbnail images for local_folder videos that have no thumbnail.
+
+    DB-driven: queries Video records with source_provider='local_folder' and
+    no thumbnail_url, then runs ffmpeg frame-grab on each file and writes
+    the resulting /library/thumb/... URL back to the record so the Catalog
+    page can display it immediately.
+    """
+    from sqlalchemy import or_
+
     downloads_dir = settings.downloads_path
-    if not os.path.isdir(downloads_dir):
-        return {"status": "error", "detail": "Library directory not found"}
 
-    candidates = []
-    for dirpath, _dirnames, filenames in os.walk(downloads_dir):
-        for filename in filenames:
-            if filename.endswith(THUMB_SUFFIX):
-                continue
-            _, ext = os.path.splitext(filename)
-            if ext.lower() not in VIDEO_EXTENSIONS:
-                continue
-            full_path = os.path.join(dirpath, filename)
-            thumb_path = _thumb_path_for(full_path)
-            if not os.path.isfile(thumb_path):
-                candidates.append((full_path, thumb_path))
-            if len(candidates) >= limit:
-                break
-        if len(candidates) >= limit:
-            break
+    # Find local_folder videos missing thumbnails — DB is the source of truth.
+    stmt = (
+        select(Video)
+        .where(
+            Video.source_provider == "local_folder",
+            or_(Video.thumbnail_url.is_(None), Video.thumbnail_url == ""),
+        )
+        .order_by(Video.id.asc())
+        .limit(limit)
+    )
+    result = await db.execute(stmt)
+    videos = result.scalars().all()
 
-    summary = {"total": len(candidates), "generated": 0, "failed": 0}
+    summary = {"total": len(videos), "generated": 0, "failed": 0, "skipped": 0}
 
-    for video_path, thumb_path in candidates:
+    for video in videos:
+        video_path = video.source_url  # absolute path e.g. /watchdawg/Private/Folder/file.mp4
+        if not video_path or not os.path.isfile(video_path):
+            summary["skipped"] += 1
+            logger.warning(f"Local thumb: file not found for video {video.id}: {video_path}")
+            continue
+
+        thumb_path = _thumb_path_for(video_path)
+
+        # If sidecar already exists on disk, just update the DB record.
+        if os.path.isfile(thumb_path):
+            thumb_rel = os.path.relpath(thumb_path, downloads_dir)
+            video.thumbnail_url = f"/library/thumb/{urllib.parse.quote(thumb_rel, safe='/')}"
+            summary["generated"] += 1
+            continue
+
         success = await asyncio.to_thread(_generate_thumb_sync, video_path, thumb_path)
         if success:
+            thumb_rel = os.path.relpath(thumb_path, downloads_dir)
+            video.thumbnail_url = f"/library/thumb/{urllib.parse.quote(thumb_rel, safe='/')}"
             summary["generated"] += 1
-            logger.info(f"Generated thumbnail: {thumb_path}")
+            logger.info(f"Generated thumbnail: video {video.id} -> {thumb_path}")
         else:
             summary["failed"] += 1
         await asyncio.sleep(0.1)
 
+    await db.commit()
+
     logger.info(
-        f"Thumbnail generation complete: {summary['generated']} generated, "
-        f"{summary['failed']} failed out of {summary['total']}"
+        f"Local thumbnail generation complete: {summary['generated']} generated, "
+        f"{summary['failed']} failed, {summary['skipped']} skipped "
+        f"out of {summary['total']}"
     )
     return {"status": "complete", "summary": summary}
+
+
+@router.post("/purge-missing-files")
+async def purge_missing_files(
+    db: AsyncSession = Depends(get_db_session),
+):
+    """Delete local_folder video records whose files no longer exist on disk.
+
+    Scans all local_folder videos, checks if the source_url path exists,
+    and deletes the DB record (plus any sidecar thumbnail) for missing files.
+    Prevents dead records from clogging the thumbnail queue and catalog.
+    """
+    stmt = select(Video).where(Video.source_provider == "local_folder")
+    result = await db.execute(stmt)
+    local_videos = result.scalars().all()
+
+    summary = {"checked": len(local_videos), "deleted": 0, "kept": 0}
+
+    for video in local_videos:
+        if video.source_url and os.path.isfile(video.source_url):
+            summary["kept"] += 1
+            continue
+
+        # File is gone — clean up sidecar thumbnail if it exists
+        if video.source_url:
+            thumb_path = _thumb_path_for(video.source_url)
+            if os.path.isfile(thumb_path):
+                try:
+                    os.remove(thumb_path)
+                except OSError:
+                    pass
+
+        logger.info(f"Purging missing local file: video {video.id} ({video.source_url})")
+        await db.delete(video)
+        summary["deleted"] += 1
+
+    await db.commit()
+
+    logger.info(
+        f"Purge missing files complete: {summary['deleted']} deleted, "
+        f"{summary['kept']} kept out of {summary['checked']} checked"
+    )
+    return {
+        "status": "complete",
+        "summary": summary,
+        "message": f"Removed {summary['deleted']} local videos whose files no longer exist on disk.",
+    }
 
 
 @router.get("/thumb/{filename:path}")

@@ -7,6 +7,9 @@ Runs periodic tasks inside the FastAPI process using APScheduler:
 3. Dedup job          — sweeps all resolved videos for CDN fingerprint duplicates.
 4. Quality upgrade    — re-resolves low-quality videos in chunks.
 5. Live TV probe      — probes live stream URLs for online status (every 15 min).
+6. Thumbnail pass     — fills missing thumbnails automatically (every 30 min):
+                        ffmpeg frame-grabs for local files + yt-dlp metadata
+                        backfill for scraped videos. (Session 58)
 
 The scheduler starts when the FastAPI app starts and stops on shutdown.
 Intervals are configurable via environment variables.
@@ -36,7 +39,7 @@ from sqlalchemy import select
 from app.config import settings
 from app.database import async_session_factory
 from app.models import Channel
-from app.routers.channel import get_provider_for_channel
+from app.routers.channel import get_provider_for_channel, _scrape_local_folder_channel
 from app.services.scraper import ScraperService
 from app.services.resolver import ResolverService
 
@@ -67,6 +70,14 @@ LIVE_TV_PROBE_INTERVAL_MINUTES = 15
 # yt-dlp auto-update interval (hours). Checks once at startup then every N hours.
 YTDLP_UPDATE_INTERVAL_HOURS = 24
 
+# Thumbnail pass — interval and per-tick batch sizes. (Session 58)
+# Local pass: ffmpeg frame-grabs are fast and disk-only, so 50/tick is cheap.
+# Backfill pass: yt-dlp metadata calls hit the network, so 25/tick keeps each
+# tick well under the 30-min window even with the 60s per-video timeout.
+THUMBNAIL_PASS_INTERVAL_MINUTES = 30
+THUMBNAIL_LOCAL_LIMIT = 50
+THUMBNAIL_BACKFILL_LIMIT = 25
+
 
 async def scheduled_scrape():
     """
@@ -88,6 +99,25 @@ async def scheduled_scrape():
             total_new = 0
             for channel in channels:
                 try:
+                    # Session 58: local_folder channels MUST bypass the generic
+                    # scraper pipeline. The generic path (a) capped discovery
+                    # at limit=50 — the same first 50 files alphabetically every
+                    # tick, so files 51+ could never be ingested — and (b)
+                    # inserted records as resolution_status='pending', which the
+                    # resolve job then fed to yt-dlp as raw disk paths, marking
+                    # them 'failed'. The dedicated helper scans recursively at
+                    # full limit and inserts records born-resolved.
+                    if channel.channel_type == "local_folder":
+                        result_dict = await _scrape_local_folder_channel(channel, db)
+                        channel.last_scraped_at = datetime.datetime.utcnow()
+                        channel.last_scrape_count = result_dict["new"]
+                        total_new += result_dict["new"]
+                        logger.info(
+                            f"Scheduled scrape (local) '{channel.name}': "
+                            f"{result_dict['new']} new / {result_dict['discovered']} discovered"
+                        )
+                        continue
+
                     provider = get_provider_for_channel(channel)
                     scraper = ScraperService(db)
                     scrape_result = await scraper.run(
@@ -306,6 +336,48 @@ async def scheduled_ytdlp_update():
         logger.error(f"yt-dlp auto-update check failed: {e}")
 
 
+async def scheduled_thumbnail_pass():
+    """
+    Automatic thumbnail pass. Runs every THUMBNAIL_PASS_INTERVAL_MINUTES. (Session 58)
+
+    Two passes, each with its own DB session so one failing can't roll back
+    the other:
+
+    Pass 1 — Local files: reuses the /library/generate-thumbnails logic.
+      ffmpeg frame-grab for local_folder videos with no thumbnail, writing the
+      /library/thumb/... URL back to the record. Skips files that already have
+      a sidecar (links them instead — no regeneration).
+
+    Pass 2 — Scraped videos: ResolverService.backfill_thumbnails().
+      yt-dlp metadata-only fetch for non-local videos with no thumbnail.
+      Outcome-aware (Session 58): transient failures (rate limits, 403 blocks)
+      are deferred for retry on a later tick, never stamped 'unavailable', so
+      running through an outage is harmless — the backlog just drains slower.
+
+    Both passes are no-ops (fast empty queries) once everything has a
+    thumbnail, so the recurring job costs nothing at steady state.
+    """
+    logger.info("Scheduled thumbnail pass starting...")
+
+    # Pass 1: local files (ffmpeg frame-grabs)
+    async with async_session_factory() as db:
+        try:
+            from app.routers.library import generate_thumbnails as _generate_local_thumbnails
+            result = await _generate_local_thumbnails(limit=THUMBNAIL_LOCAL_LIMIT, db=db)
+            logger.info(f"Scheduled thumbnail pass (local): {result.get('summary', result)}")
+        except Exception as e:
+            logger.error(f"Scheduled thumbnail pass (local) failed: {e}")
+
+    # Pass 2: scraped videos (yt-dlp metadata backfill)
+    async with async_session_factory() as db:
+        try:
+            resolver = ResolverService(db)
+            summary = await resolver.backfill_thumbnails(limit=THUMBNAIL_BACKFILL_LIMIT)
+            logger.info(f"Scheduled thumbnail pass (backfill): {summary}")
+        except Exception as e:
+            logger.error(f"Scheduled thumbnail pass (backfill) failed: {e}")
+
+
 def start_scheduler():
     """
     Start the background scheduler with configured intervals.
@@ -375,6 +447,16 @@ def start_scheduler():
         next_run_time=datetime.datetime.now(),
     )
 
+    # Thumbnail pass — every 30 minutes, fires immediately at startup. (Session 58)
+    scheduler.add_job(
+        scheduled_thumbnail_pass,
+        trigger=IntervalTrigger(minutes=THUMBNAIL_PASS_INTERVAL_MINUTES),
+        id="thumbnail_pass_job",
+        name="Automatic Thumbnail Pass",
+        replace_existing=True,
+        next_run_time=datetime.datetime.now(),
+    )
+
     scheduler.start()
     logger.info(
         f"Background scheduler started. "
@@ -385,6 +467,8 @@ def start_scheduler():
         f"(chunk={QUALITY_UPGRADE_CHUNK_SIZE}, min={QUALITY_UPGRADE_MIN_HEIGHT}p). "
         f"Live TV probe interval: {LIVE_TV_PROBE_INTERVAL_MINUTES} minutes. "
         f"yt-dlp auto-update interval: {YTDLP_UPDATE_INTERVAL_HOURS} hours (runs at startup). "
+        f"Thumbnail pass interval: {THUMBNAIL_PASS_INTERVAL_MINUTES} minutes "
+        f"(local={THUMBNAIL_LOCAL_LIMIT}, backfill={THUMBNAIL_BACKFILL_LIMIT} per tick). "
         f"All jobs run immediately at startup then repeat on their intervals."
     )
 
