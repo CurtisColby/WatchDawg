@@ -8,12 +8,26 @@ This is the brain of the discovery pipeline. It:
 4. Inserts new discoveries into the videos table with status "pending".
 
 For Reddit sources specifically, the scraper checks whether each discovered
-video can be played directly (v.redd.it native video, YouTube links, Vimeo
-links). If it CAN be played directly it goes into the feed as normal.
-If it CANNOT (e.g. Redgifs or other hostile CDNs), it is auto-downloaded
-via yt-dlp directly into /Music Videos/Reddit/<subreddit_name>/ and stored
-as a Library file only — it never appears in the feed. This sidesteps CDN
+video can be played directly (v.redd.it native video via its reddit.com
+post permalink, YouTube links, Vimeo links). If it CAN be played directly
+it goes into the feed as normal. If it CANNOT (e.g. Redgifs or other
+hostile CDNs), it is auto-downloaded via yt-dlp into the Library downloads
+tree — Private/Reddit/<subreddit_name>/ for locked channels,
+Public/Reddit/<subreddit_name>/ for unlocked ones — and stored as a
+Library file only. It never appears in the feed. This sidesteps CDN
 Referer/auth issues permanently for non-playable Reddit sources.
+
+Session 60 fixes (first run with real Reddit data):
+- _get_reddit_download_dir referenced settings.music_videos_path, which
+  was renamed to downloads_path pre-Milestone D — every auto-download
+  was skipped with "no download dir available". Now lock-aware:
+  locked channel → private_downloads_path, unlocked → public_downloads_path.
+- reddit.com added to REDDIT_DIRECTLY_PLAYABLE_DOMAINS: the provider
+  stores v.redd.it posts as reddit.com post permalinks (so yt-dlp gets
+  muxed audio+video), which were being misrouted to the (broken)
+  auto-download path instead of the feed.
+- Domain normalizer used str.lstrip("www."), which strips a character
+  SET, not a prefix — replaced with str.removeprefix("www.").
 
 The orchestrator doesn't care which provider it's talking to — it works
 with any BaseProvider implementation through the standard interface.
@@ -59,7 +73,12 @@ logger = logging.getLogger(__name__)
 # Domains that can be played directly through the feed without downloading.
 # Anything NOT in this set from a Reddit source will be auto-downloaded.
 REDDIT_DIRECTLY_PLAYABLE_DOMAINS = {
-    # Native Reddit video — already works perfectly via v.redd.it
+    # Native Reddit video — the provider stores these as reddit.com post
+    # permalinks (NOT v.redd.it URLs) so yt-dlp extracts the full muxed
+    # stream from the post page. v.redd.it kept for direct-link posts.
+    "reddit.com",
+    "www.reddit.com",
+    "old.reddit.com",
     "v.redd.it",
     # YouTube — resolved via yt-dlp + DASH manifest, works great
     "youtube.com",
@@ -93,17 +112,19 @@ def _extract_vimeo_numeric_id(source_post_id: str) -> Optional[str]:
 def _reddit_url_is_directly_playable(source_url: str) -> bool:
     """
     Return True if a Reddit post URL points to a domain we can resolve
-    and play directly in the feed (YouTube, Vimeo, v.redd.it).
+    and play directly in the feed (YouTube, Vimeo, Reddit-hosted video).
 
     Return False for everything else (Redgifs, Streamable, direct .mp4
     on hostile CDNs, etc.) — those will be auto-downloaded instead.
     """
     try:
         parsed = urlparse(source_url)
-        domain = parsed.netloc.lower().lstrip("www.")
+        # removeprefix, NOT lstrip: lstrip("www.") strips any leading
+        # run of the characters {w, .}, not the literal prefix "www."
+        domain = parsed.netloc.lower().removeprefix("www.")
         # Check against our known-playable set (strip www. for comparison)
         for playable in REDDIT_DIRECTLY_PLAYABLE_DOMAINS:
-            if domain == playable.lstrip("www.") or domain == playable:
+            if domain == playable.removeprefix("www.") or domain == playable:
                 return True
         return False
     except Exception:
@@ -186,8 +207,8 @@ class ScraperService:
         Execute a full scrape cycle for the given provider.
 
         For Reddit sources:
-        - Directly playable URLs (YouTube, Vimeo, v.redd.it) → inserted as
-          feed entries with status "pending" as normal.
+        - Directly playable URLs (YouTube, Vimeo, Reddit-hosted video)
+          → inserted as feed entries with status "pending" as normal.
         - Non-playable URLs (Redgifs etc.) → auto-downloaded to Library,
           never inserted into the feed.
 
@@ -326,7 +347,9 @@ class ScraperService:
 
     async def _get_reddit_download_dir(self, channel_id: int) -> Optional[str]:
         """
-        Build the /Music Videos/Reddit/<subreddit_name>/ path for this channel.
+        Build the Library download path for this Reddit channel:
+          locked channel   → {private_downloads_path}/Reddit/<subreddit_name>/
+          unlocked channel → {public_downloads_path}/Reddit/<subreddit_name>/
         Creates the directory if it doesn't exist.
         Returns None on failure.
         """
@@ -345,7 +368,13 @@ class ScraperService:
                 sub_name = match.group(1)
 
             safe_sub = _sanitize_folder_name(sub_name)
-            base_dir = settings.music_videos_path
+            # Lock-aware base: locked sources live in the PIN-protected
+            # Private tree, unlocked ones in Public — same rule as every
+            # other Library download.
+            if getattr(channel, "locked", False):
+                base_dir = settings.private_downloads_path
+            else:
+                base_dir = settings.public_downloads_path
             download_dir = os.path.join(base_dir, "Reddit", safe_sub)
 
             os.makedirs(download_dir, exist_ok=True)

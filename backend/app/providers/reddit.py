@@ -1,27 +1,48 @@
 """
 WatchDawg Reddit Provider.
 
-Scrapes configured subreddits using Reddit's public JSON API.
-No OAuth required — we just append .json to the subreddit URL.
+Scrapes configured subreddits using Reddit's JSON listings, authenticated
+with session cookies exported from a logged-in browser.
 
-Rate limiting notes:
-- Reddit allows ~30 requests/minute for unauthenticated JSON access.
-- We use a proper User-Agent to avoid getting blocked.
-- httpx handles connection pooling and timeouts.
+Session 60 rebuild — fetch layer only:
+- Reddit 403-blocks ALL unauthenticated JSON access from this network
+  (every User-Agent, every curl_cffi impersonation target, old.reddit,
+  api.reddit.com — all tested dead in Session 59). OAuth app registration
+  is gated behind manual approval and effectively closed to personal
+  projects. The ONE working path, verified live from the container:
+  logged-in browser cookies (MozillaCookieJar at settings.reddit_cookies_path)
+  + curl_cffi TLS impersonation (chrome136). HTTP 200 with real JSON,
+  NSFW subreddits included (the account's over-18 preference applies).
+- Cookies are re-read from disk at the start of every scrape run, so
+  re-exporting fresh cookies to the host file takes effect on the next
+  run with no restart.
+- Volume discipline (the Vimeo lesson, applied from day one): one request
+  per subreddit per run, randomized 20-40s spacing between subreddits.
+- Self-healing pause flag: any 403 flips a module-level "paused" flag,
+  the rest of the run is skipped, and nothing is ever marked failed.
+  While paused, each run sends exactly ONE probe request (the first
+  subreddit): 403 keeps us paused, 200 clears the flag and the run
+  continues normally. Recovery after a cookie re-export is automatic.
+  A missing/unreadable/empty cookie file triggers the same pause path.
 
-URL extraction logic:
+URL extraction logic (UNCHANGED from the original provider):
 - Reddit posts can contain YouTube links, Vimeo links, direct video URLs,
   or Reddit-hosted video (v.redd.it).
-- We extract the actual media URL, not the Reddit post URL.
+- We extract the actual media URL, not the Reddit post URL — except for
+  Reddit-hosted video, where we store the post permalink so yt-dlp gets
+  the full muxed stream (the fallback_url is video-only / gray box).
 - Self-posts (text only) and image-only posts are filtered out.
 """
 
+import asyncio
 import logging
+import random
 import re
-from typing import List, Optional
+from http.cookiejar import MozillaCookieJar
+from typing import Dict, List, Optional
 from urllib.parse import urlparse
 
-import httpx
+from curl_cffi.requests import AsyncSession
 
 from app.providers.base import BaseProvider, DiscoveredVideo
 from app.config import settings
@@ -48,13 +69,46 @@ VIDEO_EXTENSIONS = {".mp4", ".webm", ".mkv", ".avi", ".mov", ".m3u8"}
 # Reddit JSON API base
 REDDIT_BASE_URL = "https://www.reddit.com"
 
-# Be a good citizen — identify ourselves
-USER_AGENT = "WatchDawg/0.1.0 (Media Aggregation Backend; Contact: github.com/watchdawg)"
+# Browser TLS fingerprint to impersonate. chrome136 is the target verified
+# working against Reddit from this container in Session 59. curl_cffi sets
+# matching browser headers automatically — do NOT override User-Agent.
+IMPERSONATE_TARGET = "chrome136"
+
+# Inter-subreddit pacing (seconds). Randomized to avoid a mechanical
+# request signature. Burst volume is the block trigger on every provider
+# we scrape — slow drips are the sustainable posture.
+PACING_MIN_SECONDS = 20
+PACING_MAX_SECONDS = 40
+
+# Per-request timeout (seconds)
+REQUEST_TIMEOUT = 30
+
+# ---------------------------------------------------------------------------
+# Module-level pause flag.
+#
+# Module-level (not instance-level) because the scraper may construct a
+# fresh RedditProvider per run — the flag must survive across instances
+# for the lifetime of the process. It intentionally does NOT survive a
+# container restart: a restart gets one fresh full attempt, which either
+# works or immediately re-pauses on the first 403.
+# ---------------------------------------------------------------------------
+_reddit_paused: bool = False
+
+
+def reddit_is_paused() -> bool:
+    """Expose pause state for logging/UI without touching the flag."""
+    return _reddit_paused
+
+
+def _set_paused(value: bool) -> None:
+    global _reddit_paused
+    _reddit_paused = value
 
 
 class RedditProvider(BaseProvider):
     """
-    Scrapes subreddits for video posts using Reddit's public JSON API.
+    Scrapes subreddits for video posts using Reddit's JSON listings,
+    authenticated with browser session cookies.
     """
 
     def __init__(self, subreddits: Optional[List[str]] = None):
@@ -64,54 +118,165 @@ class RedditProvider(BaseProvider):
                         Defaults to the configured list from .env.
         """
         self._subreddits = subreddits or settings.subreddit_list
-        self._client = httpx.AsyncClient(
-            headers={"User-Agent": USER_AGENT},
-            timeout=httpx.Timeout(30.0),
-            follow_redirects=True,
+        self._session = AsyncSession(
+            impersonate=IMPERSONATE_TARGET,
+            timeout=REQUEST_TIMEOUT,
         )
 
     @property
     def provider_name(self) -> str:
         return "reddit"
 
+    # ------------------------------------------------------------------
+    # Cookie handling
+    # ------------------------------------------------------------------
+
+    def _load_cookies(self) -> Optional[Dict[str, str]]:
+        """
+        Load Reddit session cookies fresh from disk.
+
+        Returns a simple {name: value} dict scoped to reddit.com domains,
+        or None if the file is missing, unreadable, or contains no Reddit
+        cookies. Loading fresh on every scrape run means a re-exported
+        cookie file takes effect on the next run — no restart needed.
+        """
+        path = settings.reddit_cookies_path
+        jar = MozillaCookieJar()
+        try:
+            # ignore_discard: keep session cookies (Reddit's login IS a
+            # session cookie). ignore_expires: let Reddit judge staleness,
+            # not the local clock.
+            jar.load(path, ignore_discard=True, ignore_expires=True)
+        except FileNotFoundError:
+            logger.error(
+                f"REDDIT PAUSED: cookie file not found at {path}. "
+                f"Export Reddit cookies from a logged-in browser "
+                f"(MozillaCookieJar format) to the mounted host file."
+            )
+            return None
+        except Exception as e:
+            logger.error(
+                f"REDDIT PAUSED: cookie file at {path} could not be parsed: {e}. "
+                f"Re-export it from the browser extension (MozillaCookieJar format)."
+            )
+            return None
+
+        cookies = {
+            c.name: c.value
+            for c in jar
+            if c.value is not None and "reddit" in (c.domain or "").lower()
+        }
+        if not cookies:
+            logger.error(
+                f"REDDIT PAUSED: cookie file at {path} loaded but contains "
+                f"no reddit.com cookies. Re-export from a logged-in browser."
+            )
+            return None
+
+        logger.debug(f"Loaded {len(cookies)} Reddit cookies from {path}")
+        return cookies
+
+    # ------------------------------------------------------------------
+    # Fetch layer
+    # ------------------------------------------------------------------
+
     async def fetch_posts(self, limit: int = 50) -> List[DiscoveredVideo]:
         """
         Fetch video posts from all configured subreddits.
 
-        Hits the 'hot' listing for each subreddit. Could be extended
-        to also scrape 'new' or 'top' with a time filter.
+        One request per subreddit (hot listing), randomized 20-40s spacing
+        between subreddits. Any 403 pauses Reddit scraping for the rest of
+        this run and all future runs until a probe succeeds — videos stay
+        pending, nothing is ever marked failed.
+
+        While paused, this method sends exactly one probe request per run:
+        success clears the pause and the run continues normally; failure
+        leaves the pause in place and returns immediately.
         """
+        cookies = self._load_cookies()
+        if cookies is None:
+            _set_paused(True)
+            return []
+
+        if not self._subreddits:
+            logger.warning("Reddit: no subreddits configured — nothing to scrape.")
+            return []
+
+        if _reddit_paused:
+            logger.info(
+                "Reddit is PAUSED (stale cookies suspected) — sending one "
+                "probe request to check for recovery..."
+            )
+
         all_videos: List[DiscoveredVideo] = []
 
-        for subreddit in self._subreddits:
+        for index, subreddit in enumerate(self._subreddits):
+            # Randomized pacing between subreddits (not before the first)
+            if index > 0:
+                delay = random.uniform(PACING_MIN_SECONDS, PACING_MAX_SECONDS)
+                logger.debug(f"Reddit pacing: sleeping {delay:.1f}s before r/{subreddit}")
+                await asyncio.sleep(delay)
+
             try:
-                videos = await self._scrape_subreddit(subreddit, limit=limit)
-                all_videos.extend(videos)
-                logger.info(
-                    f"Scraped r/{subreddit}: found {len(videos)} video posts"
+                videos = await self._scrape_subreddit(subreddit, cookies, limit=limit)
+            except _RedditBlocked:
+                _set_paused(True)
+                logger.error(
+                    f"REDDIT PAUSED: got HTTP 403 from r/{subreddit}. Reddit "
+                    f"cookies appear stale or the session was rotated. "
+                    f"Skipping all remaining subreddits this run. Re-export "
+                    f"cookies to the host file — scraping will resume "
+                    f"automatically on the next successful probe."
                 )
+                break
             except Exception as e:
-                logger.error(f"Failed to scrape r/{subreddit}: {e}")
+                # Transient (timeout, 429, 5xx, parse hiccup): log and move
+                # to the next subreddit. No pause, nothing marked failed.
+                logger.error(f"Failed to scrape r/{subreddit} (transient): {e}")
                 continue
+
+            # A successful response proves the cookies work — clear the
+            # pause if it was set and let the run continue normally.
+            if _reddit_paused:
+                _set_paused(False)
+                logger.info(
+                    "Reddit scraping RESUMED: probe request succeeded — "
+                    "cookies are valid again. Continuing full scrape run."
+                )
+
+            all_videos.extend(videos)
+            logger.info(f"Scraped r/{subreddit}: found {len(videos)} video posts")
 
         logger.info(f"Total videos discovered across all subreddits: {len(all_videos)}")
         return all_videos
 
     async def _scrape_subreddit(
-        self, subreddit: str, limit: int = 50, sort: str = "hot"
+        self,
+        subreddit: str,
+        cookies: Dict[str, str],
+        limit: int = 50,
+        sort: str = "hot",
     ) -> List[DiscoveredVideo]:
         """
-        Scrape a single subreddit's JSON feed.
+        Scrape a single subreddit's JSON feed. One request.
 
         Args:
             subreddit: Subreddit name without r/ prefix.
+            cookies: Reddit session cookies (name -> value).
             limit: Max posts to fetch (Reddit caps at 100 per request).
             sort: Listing sort — "hot", "new", "top", "rising".
+
+        Raises:
+            _RedditBlocked: on HTTP 403 (stale cookies / rotated session).
+            Exception: on any other failure (treated as transient upstream).
         """
         url = f"{REDDIT_BASE_URL}/r/{subreddit}/{sort}.json"
         params = {"limit": min(limit, 100), "raw_json": 1}
 
-        response = await self._client.get(url, params=params)
+        response = await self._session.get(url, params=params, cookies=cookies)
+
+        if response.status_code == 403:
+            raise _RedditBlocked(f"HTTP 403 for r/{subreddit}")
         response.raise_for_status()
 
         data = response.json()
@@ -124,6 +289,10 @@ class RedditProvider(BaseProvider):
                 videos.append(video)
 
         return videos
+
+    # ------------------------------------------------------------------
+    # Parsing layer — UNCHANGED from the original provider
+    # ------------------------------------------------------------------
 
     def _parse_post(self, post_data: dict, subreddit: str) -> Optional[DiscoveredVideo]:
         """
@@ -284,17 +453,33 @@ class RedditProvider(BaseProvider):
 
         return None
 
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
     async def validate_connection(self) -> bool:
-        """Test that Reddit's JSON API is reachable."""
+        """Test that Reddit's JSON listings are reachable with our cookies."""
+        cookies = self._load_cookies()
+        if cookies is None or not self._subreddits:
+            return False
         try:
-            response = await self._client.get(
+            response = await self._session.get(
                 f"{REDDIT_BASE_URL}/r/{self._subreddits[0]}/hot.json",
-                params={"limit": 1},
+                params={"limit": 1, "raw_json": 1},
+                cookies=cookies,
             )
             return response.status_code == 200
         except Exception:
             return False
 
     async def close(self):
-        """Close the HTTP client. Call on shutdown."""
-        await self._client.aclose()
+        """Close the HTTP session. Call on shutdown."""
+        try:
+            await self._session.close()
+        except Exception:
+            pass
+
+
+class _RedditBlocked(Exception):
+    """Raised on HTTP 403 — cookies stale or session rotated."""
+    pass

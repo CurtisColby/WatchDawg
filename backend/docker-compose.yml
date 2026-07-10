@@ -28,6 +28,13 @@ services:
       # Browser cookies for yt-dlp (read-only inside container)
       - ./config/cookies.txt:/config/cookies.txt
 
+      # Reddit session cookies for the Reddit provider (read-only inside
+      # container). Exported from a logged-in browser in MozillaCookieJar
+      # format — same routine as the YouTube cookies above. Re-export to
+      # this host file when Reddit rotates the session; the provider
+      # re-reads it on every scrape run, no restart needed.
+      - ./config/reddit_cookies.txt:/config/reddit_cookies.txt
+
       # Downloads root — contains Public/ and Private/ subfolders.
       # Host folder: /media/colby/NAS1/WD_Downloads
       # Internal container path: /watchdawg

@@ -14,6 +14,12 @@ Pre-Milestone D change:
   Host folder renamed from /media/colby/NAS1/WatchDawg to
   /media/colby/NAS1/WD_Downloads for clarity.
   Subfolders Public/ and Private/ are created on first download.
+
+Session 60 addition:
+- reddit_cookies_path: Path to the Reddit session cookie file
+  (MozillaCookieJar format) used by the Reddit provider. Mounted
+  read-only into the container via docker-compose.yml, same pattern
+  as the YouTube cookies file.
 """
 
 from pydantic_settings import BaseSettings
@@ -49,6 +55,12 @@ class Settings(BaseSettings):
     # --- Reddit ---
     reddit_subreddits: str = Field(default="SexyMusicVideos")
     scrape_interval_minutes: int = Field(default=30)
+    # Path to Reddit session cookies (MozillaCookieJar format), exported
+    # from a logged-in browser. Required for Reddit scraping to work —
+    # Reddit 403-blocks all unauthenticated JSON access. The provider
+    # re-reads this file on every scrape run, so re-exporting fresh
+    # cookies to the host file takes effect without a restart.
+    reddit_cookies_path: str = Field(default="/config/reddit_cookies.txt")
 
     # --- Downloads ---
     # Root download directory inside the container.
