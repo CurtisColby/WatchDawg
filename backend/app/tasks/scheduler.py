@@ -59,7 +59,14 @@ QUALITY_UPGRADE_MIN_HEIGHT = 720  # upgrade anything below 720p
 _quality_upgrade_offset = 0
 
 # Pending resolve batch size per scheduler tick.
-SCHEDULED_PENDING_LIMIT = 200
+# Session 59: lowered 200 → 25. At 200/tick every 30 min, background resolving
+# could hit Vimeo up to ~9,600 times/day — a burst pattern that (combined with
+# the old 1.0s inter-request delay in resolve_batch) is the likely trigger for
+# the July 2026 Vimeo 403 IP-block. 25/tick = ~1,200/day max, a slow steady
+# drip that drains the backlog in about a week without looking like a scraper.
+# resolve_batch also now paces non-YouTube requests at 5-10s and stops early
+# on 5 consecutive transient failures (provider-block circuit breaker).
+SCHEDULED_PENDING_LIMIT = 25
 
 # Expired re-resolve batch size per scheduler tick.
 SCHEDULED_EXPIRED_LIMIT = 100

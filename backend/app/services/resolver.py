@@ -500,6 +500,17 @@ RATE_LIMIT_SAFEGUARD_KEYWORDS = [
     "please try again later",
 ]
 
+# Circuit breaker for background batch resolving (Session 59). If this many
+# CONSECUTIVE transient failures occur within one batch, the provider is
+# almost certainly blocked or down (e.g. the July 2026 Vimeo 403 IP-block) —
+# the batch stops early instead of hammering a blocked provider with the
+# remaining slots. Hammering is exactly what keeps IP blocks alive. Remaining
+# videos stay pending and the next scheduled tick probes again automatically,
+# so resolving resumes on its own the moment the block lifts. The counter
+# resets on any successful resolve OR any permanent-delete (both prove the
+# provider is actually responding).
+BATCH_CONSECUTIVE_FAILURE_LIMIT = 5
+
 # Vimeo CDN domains — fingerprinting ONLY fires for URLs from these domains.
 # This prevents the broad /video/{hash}/ pattern from false-matching YouTube
 # CDN paths and incorrectly deleting unrelated videos as duplicates.
@@ -1014,11 +1025,26 @@ class ResolverService:
                     f"Error: {error_msg[:200]}"
                 )
                 return None
-            video.resolution_status = "failed"
-            video.resolved_at = datetime.datetime.utcnow()
+            # ALL other transient errors (Session 59): leave the status
+            # unchanged — pending stays pending — so the video is retried on a
+            # later pass. Record the error text for visibility in the web UI.
+            #
+            # The old behavior wrote resolution_status="failed" here, which
+            # permanently removed the video from the pending queue. During the
+            # July 2026 Vimeo 403 IP-block, a single scheduled tick buried 200
+            # good videos this way (the 403 text matched neither the rate-limit
+            # nor cookie-stale keyword guards above). Keyword guards can never
+            # cover every phrasing, so the safe default for anything transient
+            # is retry-later, never bury-forever. Genuinely dead videos are
+            # handled by the is_permanent branch (auto-delete) — the "failed"
+            # status is no longer written by this method.
             video.resolution_error = error_msg or "Unknown error"
             await self._db.commit()
-            logger.warning(f"Failed to resolve video {video_id}: {error_msg}")
+            logger.warning(
+                f"Transient failure for video {video_id} — leaving status "
+                f"'{video.resolution_status}' so it retries on a later pass. "
+                f"Error: {(error_msg or 'Unknown error')[:200]}"
+            )
             return None
 
     async def dedup_after_resolve(self, video: Video) -> Optional[dict]:
@@ -1436,7 +1462,11 @@ class ResolverService:
         videos = result.scalars().all()
 
         all_videos = list(videos)
-        summary = {"total": len(all_videos), "resolved": 0, "failed": 0, "deleted": 0, "skipped_backoff": 0, "skipped_cookie_stale": 0, "skipped_youtube_bg": 0}
+        summary = {"total": len(all_videos), "resolved": 0, "failed": 0, "deleted": 0, "skipped_backoff": 0, "skipped_cookie_stale": 0, "skipped_youtube_bg": 0, "stopped_early": False}
+
+        # Session 59 circuit breaker: consecutive transient failures within
+        # this batch. See BATCH_CONSECUTIVE_FAILURE_LIMIT for rationale.
+        consecutive_failures = 0
 
         for video in all_videos:
             video_id = video.id
@@ -1464,20 +1494,38 @@ class ResolverService:
             result = await self.resolve_video(video_id, force=True)
             if result is not None:
                 summary["resolved"] += 1
+                consecutive_failures = 0
             else:
                 check = await self._db.execute(select(Video).where(Video.id == video_id))
                 if check.scalar_one_or_none() is None:
+                    # Permanent-delete: the provider responded (it told us the
+                    # video is dead), so this does NOT count toward the breaker.
                     summary["deleted"] += 1
+                    consecutive_failures = 0
                 else:
                     summary["failed"] += 1
+                    consecutive_failures += 1
+                    if consecutive_failures >= BATCH_CONSECUTIVE_FAILURE_LIMIT:
+                        summary["stopped_early"] = True
+                        logger.warning(
+                            f"Batch resolve: {consecutive_failures} consecutive "
+                            f"transient failures — provider appears blocked or "
+                            f"down. Stopping this batch early; remaining videos "
+                            f"stay pending and will be retried on the next tick."
+                        )
+                        break
 
             # Polite inter-request delay. YouTube needs a longer pause to avoid
-            # re-triggering rate limits; Vimeo/other sources use a short pause.
+            # re-triggering rate limits. Session 59: Vimeo/other sources moved
+            # from a fixed 1.0s to a randomized 5-10s — the old pace (~200 hits
+            # in ~3 minutes every tick) is a scraper signature and the likely
+            # trigger for the July 2026 Vimeo IP-block. A slow steady drip over
+            # the whole day is far safer than fast bursts.
+            import random
             if is_yt:
-                import random
                 await asyncio.sleep(random.uniform(6.0, 10.0))
             else:
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(random.uniform(5.0, 10.0))
 
         logger.info(
             f"Batch resolve complete: {summary['resolved']} resolved, "
@@ -1486,6 +1534,7 @@ class ResolverService:
             f"{summary['skipped_cookie_stale']} skipped (cookie-stale), "
             f"{summary['skipped_youtube_bg']} skipped (yt-bg-off) "
             f"out of {summary['total']}"
+            + (" [STOPPED EARLY — provider appears blocked]" if summary["stopped_early"] else "")
         )
         return summary
 
