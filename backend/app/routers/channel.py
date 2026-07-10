@@ -28,7 +28,7 @@ from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Header, Response
 from pydantic import BaseModel, Field
-from sqlalchemy import select, func, delete
+from sqlalchemy import select, func, delete, and_, not_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db_session
@@ -1438,11 +1438,21 @@ async def export_all_channels_live_m3u(
 # both. The original /all/live.m3u is left untouched and still serves
 # everything.
 #
-# Unlike /all/live.m3u (which serves any non-failed video), these two only
-# serve videos that are actually playable right now:
-#   resolution_status == "resolved"  OR  source_provider == "local_folder"
-# so scraped-but-unresolved (pending) and failed videos are skipped. This
-# matches the Session 52 Xtream catalog filter.
+# These two serve every video that isn't permanently failed — the same
+# filter as the Xtream catalog (aligned in Session 61) — with ONE exception:
+#   resolution_status != "failed"  AND NOT (pending vimeo.com)
+# Pending videos are included on purpose: YouTube background resolving is
+# OFF by design (Session 56, cookie protection), so scraped YouTube videos
+# live permanently at "pending" and resolve on demand at play time via
+# /channel/stream (remux-on-play, Session 57). Hiding pending would make
+# YouTube content unreachable. Anything already on disk (downloaded /
+# bulk-downloaded / local folder) is served disk-first at play time.
+# Pending VIMEO is the exception (Session 61): Vimeo background-resolves
+# on the normal schedule, so its pendings wait for the background resolver
+# — dead links get auto-deleted quietly instead of erroring in TiviMate,
+# and each video appears here automatically the moment it resolves (these
+# playlists are live queries). Keyed on URL, not provider, so Reddit posts
+# linking to Vimeo are covered too.
 #
 # ROUTE ORDER: these literal paths must stay ABOVE /{channel_id}/live.m3u so
 # FastAPI matches "public"/"private" as literals, not as an int channel_id.
@@ -1455,8 +1465,10 @@ async def export_public_channels_live_m3u(
     """
     Export all playable videos from enabled, UNLOCKED channels as one combined
     live M3U playlist (the public stream). group-title driven by genre_tags or
-    category. Only resolved (or local-folder) videos are served — pending and
-    failed videos are skipped. Videos shuffled randomly in Python on every fetch.
+    category. Every non-failed video is served except pending Vimeo (which
+    waits for the background resolver — Session 61); other pending videos
+    resolve on demand at play time. Videos shuffled randomly in Python on
+    every fetch.
     Add http://192.168.50.42:6868/channel/public/live.m3u to TiviMate.
     """
     base_url = "http://192.168.50.42:6868"
@@ -1479,9 +1491,12 @@ async def export_public_channels_live_m3u(
                 Video.channel_id == channel.id,
                 Video.source_url.isnot(None),
                 Video.source_url != "",
-                (
-                    (Video.resolution_status == "resolved")
-                    | (Video.source_provider == "local_folder")
+                Video.resolution_status != "failed",
+                not_(
+                    and_(
+                        Video.resolution_status == "pending",
+                        Video.source_url.contains("vimeo.com"),
+                    )
                 ),
             )
             .order_by(Video.created_at.desc())
@@ -1516,8 +1531,10 @@ async def export_private_channels_live_m3u(
     """
     Export all playable videos from enabled, LOCKED channels as one combined
     live M3U playlist (the private stream). group-title driven by genre_tags or
-    category. Only resolved (or local-folder) videos are served — pending and
-    failed videos are skipped. Videos shuffled randomly in Python on every fetch.
+    category. Every non-failed video is served except pending Vimeo (which
+    waits for the background resolver — Session 61); other pending videos
+    resolve on demand at play time. Videos shuffled randomly in Python on
+    every fetch.
     Add http://192.168.50.42:6868/channel/private/live.m3u to TiviMate.
     """
     base_url = "http://192.168.50.42:6868"
@@ -1540,9 +1557,12 @@ async def export_private_channels_live_m3u(
                 Video.channel_id == channel.id,
                 Video.source_url.isnot(None),
                 Video.source_url != "",
-                (
-                    (Video.resolution_status == "resolved")
-                    | (Video.source_provider == "local_folder")
+                Video.resolution_status != "failed",
+                not_(
+                    and_(
+                        Video.resolution_status == "pending",
+                        Video.source_url.contains("vimeo.com"),
+                    )
                 ),
             )
             .order_by(Video.created_at.desc())
@@ -1568,6 +1588,100 @@ async def export_private_channels_live_m3u(
         media_type="application/x-mpegurl",
         headers={"Content-Disposition": 'inline; filename="watchdawg_private.m3u"'},
     )
+
+
+async def _find_local_file_for_video(
+    db: AsyncSession, video: Video
+) -> Optional[str]:
+    """
+    Disk-first lookup (Session 61): return the path (relative to the
+    downloads root, ready for /library/stream/{path}) of a local copy of
+    this video if one exists on the NAS. Returns None if no usable file
+    is found.
+
+    Two places a local copy can live:
+
+    1. A linked Favorite record with local_file_path set — written by the
+       Save button and by the Reddit auto-download pipeline (Session 60).
+       The stored path is absolute inside the container
+       (e.g. /watchdawg/Private/Reddit/SubName/Title.mp4).
+
+    2. The bulk channel downloader's predictable path (Session 42):
+       {downloads_path}/{Public|Private}/{channel_id}_{safe_name}/{video_id}.mp4
+       The bulk downloader never touches the Video record, so this path
+       check is the ONLY way to know the file exists. The Session 42
+       docstring promised "the resolver automatically prefers local files
+       over yt-dlp resolution" — that check was never actually implemented
+       anywhere until this helper. Both the Public and Private folders are
+       checked (current lock state first) so files survive a later lock
+       toggle on their channel.
+
+    Safety:
+    - Candidate paths are resolved with realpath and must stay inside the
+      downloads root, mirroring the /library/stream traversal guard.
+    - Files smaller than 1 MB are ignored as likely yt-dlp partials — the
+      same guard the bulk downloader's own skip check uses.
+
+    Lock discipline is NOT enforced here — this only changes where the
+    bytes come from for a play request that already passed the catalog
+    lock split (Xtream credentials / M3U channel split), exactly like the
+    existing local_folder and /library/stream behaviour.
+    """
+    import os
+    from app.config import settings as _cfg
+
+    downloads_root = os.path.realpath(_cfg.downloads_path)
+
+    def _relative_if_valid(abs_path: Optional[str]) -> Optional[str]:
+        """Validate a candidate file and return its downloads-root-relative path."""
+        if not abs_path:
+            return None
+        try:
+            real = os.path.realpath(abs_path)
+            if not real.startswith(downloads_root + os.sep):
+                return None  # outside the downloads tree — never serve
+            if not os.path.isfile(real):
+                return None
+            if os.path.getsize(real) < 1_000_000:
+                return None  # likely a yt-dlp partial — skip
+            return os.path.relpath(real, downloads_root)
+        except OSError:
+            return None
+
+    # 1. Favorite record with a stored local file path
+    fav_stmt = select(Favorite).where(
+        Favorite.video_id == video.id,
+        Favorite.local_file_path.isnot(None),
+    )
+    fav_result = await db.execute(fav_stmt)
+    for fav in fav_result.scalars().all():
+        rel = _relative_if_valid(fav.local_file_path)
+        if rel is not None:
+            return rel
+
+    # 2. Bulk channel downloader path: {video_id}.mp4 in the channel folder
+    if video.channel_id is not None:
+        ch_stmt = select(Channel).where(Channel.id == video.channel_id)
+        ch_result = await db.execute(ch_stmt)
+        channel = ch_result.scalar_one_or_none()
+        if channel is not None:
+            safe_name = re.sub(r'[^\w\-]', '_', channel.name)[:50]
+            # Current lock state's folder first, then the other — files
+            # downloaded before a lock toggle live in the old folder.
+            first = "Private" if channel.locked else "Public"
+            second = "Public" if channel.locked else "Private"
+            for folder_type in (first, second):
+                candidate = os.path.join(
+                    _cfg.downloads_path,
+                    folder_type,
+                    f"{channel.id}_{safe_name}",
+                    f"{video.id}.mp4",
+                )
+                rel = _relative_if_valid(candidate)
+                if rel is not None:
+                    return rel
+
+    return None
 
 
 @router.get("/stream/{video_id}", response_class=Response)
@@ -1616,6 +1730,39 @@ async def stream_video_redirect(
         raise HTTPException(status_code=404, detail=f"Video {video_id} not found")
     if not video.source_url:
         raise HTTPException(status_code=404, detail=f"Video {video_id} has no source URL")
+
+    # ------------------------------------------------------------------
+    # Disk-first playback (Session 61): if a local copy of this video is
+    # already on the NAS — a Reddit auto-download, a Save-button download,
+    # or a bulk channel download — serve it straight from disk via
+    # /library/stream/. No yt-dlp, no cookies, no internet, instant start.
+    # Checked BEFORE the failed-status 404 on purpose: a file on disk is
+    # playable regardless of what happened to its online source since.
+    # Falls through to the normal resolver path only when no file exists.
+    # ------------------------------------------------------------------
+    local_rel = await _find_local_file_for_video(db, video)
+    if local_rel is not None:
+        from fastapi.responses import RedirectResponse
+        local_url = f"{base_url}/library/stream/{urllib.parse.quote(local_rel, safe='/')}"
+        logger.info(
+            f"STREAM REDIRECT | video {video_id} — disk-first → {local_rel[:80]}"
+        )
+        return RedirectResponse(url=local_url, status_code=302)
+
+    # "downloaded" videos exist ONLY as local files (Session 60 Reddit
+    # auto-downloads — their source_url points at a hostile CDN that yt-dlp
+    # was used to defeat at download time). If the file is missing, 404
+    # cleanly instead of burning a doomed resolver call.
+    if video.resolution_status == "downloaded":
+        logger.warning(
+            f"STREAM REDIRECT | video {video_id} — status 'downloaded' but "
+            f"no local file found on disk — 404"
+        )
+        raise HTTPException(
+            status_code=404,
+            detail=f"Downloaded file for video {video_id} not found on disk",
+        )
+
     if video.resolution_status == "failed":
         logger.warning(f"STREAM REDIRECT | video {video_id} permanently failed — 404")
         raise HTTPException(status_code=404, detail=f"Video {video_id} is permanently unavailable")

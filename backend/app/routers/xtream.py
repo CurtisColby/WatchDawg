@@ -75,7 +75,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response
-from sqlalchemy import select, func, text
+from sqlalchemy import select, func, text, and_, not_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -248,18 +248,50 @@ def _eligible_video_filter(stmt):
     """
     Apply catalog-eligibility filters to a Video select.
 
-    Only resolved videos and local downloaded files are served — unresolved
-    or pending videos are excluded so TiviMate never waits on a live yt-dlp
-    call at play time. Videos the background scheduler hasn't resolved yet
-    simply don't appear in the catalog until the next refresh.
+    Serve everything that isn't permanently failed — with ONE exception,
+    pending Vimeo (see below). This is the same proven baseline filter
+    /channel/all/live.m3u has always used:
+      - resolved      → cached stream URL, plays immediately
+      - downloaded    → auto-downloaded file on the NAS (Session 60), served
+                        disk-first by /channel/stream — instant local playback
+      - pending       → resolved ON DEMAND at play time. Essential for
+                        YouTube: background YouTube resolving is OFF by design
+                        (Session 56, cookie protection), so "pending" is the
+                        permanent resting state of scraped YouTube videos. If
+                        pending were hidden, YouTube content could never be
+                        clicked in TiviMate — and a video that can't be
+                        clicked can never trigger its on-demand resolve+remux.
+      - local_folder  → real file on the NAS
+    Only "failed" videos are excluded — plus:
+
+    Pending VIMEO exclusion (Session 61, Colby's call after live testing):
+    Vimeo IS background-resolved on the normal schedule (unlike YouTube), so
+    hiding its pendings costs nothing permanent — the background resolver
+    acts as the taste-tester: dead scraped links get found and auto-deleted
+    in the background instead of erroring in TiviMate, and each video appears
+    in the catalog automatically the moment its status flips to "resolved"
+    (the catalog is a live query — no refresh mechanism needed beyond
+    TiviMate's own playlist reload). Keyed on the URL, not the provider —
+    the same pattern as the resolver's YouTube exclusion — so Reddit posts
+    that link to Vimeo are covered too.
+
+    History (Session 61): Session 52 served resolved/local_folder only, "so
+    TiviMate never waits on a live yt-dlp call at play time". Session 57's
+    remux-on-play made that restriction obsolete — on-demand playback is
+    hardware-verified in TiviMate. First play of a cold video takes ~15-40s
+    (yt-dlp + remux); repeat plays within the cache window are instant.
     """
-    from sqlalchemy import or_
     return stmt.where(
         Video.source_url.isnot(None),
         Video.source_url != "",
-        or_(
-            Video.resolution_status == "resolved",
-            Video.source_provider == "local_folder",
+        Video.resolution_status != "failed",
+        # Pending Vimeo waits for the background resolver — everything
+        # else that's pending resolves on demand at play time.
+        not_(
+            and_(
+                Video.resolution_status == "pending",
+                Video.source_url.contains("vimeo.com"),
+            )
         ),
     )
 
