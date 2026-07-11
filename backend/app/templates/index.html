@@ -226,7 +226,7 @@ h2{font-size:16px;margin:26px 0 12px;color:var(--accent2)}
 
   <div class="subtabs">
     <button class="btn active" id="dtab-jobs" data-tip="One downloader per channel — pick a quality, press Download All, and watch it work file by file.">⬇️ Channel Downloaders</button>
-    <button class="btn" id="dtab-files" data-tip="Everything already on disk, grouped by folder. Play files right here in the browser, or delete ones you don't want.">📁 Files on Disk</button>
+    <button class="btn" id="dtab-files" data-tip="Everything already on disk, browsed folder by folder — open a folder to see its files as a thumbnail gallery, play them in the browser, or delete ones you don't want.">📁 Files on Disk</button>
   </div>
 
   <div id="dl-jobs"><div class="empty">Loading channels…</div></div>
@@ -828,41 +828,92 @@ window.stopDownload = async (id)=>{
   }catch(e){}
 };
 
-/* ---- Files on disk (Library) ---- */
+/* ---- Files on disk (Library) — Session 62 two-level gallery ----
+   Level 1: grid of folder cards (cover thumb, name, count, size).
+   Level 2: click a folder → Catalog-style vcard grid of just that folder's
+   files, with Play/Delete on each card and a type-to-filter box.
+   Only the active level is rendered, so thousands of files never hit the
+   DOM at once. Data comes from one /library scan, grouped client-side. */
+let libData = null;      // last /library response
+let libFolder = null;    // currently-open folder key, or null for folder view
+
 async function loadLibrary(){
   $("#lib-list").innerHTML = `<div class="empty">Scanning download folders…</div>`;
-  let data;
-  try{ data = await api("/library", {}, true); }
+  try{ libData = await api("/library", {}, true); }
   catch(e){ $("#lib-list").innerHTML = `<div class="empty">Couldn't scan the library.</div>`; return; }
-  const files = data.files || [];
-  const totalBytes = files.reduce((a,f)=>a+(f.size_bytes||0),0);
-  $("#lib-summary").textContent = `${files.length} files · ${(totalBytes/1073741824).toFixed(1)} GB total` + (token?"" : " (Private/ hidden while locked)");
-  if(!files.length){ $("#lib-list").innerHTML = `<div class="empty">No downloaded files yet. Use a Channel Downloader above, or Save individual videos from the Catalog.</div>`; return; }
-  // group by folder (first two path parts, e.g. Public/12_ChannelName)
+  renderLibrary();
+}
+
+function libGroups(){
   const groups = {};
-  for (const f of files){
+  for (const f of (libData?.files || [])){
     const parts = (f.relative_path||"").split("/");
     const key = parts.length > 1 ? parts.slice(0, parts.length-1).join("/") : "(root)";
     (groups[key] = groups[key] || []).push(f);
   }
-  let html = "";
-  for (const key of Object.keys(groups).sort()){
-    const g = groups[key];
-    const gb = g.reduce((a,f)=>a+(f.size_bytes||0),0)/1073741824;
-    html += `<div class="folder-head">📁 ${esc(key)} <span class="badge dim">${g.length} files · ${gb.toFixed(1)} GB</span></div>`;
-    html += g.map(f=>`
-      <div class="filerow">
-        <div class="fthumb" style="${f.thumbnail_url?`background-image:url('${esc(f.thumbnail_url)}')`:""}"></div>
-        <div class="fmeta">
-          <div class="t">${esc(f.title||f.filename)}</div>
-          <div class="tiny">${esc(f.size_human||"")} · ${f.modified_at?new Date(f.modified_at*1000).toLocaleDateString():""}</div>
-        </div>
-        <button class="btn small" onclick="playFile('${esc(encodeURIComponent(f.stream_url))}','${esc((f.title||f.filename).replace(/'/g,""))}')" data-tip="Play this file right here in the browser, streamed from the NAS.">▶ Play</button>
-        <button class="btn small danger" onclick="deleteFile('${esc(encodeURIComponent(f.relative_path))}')" data-tip="Delete this file from the NAS. It's also added to the skip list so scrapes won't bring it back.">🗑️</button>
-      </div>`).join("");
-  }
-  $("#lib-list").innerHTML = html;
+  return groups;
 }
+
+function renderLibrary(){
+  const files = libData?.files || [];
+  const totalBytes = files.reduce((a,f)=>a+(f.size_bytes||0),0);
+  $("#lib-summary").textContent = `${files.length} files · ${(totalBytes/1073741824).toFixed(1)} GB total` + (token?"" : " (Private/ hidden while locked)");
+  if(!files.length){ $("#lib-list").innerHTML = `<div class="empty">No downloaded files yet. Use a Channel Downloader above, or Save individual videos from the Catalog.</div>`; return; }
+
+  const groups = libGroups();
+  const keys = Object.keys(groups).sort();
+  if (libFolder && !groups[libFolder]) libFolder = null; // folder emptied out — back to folder view
+
+  if (!libFolder){
+    // ---- Level 1: folder cards ----
+    $("#lib-list").innerHTML = `<div class="vgrid">` + keys.map(key=>{
+      const g = groups[key];
+      const gb = g.reduce((a,f)=>a+(f.size_bytes||0),0)/1073741824;
+      const cover = (g.find(f=>f.thumbnail_url)||{}).thumbnail_url;
+      return `
+      <div class="vcard" style="cursor:pointer" onclick="openLibFolder('${esc(encodeURIComponent(key))}')" data-tip="Open this folder to browse, play, or delete its files.">
+        <div class="vthumb" style="${cover?`background-image:url('${esc(cover)}')`:""}"><span class="badge dim stat">${g.length}</span></div>
+        <div class="vbody">
+          <div class="vtitle">📁 ${esc(key)}</div>
+          <div class="tiny">${g.length} files · ${gb.toFixed(1)} GB</div>
+        </div>
+      </div>`;
+    }).join("") + `</div>`;
+    return;
+  }
+
+  // ---- Level 2: one folder, gallery grid ----
+  const g = groups[libFolder];
+  const gb = g.reduce((a,f)=>a+(f.size_bytes||0),0)/1073741824;
+  $("#lib-list").innerHTML = `
+    <div class="folder-head" style="margin-top:0">
+      <button class="btn small" onclick="closeLibFolder()" data-tip="Back to the folder overview.">← All folders</button>
+      📁 ${esc(libFolder)} <span class="badge dim">${g.length} files · ${gb.toFixed(1)} GB</span>
+      <input id="lib-filter" placeholder="Filter files…" style="margin-left:auto;width:200px" oninput="libFilterApply(this.value)" data-tip="Type to narrow the cards below by title or filename.">
+    </div>
+    <div class="vgrid" id="lib-grid">` + g.map(f=>{
+      const name = f.title || f.filename;
+      return `
+      <div class="vcard" data-t="${esc(name.toLowerCase())}">
+        <div class="vthumb" style="${f.thumbnail_url?`background-image:url('${esc(f.thumbnail_url)}')`:""}"></div>
+        <div class="vbody">
+          <div class="vtitle">${esc(name)}</div>
+          <div class="tiny">${esc(f.size_human||"")} · ${f.modified_at?new Date(f.modified_at*1000).toLocaleDateString():""}</div>
+          <div style="display:flex;gap:6px;margin-top:auto">
+            <button class="btn small" onclick="playFile('${esc(encodeURIComponent(f.stream_url))}','${esc(name.replace(/'/g,""))}')" data-tip="Play this file right here in the browser, streamed from the NAS.">▶ Play</button>
+            <button class="btn small danger" onclick="deleteFile('${esc(encodeURIComponent(f.relative_path))}')" data-tip="Delete this file from the NAS. It's also added to the skip list so scrapes won't bring it back.">🗑️</button>
+          </div>
+        </div>
+      </div>`;
+    }).join("") + `</div>`;
+}
+
+window.openLibFolder = (encKey)=>{ libFolder = decodeURIComponent(encKey); renderLibrary(); };
+window.closeLibFolder = ()=>{ libFolder = null; renderLibrary(); };
+window.libFilterApply = (q)=>{
+  q = (q||"").toLowerCase();
+  $$("#lib-grid .vcard").forEach(c=>{ c.style.display = (!q || (c.dataset.t||"").includes(q)) ? "" : "none"; });
+};
 $("#lib-refresh").onclick = loadLibrary;
 $("#gen-thumbs").onclick = async function(){
   this.disabled = true;
@@ -886,7 +937,18 @@ window.deleteFile = async (encPath)=>{
   if(!ok) return;
   try{
     await api(`/library/file?relative_path=${encodeURIComponent(rel)}`, {method:"DELETE"});
-    toast("File deleted and skip-listed.", "ok"); loadLibrary();
+    toast("File deleted and skip-listed.", "ok");
+    // Session 62: update in place — drop the file from the in-memory list and
+    // re-render, so you stay inside the folder you're curating (filter text
+    // preserved) instead of being bounced back by a full rescan.
+    if (libData && libData.files){
+      libData.files = libData.files.filter(f=>f.relative_path !== rel);
+      const q = $("#lib-filter") ? $("#lib-filter").value : "";
+      renderLibrary();
+      if (q && $("#lib-filter")){ $("#lib-filter").value = q; libFilterApply(q); }
+    } else {
+      loadLibrary();
+    }
   }catch(e){}
 };
 
