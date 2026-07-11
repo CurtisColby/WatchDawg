@@ -189,12 +189,26 @@ async def list_library(
             path_parts = relative_path.split(os.sep)
             subfolder = path_parts[0] if len(path_parts) > 1 else ""
 
+            # Session 62: locally-generated sidecar thumbnails are preferred
+            # for ALL files — matched and unmatched. Previously the sidecar
+            # check only ran for files WITHOUT a DB record, so Reddit
+            # auto-downloads (which always have one) could never display a
+            # generated thumbnail: they were stuck with whatever Reddit
+            # provided at scrape time — often nothing. Disk sidecar first
+            # (local, always loads), DB-provided URL as the fallback.
+            thumb_path = _thumb_path_for(full_path)
+            if os.path.isfile(thumb_path):
+                thumb_rel = os.path.relpath(thumb_path, downloads_dir)
+                sidecar_url = f"/library/thumb/{urllib.parse.quote(thumb_rel, safe='/')}"
+            else:
+                sidecar_url = None
+
             match = known_files.get(full_path)
             if match:
                 fav, video = match
                 title = video.title
                 artist = video.artist
-                thumbnail_url = video.thumbnail_url
+                thumbnail_url = sidecar_url or video.thumbnail_url
                 favorite_id = fav.id
                 video_id = video.id
                 # Session 42: include channel genre_tags for pill filtering
@@ -208,12 +222,7 @@ async def list_library(
                 video_id = None
                 genre_tags = ""
                 channel_name = ""
-                thumb_path = _thumb_path_for(full_path)
-                if os.path.isfile(thumb_path):
-                    thumb_rel = os.path.relpath(thumb_path, downloads_dir)
-                    thumbnail_url = f"/library/thumb/{urllib.parse.quote(thumb_rel, safe='/')}"
-                else:
-                    thumbnail_url = None
+                thumbnail_url = sidecar_url
 
             # Session 42: apply genre filter if provided
             if genre and genre_tags:
@@ -312,12 +321,21 @@ async def generate_thumbnails(
     limit: int = Query(20, ge=1, le=200, description="Max files to process per run"),
     db: AsyncSession = Depends(get_db_session),
 ):
-    """Generate thumbnail images for local_folder videos that have no thumbnail.
+    """Generate thumbnail images for library files that have no thumbnail.
 
-    DB-driven: queries Video records with source_provider='local_folder' and
-    no thumbnail_url, then runs ffmpeg frame-grab on each file and writes
-    the resulting /library/thumb/... URL back to the record so the Catalog
-    page can display it immediately.
+    Two passes, sharing one per-run limit:
+
+    Pass 1 (DB-driven, unchanged): Video records with
+    source_provider='local_folder' and no thumbnail_url — runs ffmpeg
+    frame-grab and writes the /library/thumb/... URL back to the record so
+    the Catalog page can display it immediately.
+
+    Pass 2 (Session 62, filesystem walk): any video file in the download
+    folders that lacks a sidecar thumbnail — Reddit auto-downloads, bulk
+    channel downloads, Save-button downloads. No DB write-back needed: the
+    Files on Disk listing prefers sidecar thumbnails for every file
+    (Session 62 listing fix), so generated thumbnails appear on the next
+    page load.
     """
     from sqlalchemy import or_
 
@@ -366,10 +384,47 @@ async def generate_thumbnails(
 
     await db.commit()
 
+    # ------------------------------------------------------------------
+    # Pass 2 (Session 62): walk the download folders and generate sidecar
+    # thumbnails for ANY video file that lacks one. This is what covers
+    # Reddit auto-downloads and bulk channel downloads — their DB records
+    # are keyed by post/source, not file path, so the DB-driven pass above
+    # never sees them. Shares the same per-run limit budget with pass 1.
+    # ------------------------------------------------------------------
+    remaining = limit - summary["total"]
+    walk_candidates = []
+    if remaining > 0 and os.path.isdir(downloads_dir):
+        for dirpath, _dirnames, filenames in os.walk(downloads_dir):
+            for filename in sorted(filenames):
+                if filename.endswith(THUMB_SUFFIX):
+                    continue
+                _, ext = os.path.splitext(filename)
+                if ext.lower() not in VIDEO_EXTENSIONS:
+                    continue
+                full_path = os.path.join(dirpath, filename)
+                walk_thumb = _thumb_path_for(full_path)
+                if not os.path.isfile(walk_thumb):
+                    walk_candidates.append((full_path, walk_thumb))
+                if len(walk_candidates) >= remaining:
+                    break
+            if len(walk_candidates) >= remaining:
+                break
+
+    summary["total"] += len(walk_candidates)
+    for video_path, thumb_path in walk_candidates:
+        success = await asyncio.to_thread(_generate_thumb_sync, video_path, thumb_path)
+        if success:
+            summary["generated"] += 1
+            logger.info(f"Generated sidecar thumbnail: {thumb_path}")
+        else:
+            summary["failed"] += 1
+        await asyncio.sleep(0.1)
+
     logger.info(
-        f"Local thumbnail generation complete: {summary['generated']} generated, "
+        f"Thumbnail generation complete: {summary['generated']} generated, "
         f"{summary['failed']} failed, {summary['skipped']} skipped "
-        f"out of {summary['total']}"
+        f"out of {summary['total']} "
+        f"(pass 2 folder walk: {len(walk_candidates)} candidates)"
     )
     return {"status": "complete", "summary": summary}
 

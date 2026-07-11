@@ -400,6 +400,8 @@ class ScraperService:
         2. Insert a Video + Favorite DB record (download_status="downloading").
         3. Run yt-dlp download in a thread.
         4. Update Favorite with result (complete/failed) and local_file_path.
+        5. On success, generate the sidecar thumbnail (Session 62) —
+           off-thread, non-fatal on failure.
 
         Returns True if a download was attempted (success or fail),
         False if skipped (cap hit, no dir, already exists).
@@ -485,6 +487,7 @@ class ScraperService:
         )
 
         # Refresh records after thread completes
+        downloaded_path = None  # Session 62: captured for thumbnail generation
         async with self._db.begin_nested():
             fav_stmt = select(Favorite).where(Favorite.id == favorite.id)
             fav_result = await self._db.execute(fav_stmt)
@@ -497,6 +500,7 @@ class ScraperService:
                     fav.local_file_path = actual_path or output_path
                     fav.downloaded_at = datetime.datetime.utcnow()
                     fav.download_error = None
+                    downloaded_path = fav.local_file_path
                     logger.info(
                         f"Reddit auto-download: COMPLETE — "
                         f"video_id={db_video.id} path={fav.local_file_path}"
@@ -512,6 +516,34 @@ class ScraperService:
                     result.errors += 1
 
         await self._db.commit()
+
+        # ------------------------------------------------------------------
+        # Session 62: generate the sidecar thumbnail immediately after a
+        # successful download, so new Reddit files land in the Files on Disk
+        # view with a preview already made. Runs off-thread (same as the
+        # download itself) so scraping never blocks. Non-fatal: on failure we
+        # log and move on — the Generate Thumbnails button's folder-walk pass
+        # (Session 62, library.py) picks up any stragglers.
+        # ------------------------------------------------------------------
+        if success and downloaded_path and os.path.isfile(downloaded_path):
+            from app.routers.library import _generate_thumb_sync, _thumb_path_for
+            thumb_path = _thumb_path_for(downloaded_path)
+            if not os.path.isfile(thumb_path):
+                thumb_ok = await asyncio.to_thread(
+                    _generate_thumb_sync, downloaded_path, thumb_path
+                )
+                if thumb_ok:
+                    logger.info(
+                        f"Reddit auto-download: sidecar thumbnail generated "
+                        f"for video_id={db_video.id}"
+                    )
+                else:
+                    logger.warning(
+                        f"Reddit auto-download: thumbnail generation failed "
+                        f"for video_id={db_video.id} — the Generate Thumbnails "
+                        f"folder-walk pass will retry it"
+                    )
+
         return True
 
     async def _get_existing_post_ids(

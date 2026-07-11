@@ -235,7 +235,7 @@ h2{font-size:16px;margin:26px 0 12px;color:var(--accent2)}
     <div class="row" style="margin-bottom:10px">
       <div class="muted" id="lib-summary"></div>
       <div class="spacer"></div>
-      <button class="btn" id="gen-thumbs" data-tip="Create preview thumbnails for downloaded files that don't have one yet (20 at a time). Run it a few times for a big library.">🖼️ Generate Thumbnails</button>
+      <button class="btn" id="gen-thumbs" data-tip="Create preview thumbnails for downloaded files that don't have one yet (200 at a time). Run it a few times for a big library.">🖼️ Generate Thumbnails</button>
       <button class="btn" id="lib-refresh" data-tip="Re-scan the download folders on the NAS.">🔄 Refresh</button>
     </div>
     <div class="card" id="lib-list"><div class="empty">Loading library…</div></div>
@@ -351,7 +351,9 @@ h2{font-size:16px;margin:26px 0 12px;color:var(--accent2)}
     <div class="muted" style="margin-bottom:10px">Safe cleanup tools. Each one tells you exactly what it did.</div>
     <div class="row">
       <button class="btn small" id="m-reset-failed" data-tip="Mark every 'failed' video as pending again so the resolver will retry them. Use after a bad network day.">♻️ Reset Failed Videos</button>
-      <button class="btn small" id="m-backfill" data-tip="Fill in missing thumbnails for videos that don't have one.">🖼️ Backfill Thumbnails</button>
+      <button class="btn small" id="m-backfill" data-tip="Fill in missing thumbnails for scraped videos (Vimeo/YouTube) that don't have one. Uses yt-dlp metadata.">🖼️ Backfill Thumbnails</button>
+      <button class="btn small" id="m-local-thumbs" data-tip="Generate thumbnail images for local video files that don't have one. Extracts a frame from each file using ffmpeg.">📁 Local Thumbnails</button>
+      <button class="btn small" id="m-purge-missing" data-tip="Remove local video records whose files no longer exist on disk. Cleans up entries left behind after deleting or moving files.">🧹 Purge Missing Files</button>
       <button class="btn small" id="m-purge-dead" data-tip="Remove videos whose source link no longer works (deleted or private videos).">💀 Purge Dead Links</button>
       <button class="btn small" id="m-purge-dupes" data-tip="Remove duplicate copies of the same video that snuck in from multiple scrapes.">👯 Purge Duplicates</button>
       <button class="btn small danger" id="m-skip-clear" data-tip="Empty the skip list. Videos you skipped in the past may reappear on the next scrape.">🗑️ Clear Skip List (<span id="skip-count">…</span>)</button>
@@ -865,7 +867,7 @@ $("#lib-refresh").onclick = loadLibrary;
 $("#gen-thumbs").onclick = async function(){
   this.disabled = true;
   try{
-    const r = await api("/library/generate-thumbnails?limit=20", {method:"POST"});
+    const r = await api("/library/generate-thumbnails?limit=200", {method:"POST"});
     toast(r.message || "Thumbnail pass finished.", "ok"); loadLibrary();
   }catch(e){}
   this.disabled = false;
@@ -928,13 +930,14 @@ function renderFeed(){
   if (!vids.length){ $("#feed-grid").innerHTML = `<div class="empty">No videos match. Try scraping your sources, or loosen the filters.</div>`; return; }
   $("#feed-grid").innerHTML = vids.map(v=>{
     const st = v.resolution_status;
+    const srcIcon = v.source_provider==="local_folder" ? `<span class="badge dim stat" style="left:6px;right:auto" data-tip="Local file — use 📁 Local Thumbnails button for these.">📁 local</span>` : "";
     const badge = st==="resolved" ? `<span class="badge good stat" data-tip="Ready to stream — the real video link is resolved and cached.">resolved</span>`
       : st==="failed" ? `<span class="badge bad stat" data-tip="The last attempt to resolve this video's stream failed: ${esc(v.resolution_error||"unknown error")}">failed</span>`
       : `<span class="badge dim stat" data-tip="Not resolved yet — the stream link gets looked up on demand or via batch resolve.">pending</span>`;
-    const thumb = v.thumbnail_url ? `background-image:url('${esc(v.thumbnail_url)}')` : "";
+    const thumb = v.thumbnail_url && v.thumbnail_url !== "unavailable" ? `background-image:url('${esc(v.thumbnail_url)}')` : "";
     return `
     <div class="vcard">
-      <div class="vthumb" style="${thumb}">${badge}</div>
+      <div class="vthumb" style="${thumb}">${badge}${srcIcon}</div>
       <div class="vbody">
         <div class="vtitle" title="${esc(v.title)}">${esc(v.title||"Untitled")}</div>
         <div class="tiny">${esc(v.artist||"")}</div>
@@ -1088,6 +1091,12 @@ async function refreshSkipCount(){
 }
 $("#m-reset-failed").onclick = async function(){ this.disabled=true; try{ const r=await api("/resolve/reset-failed",{method:"POST"}); toast(r.message||"Failed videos reset to pending.","ok"); }catch(e){} this.disabled=false; };
 $("#m-backfill").onclick   = async function(){ this.disabled=true; try{ const r=await api("/resolve/backfill-thumbnails",{method:"POST"}); toast(r.message||"Thumbnail backfill finished.","ok"); }catch(e){} this.disabled=false; };
+$("#m-local-thumbs").onclick = async function(){ this.disabled=true; try{ const r=await api("/library/generate-thumbnails?limit=200",{method:"POST"}); toast(r.message||"Local thumbnail generation finished.","ok"); }catch(e){} this.disabled=false; };
+$("#m-purge-missing").onclick = async function(){
+  const ok = await confirmBox("Purge missing files?", "This scans all local video records and removes any whose files no longer exist on disk. Downloaded/moved files won't come back.", "Purge", true);
+  if(!ok) return; this.disabled=true;
+  try{ const r=await api("/library/purge-missing-files",{method:"POST"}); toast(r.message||"Missing files purged.","ok"); }catch(e){} this.disabled=false;
+};
 $("#m-purge-dead").onclick = async function(){
   const ok = await confirmBox("Purge dead links?", "This checks for videos whose source no longer exists and removes them from the Catalog.", "Purge", true);
   if(!ok) return; this.disabled=true;

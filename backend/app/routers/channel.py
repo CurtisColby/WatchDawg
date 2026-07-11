@@ -1684,6 +1684,202 @@ async def _find_local_file_for_video(
     return None
 
 
+# ---------------------------------------------------------------------------
+# Progressive YouTube pipe (Session 62)
+# ---------------------------------------------------------------------------
+# Replaces the "download the whole video, then serve it" step of the Session 57
+# remux-on-play path with a live pipe: the resolver has ALREADY produced the
+# direct CDN URLs for the video-only and audio-only streams, so we feed both
+# straight into ffmpeg (-c copy, no transcode) and forward ffmpeg's output to
+# the client as it is produced. Startup latency stops scaling with video
+# length (~resolve time + a couple of seconds, regardless of duration), no
+# temp file is written, and yt-dlp is NOT run a second time — which also
+# halves the number of cookie-bearing YouTube extractions per play.
+#
+# Container: fragmented MP4 ("-movflags frag_keyframe+empty_moov+
+# default_base_moof"). A normal MP4 puts its index (moov atom) at the END of
+# the file, which is why it cannot be piped; fragmented MP4 interleaves
+# self-contained fragments and is built exactly for streaming. Content type
+# stays video/mp4, same as the Session 57 FileResponse.
+#
+# Known trade-off (accepted in the Session 62 plan): a piped stream is not
+# seekable the way a finished file is — skipping around on a cold first play
+# will restart the stream. The future 6-hour temp cache (queue) is the fix
+# that gives instant start AND seek; this design leaves that door open.
+#
+# Safety net: if ffmpeg produces no output within _YT_PIPE_FIRST_BYTE_TIMEOUT
+# seconds (e.g. the googlevideo CDN rejects ffmpeg's request style, or the
+# container's ffmpeg lacks https support — both unknowns until hardware
+# verification), the helper returns None and the caller falls through to the
+# UNCHANGED Session 57 full-download remux. Worst case is the old behavior,
+# never a broken player.
+
+_YT_PIPE_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
+)
+
+# Seconds to wait for ffmpeg's FIRST output chunk before declaring the pipe
+# path dead and falling back to the full-download remux. The CDN URLs are
+# already resolved at this point, so ffmpeg only has to open two HTTPS
+# connections and read a few packets — healthy startup is 1-3s.
+_YT_PIPE_FIRST_BYTE_TIMEOUT = 20.0
+
+_YT_PIPE_CHUNK_SIZE = 64 * 1024
+
+
+async def _try_progressive_youtube_pipe(video_id: int, video_url: str, audio_url: str):
+    """
+    Attempt to serve a split YouTube stream as a live progressive pipe.
+
+    Launches ffmpeg with the two resolved CDN URLs as inputs, -c copy, and
+    fragmented-MP4 output on stdout. Waits up to _YT_PIPE_FIRST_BYTE_TIMEOUT
+    for the first chunk:
+
+    - First chunk arrives  -> returns a StreamingResponse that forwards
+      ffmpeg's output to the client for the life of the playback. If the
+      client disconnects (stop / channel change), ffmpeg is killed
+      immediately — no orphaned processes, and nothing ever touches disk.
+    - No output in time / ffmpeg dies early -> kills ffmpeg, logs its stderr,
+      and returns None so the caller can fall back to the Session 57 path.
+    """
+    import asyncio as _asyncio
+    from fastapi.responses import StreamingResponse
+
+    # Per-input options (must precede EACH -i they apply to): a browser
+    # user-agent, plus auto-reconnect so a momentary CDN hiccup mid-movie
+    # resumes instead of ending the stream.
+    input_flags = [
+        "-user_agent", _YT_PIPE_USER_AGENT,
+        "-reconnect", "1",
+        "-reconnect_streamed", "1",
+        "-reconnect_delay_max", "5",
+    ]
+    cmd = (
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin"]
+        + input_flags + ["-i", video_url]
+        + input_flags + ["-i", audio_url]
+        + [
+            "-map", "0:v:0",
+            "-map", "1:a:0",
+            "-c", "copy",
+            "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+            "-f", "mp4",
+            "pipe:1",
+        ]
+    )
+
+    logger.info(
+        f"STREAM PIPE | video {video_id} — starting progressive ffmpeg pipe "
+        f"(video+audio CDN inputs, -c copy, fragmented MP4)"
+    )
+
+    try:
+        proc = await _asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=_asyncio.subprocess.PIPE,
+            stderr=_asyncio.subprocess.PIPE,
+        )
+    except Exception as exc:
+        logger.error(f"STREAM PIPE | video {video_id} — could not launch ffmpeg: {exc}")
+        return None
+
+    # Gate on the first chunk. If ffmpeg can't produce output quickly, this
+    # path doesn't work for this video (or at all) — fall back.
+    try:
+        first_chunk = await _asyncio.wait_for(
+            proc.stdout.read(_YT_PIPE_CHUNK_SIZE),
+            timeout=_YT_PIPE_FIRST_BYTE_TIMEOUT,
+        )
+    except _asyncio.TimeoutError:
+        first_chunk = b""
+
+    if not first_chunk:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        err_text = ""
+        try:
+            _, stderr_data = await _asyncio.wait_for(proc.communicate(), timeout=5)
+            err_text = (stderr_data or b"").decode(errors="replace")[:500]
+        except Exception:
+            pass
+        logger.warning(
+            f"STREAM PIPE | video {video_id} — no output within "
+            f"{_YT_PIPE_FIRST_BYTE_TIMEOUT:.0f}s, falling back to full-download "
+            f"remux. ffmpeg said: {err_text or '(nothing)'}"
+        )
+        return None
+
+    logger.info(
+        f"STREAM PIPE | video {video_id} — first bytes ready, streaming to client"
+    )
+
+    # Drain stderr in the background for the rest of the stream. Without this,
+    # a chatty ffmpeg (reconnect notices on a long movie) could fill the 64 KB
+    # stderr pipe buffer and deadlock the process. Keeps only the tail for the
+    # exit log.
+    stderr_tail = bytearray()
+
+    async def _drain_stderr():
+        try:
+            while True:
+                data = await proc.stderr.read(4096)
+                if not data:
+                    break
+                stderr_tail.extend(data)
+                if len(stderr_tail) > 2048:
+                    del stderr_tail[:-2048]
+        except Exception:
+            pass
+
+    drain_task = _asyncio.create_task(_drain_stderr())
+
+    async def _pipe_body():
+        try:
+            yield first_chunk
+            while True:
+                chunk = await proc.stdout.read(_YT_PIPE_CHUNK_SIZE)
+                if not chunk:
+                    break
+                yield chunk
+            rc = await proc.wait()
+            if rc == 0:
+                logger.info(f"STREAM PIPE | video {video_id} — stream complete")
+            else:
+                tail = stderr_tail.decode(errors="replace")[-300:]
+                logger.warning(
+                    f"STREAM PIPE | video {video_id} — ffmpeg exited {rc} "
+                    f"mid-stream. Tail: {tail or '(nothing)'}"
+                )
+        finally:
+            # Runs on normal completion AND on client disconnect (stop button,
+            # channel change) — StreamingResponse closes the generator, which
+            # triggers this block. Kill ffmpeg if it is still running.
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                logger.info(
+                    f"STREAM PIPE | video {video_id} — client disconnected, "
+                    f"ffmpeg terminated"
+                )
+            drain_task.cancel()
+
+    return StreamingResponse(
+        _pipe_body(),
+        media_type="video/mp4",
+        headers={
+            "Content-Disposition": f'inline; filename="watchdawg_{video_id}.mp4"',
+            # Be honest with the client: a live pipe cannot honor byte-range
+            # requests. TiviMate will play linearly; seeking restarts.
+            "Accept-Ranges": "none",
+        },
+    )
+
+
 @router.get("/stream/{video_id}", response_class=Response)
 async def stream_video_redirect(
     video_id: int,
@@ -1700,8 +1896,11 @@ async def stream_video_redirect(
       for a server-side ffmpeg remux into one continuous stream.
     - Combined HLS stream (no separate audio_url): route through /proxy/stream.
       The manifest already contains both audio and video tracks.
-    - Split MP4 stream (audio_url present, non-HLS, e.g. YouTube): route to
-      DASH manifest so ExoPlayer merges both tracks.
+    - Split MP4 stream (audio_url present, non-HLS, e.g. YouTube): progressive
+      ffmpeg pipe of the two resolved CDN streams (Session 62), falling back
+      to the Session 57 full-download remux if the pipe produces no output;
+      non-YouTube split MP4 routes to the DASH manifest so ExoPlayer merges
+      both tracks.
     - Combined stream: route through /proxy/stream.
 
     Uses resolve_video_for_tv() rather than the standard resolver so a
@@ -1827,9 +2026,15 @@ async def stream_video_redirect(
     # Split MP4 (non-HLS, e.g. YouTube): route by source.
     #
     # YouTube: DASH manifests are unplayable by OwnTV/ExoPlayer and TiviMate.
-    # Instead, run yt-dlp to download both streams and remux them into a
-    # combined MP4 via ffmpeg (-c copy, no transcode), then stream the file
-    # to the client. This is the ffmpeg remux-on-play path (Session 57).
+    #
+    # PRIMARY (Session 62): progressive pipe — feed the two resolved CDN URLs
+    # straight into ffmpeg (-c copy) and stream fragmented MP4 to the client
+    # as it is produced. Startup latency stops scaling with video length, no
+    # temp file, no second yt-dlp extraction.
+    #
+    # FALLBACK (Session 57, unchanged): if the pipe produces no output within
+    # its startup window, run yt-dlp to download both streams, remux into a
+    # combined MP4 via ffmpeg (-c copy), then stream the finished file.
     #
     # Non-YouTube split MP4: keep the existing DASH manifest path (untested
     # but preserved for safety).
@@ -1840,6 +2045,14 @@ async def stream_video_redirect(
         )
 
         if is_youtube:
+            # ---- Progressive pipe first (Session 62) ----
+            pipe_response = await _try_progressive_youtube_pipe(
+                video_id, cdn_url, audio_url
+            )
+            if pipe_response is not None:
+                return pipe_response
+
+            # ---- Fallback: Session 57 full-download remux (unchanged) ----
             import os
             from fastapi.responses import FileResponse
             from starlette.background import BackgroundTask
