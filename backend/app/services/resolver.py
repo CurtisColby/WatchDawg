@@ -1610,23 +1610,23 @@ class ResolverService:
                     Video.source_provider != "local_folder",
                 ),
             )
-            .order_by(Video.id.asc())
-            .limit(limit)
         )
         if channel_ids:
-            stmt = (
-                select(Video)
-                .where(
-                    or_(Video.thumbnail_url.is_(None), Video.thumbnail_url == ""),
-                    or_(
-                        Video.source_provider.is_(None),
-                        Video.source_provider != "local_folder",
-                    ),
-                    Video.channel_id.in_(channel_ids),
-                )
-                .order_by(Video.id.asc())
-                .limit(limit)
+            stmt = stmt.where(Video.channel_id.in_(channel_ids))
+
+        # Session 65: honor the YouTube on-demand policy here too. Each
+        # backfill is a yt-dlp metadata call made with the YouTube cookie, so
+        # with the background switch OFF (the default) YouTube videos are
+        # excluded at the SQL level — same pattern as resolve_batch. YouTube
+        # thumbnails arrive when the video is resolved on demand at play
+        # time, or when the switch is deliberately enabled.
+        if not is_youtube_background_resolve_enabled():
+            stmt = stmt.where(
+                ~Video.source_url.contains("youtube.com"),
+                ~Video.source_url.contains("youtu.be"),
             )
+
+        stmt = stmt.order_by(Video.id.asc()).limit(limit)
         result = await self._db.execute(stmt)
         videos = result.scalars().all()
 
@@ -1724,12 +1724,30 @@ class ResolverService:
                 Video.resolution_status == "resolved",
                 Video.resolved_format.isnot(None),
             )
+        )
+        if channel_ids:
+            stmt = stmt.where(Video.channel_id.in_(channel_ids))
+
+        # Session 65: honor the YouTube on-demand policy. When the background
+        # YouTube resolve switch is OFF (the default), exclude YouTube from
+        # the quality-upgrade query entirely — same SQL-level exclusion as
+        # resolve_batch. Before this guard, this job re-ran yt-dlp on ~25
+        # (mostly YouTube) videos every 6 hours regardless of the switch,
+        # back-off, or cookie-stale pause: the primary cookie-burner found in
+        # the Session 65 log audit. Low-res YouTube videos simply keep their
+        # current quality until the switch is deliberately enabled.
+        if not is_youtube_background_resolve_enabled():
+            stmt = stmt.where(
+                ~Video.source_url.contains("youtube.com"),
+                ~Video.source_url.contains("youtu.be"),
+            )
+
+        stmt = (
+            stmt
             .order_by(Video.reddit_score.desc().nullslast())
             .offset(chunk_offset)
             .limit(chunk_size * 4)  # over-fetch so we have enough after height filter
         )
-        if channel_ids:
-            stmt = stmt.where(Video.channel_id.in_(channel_ids))
         result = await self._db.execute(stmt)
         candidates = result.scalars().all()
 
@@ -1745,9 +1763,20 @@ class ResolverService:
             "same_or_lower": 0,
             "errored": 0,
             "skipped_permanent": 0,
+            "skipped_paused": 0,
         }
 
         for video in low_quality:
+            # Session 65: even when the background switch is ON, respect the
+            # rate-limit back-off and cookie-stale pauses — the same guards
+            # resolve_batch applies. Hammering yt-dlp while the cookie is
+            # already bot-flagged is exactly what gets a session burned.
+            if _is_youtube_source(video.source_url) and (
+                is_youtube_backed_off() or is_cookie_stale_paused()
+            ):
+                summary["skipped_paused"] += 1
+                continue
+
             old_height = _parse_height(video.resolved_format)
             try:
                 logger.info(
@@ -1802,7 +1831,8 @@ class ResolverService:
         logger.info(
             f"Quality upgrade complete: {summary['upgraded']} upgraded, "
             f"{summary['same_or_lower']} unchanged, {summary['errored']} errored, "
-            f"{summary['skipped_permanent']} permanent-gone "
+            f"{summary['skipped_permanent']} permanent-gone, "
+            f"{summary['skipped_paused']} skipped-paused "
             f"out of {summary['checked']} checked"
         )
         return summary
