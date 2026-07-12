@@ -78,6 +78,28 @@ GitHub sync repo paths are **`backend/app/...`** — not `app/...`. E.g. `backen
 
 ---
 
+## LATE-SESSION ADDITIONS (after first summary draft)
+
+### Channel rename feature — SHIPPED
+
+Motivation: manual name prefixes (e.g. "YOUTUBE — ") so TiviMate shows at a glance which sources resolve live on play vs. play from disk.
+
+- **channel.py (hash `78163e9d…`, base `ca9676…`):** new `PATCH /channel/{id}/name` — display name only (empty + 200-char guards); url, unique_key, channel_type never touched, so scraping/dedup unaffected. TiviMate picks names up on playlist refresh. Docstring endpoint list updated.
+- **index.html (hash `a2fbf772…`, base `9c5651…`):** ✏️ Rename button on each source card — prompt pre-filled with current name, in-place card update, standard toast.
+- Deployed, hash-verified, pushed to GitHub; Colby renamed a source successfully.
+- Bulk YouTube-prefix one-liner provided in session (loop GET /channel → PATCH each youtube-type source) — optional, not yet run.
+- Design note (recorded at scoping): a channel-level prefix reflects intent, not per-video truth — disk-first playback means downloaded videos in "Online" channels still play locally. Automated 💾 marker in Xtream titles remains a queued future idea.
+
+### YouTube cookie stale incident — resolved, mechanism documented
+
+Cookie went stale mid-session; a fresh cookie appeared not to take. Diagnosis: cookie file hashes MATCHED host↔container (no inode trap this time), but `youtube_cookies.state` stays **"stale" until the next SUCCESSFUL YouTube extraction** — and with background resolve off, nothing attempts one until a YouTube video is played. Cleared the pause via `DELETE /resolve/cookie-stale` (endpoint works — fixed this session by the route reorder), played a YouTube video, state flipped to ok.
+
+**Key learning — the incognito cookie export routine:** exporting cookies from a browser that keeps browsing YouTube afterward gets the exported session rotated/invalidated within minutes. Reliable routine: private/incognito window → log in to YouTube → export cookies from that window → close it without further browsing (session freezes, export stays valid). **This routine belongs in the queued "cookie refresh instructions in web UI" item.**
+
+
+
+---
+
 ## LIVE FILE HASHES AFTER THIS SESSION (source of truth)
 
 | File | Container path | New SHA-256 | Container | Host | GitHub |
@@ -85,10 +107,12 @@ GitHub sync repo paths are **`backend/app/...`** — not `app/...`. E.g. `backen
 | models.py | /app/app/models.py | 0e3d1febeac1b314c456fbd10c8b28ed69f855c46835c45c4f9df72688ee818c | ✅ | ✅ | ✅ |
 | resolve.py | /app/app/routers/resolve.py | 6af723604a451300801cfa796d5d3789994fcffbe8565aacfba2b4781a4072e5 | ✅ | ✅ | ✅ |
 | library.py | /app/app/routers/library.py | df546358a4209e74c623b648ac638176e7cceb0317f67290cafb7511a2569e2e | ✅ | ✅ | ✅ (pushed by Colby) |
+| channel.py | /app/app/routers/channel.py | 78163e9d349739b6e4737ba1f91abc051db426a4c2d11b4854b2bc7d70466923 | ✅ (per Colby) | ✅ (per Colby) | ✅ (pushed by Colby) |
+| index.html | /app/app/templates/index.html | a2fbf7725ed58a2a9f614de616390d006ea397a143f5fd8d29c1d163d8768e95 | ✅ (per Colby) | ✅ (per Colby) | ✅ (pushed by Colby) |
 
 Unchanged this session but relevant: health.py live = `b06553…` (matches S63 summary; **project copy is stale**).
 
-Session-end health check: `{"status":"healthy","database":"connected"}`, YouTube cookies `ok` with recent successful resolve, no pauses active, background resolve OFF.
+Session-end state: healthy, YouTube cookies restored to `ok` after the stale incident (fresh incognito-exported cookie + successful play-time resolve), no pauses active, background resolve OFF. Rename feature deployed and operator-verified.
 
 ---
 
@@ -109,8 +133,8 @@ Session-end health check: `{"status":"healthy","database":"connected"}`, YouTube
 1. **6-hour YouTube temp cache (40 GB cap)** — seek support for the progressive pipe path (tee to disk while piping). Now UNBLOCKED (progressive streaming hardware-verified). Full-session effort; make it a session headliner.
 2. **Legacy `failed` rows decision** — visible in ⚠️ Problems; review and 🚫 individually or one-time cleanup.
 3. **Spot-check the previously-stuck Reddit clips** in Files on Disk — confirm frame-0 thumbnails appeared (or read any .watchdawg_thumbfail.txt markers for the genuinely unreadable ones).
-4. **Channel rename feature (scoped this session, parked):** new `PATCH /channel/{id}/name` in channel.py + ✏️ rename control on source cards in index.html. Motivation: "Local —"/"Online —" name prefixes so TiviMate shows what plays from disk vs. resolves live. Design note: a channel-level prefix reflects intent, not per-video truth (disk-first playback means downloaded videos in "Online" channels still play locally). Future idea logged: automated 💾 marker on downloaded videos in Xtream titles for per-video truth.
+4. **Bulk YouTube-prefix run (optional):** rename endpoint is live; the provided one-liner can prefix all remaining YouTube-type sources with "YOUTUBE — " in one shot.
 5. **Catalog integration decision** (downloaded Reddit files in the web Catalog) — carried from S62.
-6. **Carried opens:** public-login lock-discipline eyeball; v.redd.it playback test in TiviMate; reconcile job; "Saved to NAS" badge/count split on source cards; WatchDawg pseudo-channels; PIN-lock web-UI removal (keep source lock/unlock); Reddit cookie refresh instructions in web UI; clone count; scraper insert-before-download phantom pattern (S61).
+6. **Carried opens:** public-login lock-discipline eyeball; v.redd.it playback test in TiviMate; reconcile job; "Saved to NAS" badge/count split on source cards; WatchDawg pseudo-channels; PIN-lock web-UI removal (keep source lock/unlock); Reddit + YouTube cookie refresh instructions in web UI (include the incognito-export routine from this session); clone count; scraper insert-before-download phantom pattern (S61).
 
-**Housekeeping:** refresh the Claude project files — upload this summary plus the three Session 64 files (models.py, resolve.py, library.py). Still stale/missing in the project: main.py, database.py, proxy.py, web_ui.py, epg.py, tasks/pseudo_scheduler.py, providers/base.py, providers/playlist.py, **health.py** (project copy ≠ live `b06553…`).
+**Housekeeping:** refresh the Claude project files — upload this summary plus the five Session 64 files (models.py, resolve.py, library.py, channel.py, index.html). Still stale/missing in the project: main.py, database.py, proxy.py, web_ui.py, epg.py, tasks/pseudo_scheduler.py, providers/base.py, providers/playlist.py, **health.py** (project copy ≠ live `b06553…`).
