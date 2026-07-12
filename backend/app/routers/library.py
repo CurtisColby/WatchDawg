@@ -26,6 +26,7 @@ Endpoints:
 """
 
 import asyncio
+import datetime
 import logging
 import os
 import subprocess
@@ -52,6 +53,17 @@ VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".m4v", ".avi", ".mov"}
 THUMB_SUFFIX = ".watchdawg_thumb.jpg"
 FFMPEG_GRAB_SECOND = 5
 
+# Session 64: permanent-failure marker sidecar. Written next to a video file
+# only after BOTH thumbnail attempts fail (the -ss seek grab AND the frame-0
+# retry). Both generate-thumbnails passes skip any file that has one, killing
+# the retry-forever loop where the same unreadable file was re-attempted every
+# scheduled tick. The marker contains the ffmpeg error text + timestamp, so
+# diagnosing a stubborn file is `cat file.mp4.watchdawg_thumbfail.txt`.
+# Deleting the marker re-enables retry — no endpoint, no code, just rm.
+# The .txt extension keeps markers invisible to the library scan (which
+# filters by VIDEO_EXTENSIONS), same as the .jpg thumbnail sidecars.
+THUMBFAIL_SUFFIX = ".watchdawg_thumbfail.txt"
+
 
 def _human_size(size_bytes: int) -> str:
     for unit in ("B", "KB", "MB", "GB"):
@@ -75,10 +87,45 @@ def _thumb_path_for(video_path: str) -> str:
     return video_path + THUMB_SUFFIX
 
 
-def _generate_thumb_sync(video_path: str, thumb_path: str) -> bool:
-    cmd = [
-        "ffmpeg",
-        "-ss", str(FFMPEG_GRAB_SECOND),
+def _thumbfail_path_for(video_path: str) -> str:
+    return video_path + THUMBFAIL_SUFFIX
+
+
+def _has_thumbfail_marker(video_path: str) -> bool:
+    """True if this file has already permanently failed thumbnail generation."""
+    return os.path.isfile(_thumbfail_path_for(video_path))
+
+
+def _write_thumbfail_marker(video_path: str, error_text: str) -> None:
+    """
+    Record a permanent thumbnail failure so the file is never retried.
+    Best-effort: a marker write failure (read-only mount, etc.) is logged
+    and swallowed — worst case the file just gets retried next tick,
+    which is exactly the old behaviour.
+    """
+    try:
+        with open(_thumbfail_path_for(video_path), "w", encoding="utf-8") as f:
+            f.write(
+                f"WatchDawg thumbnail generation permanently failed.\n"
+                f"Timestamp (UTC): {datetime.datetime.utcnow().isoformat()}\n"
+                f"Both attempts failed (seek to {FFMPEG_GRAB_SECOND}s, then frame 0).\n"
+                f"Delete this file to allow a retry.\n\n"
+                f"--- last ffmpeg error ---\n{error_text}\n"
+            )
+        logger.warning(f"Thumbfail marker written: {_thumbfail_path_for(video_path)}")
+    except Exception as e:
+        logger.warning(f"Could not write thumbfail marker for {video_path}: {e}")
+
+
+def _run_ffmpeg_grab(video_path: str, thumb_path: str, seek_second: Optional[int]) -> tuple[bool, str]:
+    """
+    Single ffmpeg frame-grab attempt. seek_second=None grabs frame 0 (no -ss).
+    Returns (success, error_text).
+    """
+    cmd = ["ffmpeg"]
+    if seek_second is not None:
+        cmd += ["-ss", str(seek_second)]
+    cmd += [
         "-i", video_path,
         "-frames:v", "1",
         "-q:v", "4",
@@ -88,19 +135,51 @@ def _generate_thumb_sync(video_path: str, thumb_path: str) -> bool:
     ]
     try:
         result = subprocess.run(cmd, capture_output=True, timeout=30)
-        if result.returncode == 0 and os.path.isfile(thumb_path):
-            return True
-        logger.warning(
-            f"ffmpeg failed for {video_path}: "
-            f"{result.stderr.decode(errors='replace')[:200]}"
-        )
-        return False
+        if result.returncode == 0 and os.path.isfile(thumb_path) and os.path.getsize(thumb_path) > 0:
+            return True, ""
+        return False, result.stderr.decode(errors="replace")[-500:]
     except subprocess.TimeoutExpired:
-        logger.warning(f"ffmpeg timed out for {video_path}")
-        return False
+        return False, "ffmpeg timed out (30s)"
     except Exception as e:
-        logger.warning(f"ffmpeg error for {video_path}: {e}")
-        return False
+        return False, f"ffmpeg error: {e}"
+
+
+def _generate_thumb_sync(video_path: str, thumb_path: str) -> bool:
+    """
+    Generate a thumbnail with a two-attempt strategy (Session 64):
+
+    1. Seek to FFMPEG_GRAB_SECOND and grab a frame — mid-clip frames make
+       better thumbnails than frame 0 for normal-length videos.
+    2. If that fails, retry at frame 0 (no seek). Root cause of the old
+       retry-forever loop: many Reddit clips are SHORTER than the seek
+       point, so -ss seeked past EOF, ffmpeg encoded zero frames and
+       errored, and the same healthy files failed every scheduled tick.
+       Frame 0 always exists, so this attempt succeeds for every readable
+       file regardless of duration.
+    3. If BOTH fail the file is genuinely unreadable — write a thumbfail
+       marker sidecar so neither pass ever retries it, and clean up any
+       zero-byte partial output.
+    """
+    ok, _ = _run_ffmpeg_grab(video_path, thumb_path, FFMPEG_GRAB_SECOND)
+    if ok:
+        return True
+
+    ok, err = _run_ffmpeg_grab(video_path, thumb_path, None)
+    if ok:
+        logger.info(f"Thumbnail grabbed at frame 0 (clip shorter than {FFMPEG_GRAB_SECOND}s?): {video_path}")
+        return True
+
+    # Both attempts failed — remove any empty partial file ffmpeg left behind
+    # (a zero-byte .jpg would make both passes think a thumbnail exists).
+    try:
+        if os.path.isfile(thumb_path) and os.path.getsize(thumb_path) == 0:
+            os.remove(thumb_path)
+    except Exception:
+        pass
+
+    logger.warning(f"ffmpeg failed for {video_path} (both attempts): {err[:200]}")
+    _write_thumbfail_marker(video_path, err)
+    return False
 
 
 @router.get("")
@@ -368,6 +447,12 @@ async def generate_thumbnails(
             logger.warning(f"Local thumb: file not found for video {video.id}: {video_path}")
             continue
 
+        # Session 64: permanently-failed files are never retried. Delete the
+        # .watchdawg_thumbfail.txt marker next to the file to force a retry.
+        if _has_thumbfail_marker(video_path):
+            summary["skipped"] += 1
+            continue
+
         thumb_path = _thumb_path_for(video_path)
 
         # If sidecar already exists on disk, just update the DB record.
@@ -401,12 +486,15 @@ async def generate_thumbnails(
     if remaining > 0 and os.path.isdir(downloads_dir):
         for dirpath, _dirnames, filenames in os.walk(downloads_dir):
             for filename in sorted(filenames):
-                if filename.endswith(THUMB_SUFFIX):
+                if filename.endswith(THUMB_SUFFIX) or filename.endswith(THUMBFAIL_SUFFIX):
                     continue
                 _, ext = os.path.splitext(filename)
                 if ext.lower() not in VIDEO_EXTENSIONS:
                     continue
                 full_path = os.path.join(dirpath, filename)
+                # Session 64: skip permanently-failed files (thumbfail marker).
+                if _has_thumbfail_marker(full_path):
+                    continue
                 walk_thumb = _thumb_path_for(full_path)
                 if not os.path.isfile(walk_thumb):
                     walk_candidates.append((full_path, walk_thumb))
@@ -627,6 +715,15 @@ async def delete_library_file(
         try:
             os.remove(thumb_path)
             logger.info(f"Deleted sidecar thumbnail: {thumb_path}")
+        except OSError:
+            pass
+
+    # Session 64: the thumbfail marker follows the file's lifecycle too.
+    fail_path = _thumbfail_path_for(real_path)
+    if os.path.isfile(fail_path):
+        try:
+            os.remove(fail_path)
+            logger.info(f"Deleted thumbfail marker: {fail_path}")
         except OSError:
             pass
 
