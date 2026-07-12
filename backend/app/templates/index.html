@@ -640,6 +640,7 @@ function renderChannels(){
         </label>
         <div class="spacer"></div>
         <button class="btn small" onclick="scrapeChannel(${c.id}, this)" data-tip="Fetch this source's latest videos right now (up to 2000). Only new videos are added.">🔄 Scrape</button>
+        <button class="btn small" onclick="renameChannel(${c.id})" data-tip="Rename this source's display name. Cosmetic only — the URL and scraping are unaffected. Tip: prefix YouTube sources with 'YOUTUBE — ' so TiviMate shows which ones resolve live on play.">✏️ Rename</button>
         <button class="btn small" onclick="clearVideos(${c.id})" data-tip="Delete all of this source's videos from the Catalog. The source itself stays, and a fresh scrape will re-discover videos.">🧹 Clear Videos</button>
         <button class="btn small danger" onclick="deleteChannel(${c.id})" data-tip="Remove this source. You'll be asked whether to also delete its videos.">🗑️ Delete</button>
       </div>
@@ -683,6 +684,21 @@ window.setCategory = async (id, category)=>{
     const r = await api(`/channel/${id}/category`, {method:"PATCH", body: JSON.stringify({category})});
     toast(`"${r.name}" moved to ${r.category}.`, "ok");
     const c = channels.find(x=>x.id===id); if(c) c.category = r.category;
+  }catch(e){ loadChannels(); }
+};
+window.renameChannel = async (id)=>{
+  const c = channels.find(x=>x.id===id);
+  const current = c ? c.name : "";
+  const name = prompt("New name for this source:", current);
+  if (name === null) return;                 // cancelled
+  const trimmed = name.trim();
+  if (!trimmed) return toast("Name cannot be empty.", "err");
+  if (trimmed === current) return;           // unchanged
+  try{
+    const r = await api(`/channel/${id}/name`, {method:"PATCH", body: JSON.stringify({name: trimmed})});
+    toast(`Renamed "${r.old_name}" → "${r.name}".`, "ok");
+    if(c) c.name = r.name;
+    renderChannels();
   }catch(e){ loadChannels(); }
 };
 window.setTags = async (id, tags, quiet)=>{

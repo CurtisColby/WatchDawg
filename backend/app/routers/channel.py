@@ -9,6 +9,7 @@ Endpoints:
 - PATCH  /channel/{id}/lock          — Toggle locked/unlocked (PIN gate).
 - PATCH  /channel/{id}/category      — Set channel category.
 - PATCH  /channel/{id}/genre_tags    — Set genre tags (Milestone R-1).
+- PATCH  /channel/{id}/name          — Rename channel display name (Session 64).
 - POST   /channel/{id}/scrape        — Scrape a single channel on demand.
 - DELETE /channel/{id}/videos        — Clear all videos from a channel.
 
@@ -82,6 +83,19 @@ class ChannelGenreTagsRequest(BaseModel):
             "Comma-separated free-form genre tags. "
             "Example: 'Nature,Documentary'  "
             "Empty string clears all tags."
+        )
+    )
+
+
+class ChannelRenameRequest(BaseModel):
+    name: str = Field(
+        ...,
+        description=(
+            "New display name for the channel (1-200 chars after trim). "
+            "Cosmetic only — url, unique_key, and channel_type are never "
+            "touched, so scraping and dedup are unaffected. Useful for "
+            "prefixes like 'YOUTUBE — ...' so TiviMate shows which sources "
+            "resolve live on play. (Session 64)"
         )
     )
 
@@ -793,6 +807,46 @@ async def set_channel_genre_tags(
         "channel_id": channel_id,
         "name": channel.name,
         "genre_tags": channel.genre_tags,
+    }
+
+
+@router.patch("/{channel_id}/name")
+async def rename_channel(
+    channel_id: int,
+    request: ChannelRenameRequest,
+    db: AsyncSession = Depends(get_db_session),
+):
+    """
+    Rename a channel (display name only). (Session 64)
+
+    Touches Channel.name and nothing else — url, unique_key, and
+    channel_type are preserved, so scraping and dedup behave identically.
+    TiviMate picks the new name up on its next playlist refresh (Xtream
+    category names are read live from the DB).
+    """
+    new_name = (request.name or "").strip()
+    if not new_name:
+        raise HTTPException(status_code=400, detail="Name cannot be empty.")
+    if len(new_name) > 200:
+        raise HTTPException(status_code=400, detail="Name too long (max 200 characters).")
+
+    stmt = select(Channel).where(Channel.id == channel_id)
+    result = await db.execute(stmt)
+    channel = result.scalar_one_or_none()
+
+    if channel is None:
+        raise HTTPException(status_code=404, detail="Channel not found")
+
+    old_name = channel.name
+    channel.name = new_name
+    await db.commit()
+
+    logger.info(f"Channel renamed: '{old_name}' -> '{new_name}'")
+    return {
+        "status": "renamed",
+        "channel_id": channel_id,
+        "old_name": old_name,
+        "name": channel.name,
     }
 
 
