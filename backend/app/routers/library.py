@@ -17,6 +17,11 @@ Endpoints:
 - GET    /library/stream/{filename:path}    — Stream a local file (range-capable).
 - GET    /library/thumb/{filename:path}     — Serve a generated thumbnail jpg.
 - POST   /library/generate-thumbnails       — ffmpeg frame-grab for unmatched files.
+- POST   /library/purge-missing-files       — Remove local_folder records whose files
+                                              are gone from disk (Session 63: now also
+                                              cleans linked Favorite/WatchHistory/
+                                              Watchlist rows and refuses to run if the
+                                              downloads mount looks absent).
 - DELETE /library/file                      — Delete file + add to skip list.
 """
 
@@ -33,7 +38,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db_session
-from app.models import Favorite, Video, SkipListEntry
+from app.models import Favorite, Video, SkipListEntry, WatchHistory, Watchlist
 from app.config import settings
 from app.encryption import encrypt_value
 from app.hashing import hmac_hash
@@ -429,6 +434,25 @@ async def generate_thumbnails(
     return {"status": "complete", "summary": summary}
 
 
+async def _delete_video_children(db: AsyncSession, video_id: int) -> None:
+    """
+    Delete Favorite / WatchHistory / Watchlist rows linked to a video before
+    the video row itself is deleted. (Session 63)
+
+    Why explicit deletes: WatchHistory and Watchlist declare ondelete=CASCADE,
+    but SQLite only honors CASCADE when PRAGMA foreign_keys=ON — which this
+    app never sets — so at runtime those clauses do nothing. Favorite has no
+    CASCADE at all. Raw db.delete(video) therefore strands child rows, and
+    because SQLite reuses rowids, an orphaned watch_history row could later
+    attach to a completely unrelated new video. Every delete path must clean
+    children explicitly.
+    """
+    for model in (Favorite, WatchHistory, Watchlist):
+        result = await db.execute(select(model).where(model.video_id == video_id))
+        for row in result.scalars().all():
+            await db.delete(row)
+
+
 @router.post("/purge-missing-files")
 async def purge_missing_files(
     db: AsyncSession = Depends(get_db_session),
@@ -436,8 +460,15 @@ async def purge_missing_files(
     """Delete local_folder video records whose files no longer exist on disk.
 
     Scans all local_folder videos, checks if the source_url path exists,
-    and deletes the DB record (plus any sidecar thumbnail) for missing files.
-    Prevents dead records from clogging the thumbnail queue and catalog.
+    and deletes the DB record (plus any sidecar thumbnail and linked
+    Favorite/WatchHistory/Watchlist rows) for missing files. Prevents dead
+    records from clogging the thumbnail queue and catalog.
+
+    Safety guard (Session 63): if EVERY local file appears missing, the most
+    likely explanation is that the downloads volume isn't mounted (or the
+    path moved) — not that the entire library was deliberately deleted. In
+    that case the purge ABORTS without touching anything and says so, rather
+    than mass-deleting every local record over a missing mount.
     """
     stmt = select(Video).where(Video.source_provider == "local_folder")
     result = await db.execute(stmt)
@@ -445,11 +476,36 @@ async def purge_missing_files(
 
     summary = {"checked": len(local_videos), "deleted": 0, "kept": 0}
 
+    # Phase 1 — scan only. Classify before deleting anything so the
+    # empty-mount guard can inspect the whole picture first.
+    missing: list = []
     for video in local_videos:
         if video.source_url and os.path.isfile(video.source_url):
             summary["kept"] += 1
-            continue
+        else:
+            missing.append(video)
 
+    # Empty-mount guard: everything missing (and there was something to
+    # check) almost certainly means the volume is absent, not the files.
+    if local_videos and len(missing) == len(local_videos):
+        logger.warning(
+            f"Purge missing files ABORTED: all {len(local_videos)} local "
+            f"records appear missing — downloads volume is probably not "
+            f"mounted. Nothing was deleted."
+        )
+        return {
+            "status": "aborted",
+            "summary": summary,
+            "message": (
+                f"Aborted: all {len(local_videos)} local files appear missing, "
+                f"which usually means the downloads folder isn't mounted. "
+                f"Nothing was deleted. If you really did remove every local "
+                f"file, delete the source channel instead."
+            ),
+        }
+
+    # Phase 2 — act on the genuinely missing records.
+    for video in missing:
         # File is gone — clean up sidecar thumbnail if it exists
         if video.source_url:
             thumb_path = _thumb_path_for(video.source_url)
@@ -460,6 +516,7 @@ async def purge_missing_files(
                     pass
 
         logger.info(f"Purging missing local file: video {video.id} ({video.source_url})")
+        await _delete_video_children(db, video.id)
         await db.delete(video)
         summary["deleted"] += 1
 
@@ -498,7 +555,9 @@ async def delete_library_file(
     1. Validates path stays within downloads_path (no path traversal).
     2. Looks up the associated Video record via the Favorite link.
     3. Adds the video's source_post_id to the skip list.
-    4. Deletes the Favorite and Video DB records.
+    4. Deletes the Favorite, WatchHistory, Watchlist, and Video DB records
+       (children explicitly — SQLite never enforces CASCADE here, see
+       _delete_video_children).
     5. Deletes the actual file and any sidecar thumbnail from disk.
     """
     downloads_dir = settings.downloads_path
@@ -547,6 +606,7 @@ async def delete_library_file(
                 logger.info(f"Added {video.source_post_id} to skip list")
 
             await db.delete(favorite)
+            await _delete_video_children(db, video.id)
             await db.delete(video)
             video_deleted = True
             favorite_cleaned = True

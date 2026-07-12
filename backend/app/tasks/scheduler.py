@@ -3,13 +3,37 @@ WatchDawg Background Scheduler.
 
 Runs periodic tasks inside the FastAPI process using APScheduler:
 1. Scrape job         — fetches new posts from all enabled channels.
-2. Resolve job        — resolves pending videos and refreshes expired URLs.
+2. Resolve job        — resolves pending videos (pending-only by design; URL
+                        refreshes happen at play time via the TV path).
 3. Dedup job          — sweeps all resolved videos for CDN fingerprint duplicates.
 4. Quality upgrade    — re-resolves low-quality videos in chunks.
 5. Live TV probe      — probes live stream URLs for online status (every 15 min).
 6. Thumbnail pass     — fills missing thumbnails automatically (every 30 min):
                         ffmpeg frame-grabs for local files + yt-dlp metadata
                         backfill for scraped videos. (Session 58)
+7. yt-dlp auto-update — upgrades yt-dlp daily; restarts the container on change.
+8. EPG rebuild        — rebuilds all enabled EPG pseudo-channel schedules every
+                        6 hours. (Session 63) Schedules only cover 48 hours, so
+                        without this job Live TV silently goes blank ~2 days
+                        after the last manual rebuild. Lock discipline is
+                        enforced inside build_channel_schedule itself: adult
+                        channels pull ONLY from locked sources, main channels
+                        NEVER do — a bulk rebuild cannot cross-contaminate.
+9. XMLTV refresh      — re-fetches enabled XMLTV guide sources every 2 hours
+                        (the cadence refresh_all_xmltv_sources() always
+                        documented but was never actually scheduled for).
+
+Job run registry (Session 63):
+  Every job is wrapped by @_track_job, which records last start/end time,
+  duration, a short counts-only result summary, last error, and running state
+  in an in-memory registry. get_scheduler_status() merges this with
+  APScheduler's live job list (including next_run_time) for the Settings-page
+  scheduler dashboard, served via GET /health/scheduler. run_job_now() lets
+  the dashboard trigger any job immediately.
+
+  LOCK DISCIPLINE: result summaries contain COUNTS ONLY — never video or
+  channel titles — because the dashboard renders on the Settings page, which
+  is visible to locked (public) web sessions.
 
 The scheduler starts when the FastAPI app starts and stops on shutdown.
 Intervals are configurable via environment variables.
@@ -85,12 +109,133 @@ THUMBNAIL_PASS_INTERVAL_MINUTES = 30
 THUMBNAIL_LOCAL_LIMIT = 50
 THUMBNAIL_BACKFILL_LIMIT = 25
 
+# EPG pseudo-channel schedule rebuild interval (hours). (Session 63)
+# Schedules are built 48 hours out; a 6-hour rebuild keeps the window rolling
+# with plenty of margin. Matches the cadence rebuild_all_epg_schedules()
+# documented from the start.
+EPG_REBUILD_INTERVAL_HOURS = 6
 
+# XMLTV guide source refresh interval (hours). (Session 63)
+# Matches the cadence refresh_all_xmltv_sources() documented from the start.
+XMLTV_REFRESH_INTERVAL_HOURS = 2
+
+
+# ---------------------------------------------------------------------------
+# Job run registry (Session 63).
+#
+# In-memory record of every job's last run, powering the Settings-page
+# scheduler dashboard (GET /health/scheduler). APScheduler knows the FUTURE
+# (next_run_time) but forgets the past the moment a run ends — this registry
+# is the past: when each job last started and finished, how long it took,
+# what it accomplished (counts only — see lock discipline note in the module
+# docstring), and whether it errored.
+#
+# In-memory only: a container restart clears history. That's fine — every
+# job fires at startup anyway, so the dashboard repopulates within minutes.
+# ---------------------------------------------------------------------------
+_job_history: dict = {}
+
+
+def _track_job(job_id: str):
+    """
+    Decorator that records run history for a scheduled job.
+
+    Captures start/end timestamps, duration, the job's returned summary
+    string (counts only), and any uncaught exception. Jobs keep their own
+    internal try/except blocks — this is a belt-and-suspenders outer guard
+    so a job can never kill the scheduler loop AND the failure is visible
+    on the dashboard instead of only in logs.
+    """
+    def decorator(fn):
+        import functools
+
+        @functools.wraps(fn)
+        async def wrapper(*args, **kwargs):
+            rec = _job_history.setdefault(job_id, {
+                "run_count": 0, "error_count": 0,
+                "last_start": None, "last_end": None,
+                "last_duration_seconds": None,
+                "last_result": None, "last_error": None,
+                "running": False,
+            })
+            start = datetime.datetime.utcnow()
+            rec["running"] = True
+            rec["last_start"] = start.isoformat() + "Z"
+            rec["run_count"] += 1
+            try:
+                result = await fn(*args, **kwargs)
+                rec["last_result"] = result if isinstance(result, str) else "completed"
+                rec["last_error"] = None
+            except Exception as e:
+                rec["error_count"] += 1
+                rec["last_error"] = str(e)[:300]
+                rec["last_result"] = "failed"
+                logger.error(f"Scheduled job '{job_id}' raised: {e}")
+            finally:
+                end = datetime.datetime.utcnow()
+                rec["running"] = False
+                rec["last_end"] = end.isoformat() + "Z"
+                rec["last_duration_seconds"] = round((end - start).total_seconds(), 1)
+        return wrapper
+    return decorator
+
+
+def get_scheduler_status() -> dict:
+    """
+    Merge APScheduler's live job list with the run-history registry.
+
+    Returns everything the Settings-page dashboard needs: per job — id,
+    display name, next run time, interval, running-now flag, last run
+    start/end/duration, a counts-only result summary, last error, and
+    lifetime run/error counts.
+    """
+    jobs = []
+    for job in scheduler.get_jobs():
+        rec = _job_history.get(job.id, {})
+        jobs.append({
+            "id": job.id,
+            "name": job.name,
+            "next_run": job.next_run_time.isoformat() if job.next_run_time else None,
+            "interval": str(job.trigger),
+            "running": rec.get("running", False),
+            "last_start": rec.get("last_start"),
+            "last_end": rec.get("last_end"),
+            "last_duration_seconds": rec.get("last_duration_seconds"),
+            "last_result": rec.get("last_result"),
+            "last_error": rec.get("last_error"),
+            "run_count": rec.get("run_count", 0),
+            "error_count": rec.get("error_count", 0),
+        })
+    return {
+        "scheduler_running": scheduler.running,
+        "server_time": datetime.datetime.now(
+            scheduler.timezone if scheduler.running else None
+        ).isoformat(),
+        "jobs": jobs,
+    }
+
+
+def run_job_now(job_id: str) -> bool:
+    """
+    Trigger a scheduled job to run immediately (the dashboard's Run Now
+    button). Returns False if no such job exists. The job's regular interval
+    continues unchanged afterward.
+    """
+    job = scheduler.get_job(job_id)
+    if job is None:
+        return False
+    job.modify(next_run_time=datetime.datetime.now(scheduler.timezone))
+    logger.info(f"Job '{job_id}' triggered to run now via dashboard.")
+    return True
+
+
+@_track_job("scrape_job")
 async def scheduled_scrape():
     """
     Periodic scrape job. Runs every SCRAPE_INTERVAL_MINUTES.
     Iterates through all enabled channels and scrapes each one.
     Creates its own database session since it runs outside of a request.
+    Returns a counts-only summary string for the scheduler dashboard.
     """
     logger.info("Scheduled scrape starting...")
     async with async_session_factory() as db:
@@ -101,9 +246,10 @@ async def scheduled_scrape():
 
             if not channels:
                 logger.info("No enabled channels found — skipping scheduled scrape.")
-                return
+                return "no enabled channels"
 
             total_new = 0
+            errored = 0
             for channel in channels:
                 try:
                     # Session 58: local_folder channels MUST bypass the generic
@@ -147,6 +293,7 @@ async def scheduled_scrape():
                     logger.error(
                         f"Scheduled scrape failed for channel '{channel.name}': {e}"
                     )
+                    errored += 1
                     continue
 
             await db.commit()
@@ -154,11 +301,17 @@ async def scheduled_scrape():
                 f"Scheduled scrape complete: {len(channels)} channels, "
                 f"{total_new} total new videos"
             )
+            summary = f"{len(channels)} channels scraped, {total_new} new videos"
+            if errored:
+                summary += f", {errored} channels errored"
+            return summary
 
         except Exception as e:
             logger.error(f"Scheduled scrape failed: {e}")
+            return f"failed: {str(e)[:120]}"
 
 
+@_track_job("resolve_job")
 async def scheduled_resolve():
     """
     Periodic resolve job. Runs every SCRAPE_INTERVAL_MINUTES alongside scrape.
@@ -167,9 +320,11 @@ async def scheduled_resolve():
     1. Pending pass  — resolve new pending videos (up to SCHEDULED_PENDING_LIMIT).
     2. DASH purge    — auto-purge any DASH-only videos that slipped through.
 
+    Returns a counts-only summary string for the scheduler dashboard.
+
     NOTE (Session 56): the old "expired pass" (resolver.resolve_expired) was
     removed. That method no longer exists on ResolverService — it was replaced
-    by warm_tv_cache() during an earlier refactor, but the call site here was
+    during an earlier refactor, but the call site here was
     never updated. It threw AttributeError every tick, which the except block
     below caught and ROLLED BACK — discarding Pass 1's committed work along with
     it. That silent rollback was starving Vimeo background resolving. Removing
@@ -194,10 +349,29 @@ async def scheduled_resolve():
             if dash_purged:
                 logger.info(f"Scheduled resolve (DASH purge): {dash_purged} DASH-only videos removed")
 
+            parts = [f"resolved {summary['resolved']}/{summary['total']}"]
+            if summary.get("deleted"):
+                parts.append(f"{summary['deleted']} dead removed")
+            if summary.get("failed"):
+                parts.append(f"{summary['failed']} transient failures")
+            if summary.get("skipped_youtube_bg"):
+                parts.append(f"{summary['skipped_youtube_bg']} YouTube deferred to on-demand")
+            if summary.get("skipped_backoff"):
+                parts.append(f"{summary['skipped_backoff']} skipped (back-off)")
+            if summary.get("skipped_cookie_stale"):
+                parts.append(f"{summary['skipped_cookie_stale']} skipped (cookies stale)")
+            if summary.get("stopped_early"):
+                parts.append("stopped early (provider blocked)")
+            if dash_purged:
+                parts.append(f"{dash_purged} DASH purged")
+            return ", ".join(parts)
+
         except Exception as e:
             logger.error(f"Scheduled resolve failed: {e}")
+            return f"failed: {str(e)[:120]}"
 
 
+@_track_job("dedup_job")
 async def scheduled_dedup():
     """
     Periodic CDN fingerprint dedup sweep. Runs every DEDUP_INTERVAL_HOURS (2h).
@@ -205,6 +379,8 @@ async def scheduled_dedup():
     Two-pass sweep:
     Pass 1 — Source URL dedup across ALL video statuses.
     Pass 2 — CDN fingerprint dedup on resolved videos only.
+
+    Returns a counts-only summary string for the scheduler dashboard.
     """
     logger.info("Scheduled dedup sweep starting...")
     async with async_session_factory() as db:
@@ -218,10 +394,14 @@ async def scheduled_dedup():
                 f"Pass 2 (CDN fingerprint): {summary.get('cdn_fingerprint_groups', 0)} groups, "
                 f"{summary.get('cdn_fingerprint_deleted', 0)} deleted"
             )
+            total_deleted = summary.get("source_url_deleted", 0) + summary.get("cdn_fingerprint_deleted", 0)
+            return f"{total_deleted} duplicates removed"
         except Exception as e:
             logger.error(f"Scheduled dedup sweep failed: {e}")
+            return f"failed: {str(e)[:120]}"
 
 
+@_track_job("quality_upgrade_job")
 async def scheduled_quality_upgrade():
     """
     Quality upgrade job. Runs every QUALITY_UPGRADE_INTERVAL_HOURS.
@@ -229,6 +409,8 @@ async def scheduled_quality_upgrade():
     Re-resolves a chunk of low-quality videos (below QUALITY_UPGRADE_MIN_HEIGHT)
     and replaces their stream URL only if yt-dlp finds a better resolution.
     Never deletes videos. Skips on error and moves to the next one.
+
+    Returns a counts-only summary string for the scheduler dashboard.
     """
     global _quality_upgrade_offset
 
@@ -250,25 +432,45 @@ async def scheduled_quality_upgrade():
             _quality_upgrade_offset += QUALITY_UPGRADE_CHUNK_SIZE
             if _quality_upgrade_offset > 10_000:
                 _quality_upgrade_offset = 0
+            return (
+                f"{summary.get('upgraded', 0)} upgraded, "
+                f"{summary.get('same_or_lower', 0)} unchanged "
+                f"of {summary.get('checked', 0)} checked"
+            )
         except Exception as e:
             logger.error(f"Scheduled quality upgrade failed: {e}")
+            return f"failed: {str(e)[:120]}"
 
 
+@_track_job("live_tv_probe_job")
 async def scheduled_live_tv_probe():
     """
     Live TV health probe. Runs every LIVE_TV_PROBE_INTERVAL_MINUTES (15 min).
 
     Probes all live TV channel stream URLs for online status.
     Uses HEAD requests — fast, minimal data transfer.
+
+    Returns an online/total count summary for the scheduler dashboard
+    (probe_all_channels itself logs but returns nothing, so the counts are
+    read back from the DB after the probe).
     """
     logger.info("Scheduled live TV health probe starting...")
     try:
         from app.routers.live_tv import probe_all_channels
         await probe_all_channels()
+
+        from app.models import LiveTvChannel
+        async with async_session_factory() as db:
+            result = await db.execute(select(LiveTvChannel))
+            channels = result.scalars().all()
+        online = sum(1 for ch in channels if ch.is_online)
+        return f"{online}/{len(channels)} channels online"
     except Exception as e:
         logger.error(f"Scheduled live TV probe failed: {e}")
+        return f"failed: {str(e)[:120]}"
 
 
+@_track_job("ytdlp_update_job")
 async def scheduled_ytdlp_update():
     """
     yt-dlp auto-update job. Runs once at startup then every YTDLP_UPDATE_INTERVAL_HOURS.
@@ -276,6 +478,8 @@ async def scheduled_ytdlp_update():
     Runs 'pip install --upgrade yt-dlp yt-dlp-ejs' inside the container.
     If a new version was installed, restarts the container so the update takes effect.
     If already up-to-date, logs and does nothing.
+
+    Returns a version summary string for the scheduler dashboard.
 
     Why this matters: YouTube constantly updates bot-detection. yt-dlp releases
     counter-updates very frequently. Running a stale yt-dlp is a primary cause of
@@ -324,6 +528,7 @@ async def scheduled_ytdlp_update():
                     stderr=subprocess.DEVNULL,
                 ),
             )
+            return f"upgraded to {new_version} — container restarting"
 
         else:
             # Already on the latest version — nothing to do.
@@ -338,11 +543,14 @@ async def scheduled_ytdlp_update():
             logger.info(
                 f"yt-dlp is already up-to-date ({installed_version}). No restart needed."
             )
+            return f"already up-to-date ({installed_version})"
 
     except Exception as e:
         logger.error(f"yt-dlp auto-update check failed: {e}")
+        return f"failed: {str(e)[:120]}"
 
 
+@_track_job("thumbnail_pass_job")
 async def scheduled_thumbnail_pass():
     """
     Automatic thumbnail pass. Runs every THUMBNAIL_PASS_INTERVAL_MINUTES. (Session 58)
@@ -367,22 +575,103 @@ async def scheduled_thumbnail_pass():
     logger.info("Scheduled thumbnail pass starting...")
 
     # Pass 1: local files (ffmpeg frame-grabs)
+    local_note = "0"
     async with async_session_factory() as db:
         try:
             from app.routers.library import generate_thumbnails as _generate_local_thumbnails
             result = await _generate_local_thumbnails(limit=THUMBNAIL_LOCAL_LIMIT, db=db)
             logger.info(f"Scheduled thumbnail pass (local): {result.get('summary', result)}")
+            _s = result.get("summary", {}) if isinstance(result, dict) else {}
+            local_note = str(_s.get("generated", "?"))
         except Exception as e:
             logger.error(f"Scheduled thumbnail pass (local) failed: {e}")
+            local_note = "errored"
 
     # Pass 2: scraped videos (yt-dlp metadata backfill)
+    backfill_note = "0"
     async with async_session_factory() as db:
         try:
             resolver = ResolverService(db)
             summary = await resolver.backfill_thumbnails(limit=THUMBNAIL_BACKFILL_LIMIT)
             logger.info(f"Scheduled thumbnail pass (backfill): {summary}")
+            backfill_note = str(summary.get("filled", "?"))
         except Exception as e:
             logger.error(f"Scheduled thumbnail pass (backfill) failed: {e}")
+            backfill_note = "errored"
+
+    return f"{local_note} local generated, {backfill_note} scraped backfilled"
+
+
+@_track_job("epg_rebuild_job")
+async def scheduled_epg_rebuild():
+    """
+    EPG pseudo-channel schedule rebuild. Runs every EPG_REBUILD_INTERVAL_HOURS
+    (6h) and once at startup. (Session 63)
+
+    Schedules are built 48 hours out by build_channel_schedule; without a
+    recurring rebuild they simply run out and Live TV goes blank ~2 days
+    after the last manual rebuild or channel edit. This job is the recurring
+    rebuild that rebuild_all_epg_schedules() always documented.
+
+    LOCK DISCIPLINE (verified Session 63): safe by construction. Rebuilding
+    is a server-side DB write — it serves nothing. Content separation is
+    enforced INSIDE build_channel_schedule's source query: adult EPG channels
+    pull ONLY from locked (c.locked = 1) sources; main EPG channels NEVER do
+    (c.locked = 0). Serving-side separation is enforced independently by the
+    Xtream layer, which maps the public profile to epg_type 'main' and the
+    private profile to 'adult'. This job cannot cross-contaminate either
+    direction, and its dashboard summary is a count only.
+    """
+    logger.info("Scheduled EPG rebuild starting...")
+    try:
+        from sqlalchemy import text as _text
+        async with async_session_factory() as db:
+            result = await db.execute(
+                _text("SELECT COUNT(*) FROM epg_channels WHERE enabled = 1")
+            )
+            channel_count = result.scalar() or 0
+
+        if channel_count == 0:
+            logger.info("Scheduled EPG rebuild: no enabled EPG channels.")
+            return "no enabled EPG channels"
+
+        from app.routers.epg import rebuild_all_epg_schedules
+        await rebuild_all_epg_schedules()
+        return f"{channel_count} channel schedules rebuilt (48h window)"
+    except Exception as e:
+        logger.error(f"Scheduled EPG rebuild failed: {e}")
+        return f"failed: {str(e)[:120]}"
+
+
+@_track_job("xmltv_refresh_job")
+async def scheduled_xmltv_refresh():
+    """
+    XMLTV guide source refresh. Runs every XMLTV_REFRESH_INTERVAL_HOURS (2h)
+    and once at startup. (Session 63)
+
+    Re-fetches all enabled external XMLTV guide sources and rebuilds their
+    schedules — the cadence refresh_all_xmltv_sources() documented from the
+    start but was never actually scheduled for. No-op (one fast count query)
+    when no XMLTV sources are configured.
+    """
+    logger.info("Scheduled XMLTV refresh starting...")
+    try:
+        from sqlalchemy import text as _text
+        async with async_session_factory() as db:
+            result = await db.execute(
+                _text("SELECT COUNT(*) FROM epg_xmltv_sources WHERE enabled = 1")
+            )
+            source_count = result.scalar() or 0
+
+        if source_count == 0:
+            return "no enabled XMLTV sources"
+
+        from app.routers.epg import refresh_all_xmltv_sources
+        await refresh_all_xmltv_sources()
+        return f"{source_count} guide sources refreshed"
+    except Exception as e:
+        logger.error(f"Scheduled XMLTV refresh failed: {e}")
+        return f"failed: {str(e)[:120]}"
 
 
 def start_scheduler():
@@ -464,6 +753,27 @@ def start_scheduler():
         next_run_time=datetime.datetime.now(),
     )
 
+    # EPG pseudo-channel schedule rebuild — every 6 hours, fires immediately
+    # at startup so a restart always heals stale/expired schedules. (Session 63)
+    scheduler.add_job(
+        scheduled_epg_rebuild,
+        trigger=IntervalTrigger(hours=EPG_REBUILD_INTERVAL_HOURS),
+        id="epg_rebuild_job",
+        name="EPG Schedule Rebuild",
+        replace_existing=True,
+        next_run_time=datetime.datetime.now(),
+    )
+
+    # XMLTV guide source refresh — every 2 hours, fires at startup. (Session 63)
+    scheduler.add_job(
+        scheduled_xmltv_refresh,
+        trigger=IntervalTrigger(hours=XMLTV_REFRESH_INTERVAL_HOURS),
+        id="xmltv_refresh_job",
+        name="XMLTV Guide Refresh",
+        replace_existing=True,
+        next_run_time=datetime.datetime.now(),
+    )
+
     scheduler.start()
     logger.info(
         f"Background scheduler started. "
@@ -476,7 +786,10 @@ def start_scheduler():
         f"yt-dlp auto-update interval: {YTDLP_UPDATE_INTERVAL_HOURS} hours (runs at startup). "
         f"Thumbnail pass interval: {THUMBNAIL_PASS_INTERVAL_MINUTES} minutes "
         f"(local={THUMBNAIL_LOCAL_LIMIT}, backfill={THUMBNAIL_BACKFILL_LIMIT} per tick). "
-        f"All jobs run immediately at startup then repeat on their intervals."
+        f"EPG rebuild interval: {EPG_REBUILD_INTERVAL_HOURS} hours (runs at startup). "
+        f"XMLTV refresh interval: {XMLTV_REFRESH_INTERVAL_HOURS} hours (runs at startup). "
+        f"All jobs run immediately at startup then repeat on their intervals. "
+        f"Job run history: GET /health/scheduler."
     )
 
 

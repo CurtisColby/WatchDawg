@@ -6,23 +6,35 @@ Endpoints:
 - GET  /resolve/{video_id}/manifest.mpd  — Generate a DASH MPD manifest for TV playback
                                            (merges split video+audio into one ExoPlayer URI).
 - GET  /resolve/{video_id}/playlist.m3u8 — Legacy M3U8 playlist (kept but not used).
-- POST /resolve/batch               — Resolve a batch of pending videos.
+- POST /resolve/batch               — Resolve a batch of pending videos (delegates to
+                                      ResolverService.resolve_batch — the same guarded
+                                      implementation the scheduler uses: YouTube excluded
+                                      while the background switch is off, back-off and
+                                      cookie-stale pauses respected, circuit breaker active).
 - POST /resolve/stop                — Signal the running batch to stop after current video.
 - GET  /resolve/youtube-pause       — Return current YouTube back-off / pause state.
 - POST /resolve/youtube-pause       — Manually pause all YouTube yt-dlp activity (default 70 min).
 - DELETE /resolve/youtube-pause     — Cancel an active YouTube pause immediately.
 - GET  /resolve/cookie-stale        — Return current cookie-stale pause state (auto-set on bot-check).
 - DELETE /resolve/cookie-stale      — Manually clear the cookie-stale pause after refreshing cookies.
-- POST /resolve/reset-failed        — Reset failed videos back to pending for retry.
+- GET  /resolve/youtube-background  — Return the YouTube background-resolve switch state.
+- POST /resolve/youtube-background  — Enable/disable background YouTube resolving (default OFF;
+                                      YouTube resolves on demand at play time).
 - POST /resolve/backfill-thumbnails — Fetch missing thumbnails via yt-dlp metadata pass.
 - POST /resolve/purge-dash          — Delete all DASH-only videos (unplayable in browser).
-- POST /resolve/purge-dead          — Delete all failed videos from the database entirely.
 - POST /resolve/purge-duplicates    — Delete duplicate CDN files, keeping highest-scored copy.
 
+Removed endpoints (Session 63): POST /resolve/reset-failed and POST /resolve/purge-dead.
+Both operated on resolution_status == "failed", which no code has written since the
+Session 59 poison-write fix — permanent failures auto-delete at resolve time and
+transient failures stay pending. The buttons were permanent no-ops against legacy
+rows only; any lingering legacy "failed" rows are surfaced by the web UI's Problem
+Videos view with per-video delete/skip controls.
+
 Channel filtering:
-  Both /resolve/batch and /resolve/reset-failed accept an optional
-  ?channel_ids= param (comma-separated channel IDs). When provided, only
-  videos belonging to those channels are affected.
+  /resolve/batch accepts an optional ?channel_ids= param (comma-separated
+  channel IDs). When provided, only videos belonging to those channels are
+  resolved.
 
 Stop mechanism:
   POST /resolve/stop sets a server-side flag. The running batch checks this
@@ -45,7 +57,6 @@ TV Audio Architecture (DASH MPD):
     6. ExoPlayer fetches the manifest, discovers both tracks, plays in sync
 """
 
-import asyncio
 import logging
 import urllib.parse
 from typing import Optional
@@ -63,6 +74,8 @@ from app.services.resolver import (
     get_youtube_pause_state,
     cancel_cookie_stale_pause,
     get_cookie_stale_state,
+    set_youtube_background_resolve,
+    get_youtube_background_resolve_state,
     YOUTUBE_BACKOFF_MINUTES,
 )
 
@@ -208,25 +221,51 @@ async def resolve_video(
 
     Browser clients (client=browser, default):
       Returns a single combined stream URL via the standard yt-dlp resolver.
+
+    force=true bypasses the URL cache on BOTH paths (previously it was
+    accepted but silently ignored on the TV path).
+
+    Failure responses distinguish the two very different outcomes:
+      410 Gone        — the source is permanently unavailable (deleted/private);
+                        the resolver auto-deleted the video from the catalog.
+                        The card should disappear — the video no longer exists.
+      503 Unavailable — a transient problem (rate limit, network, block); the
+                        video STAYS in the catalog and will be retried later.
+                        The recorded error text is included for visibility.
     """
     resolver = ResolverService(db)
 
-    if client == "tv":
-        result = await resolver.resolve_video_for_tv(video_id)
-        if result is None:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Video {video_id} could not be resolved for TV playback.",
-            )
-        return result
+    # Pre-check existence so a ghost card (video already auto-deleted on an
+    # earlier attempt, page never refreshed) gets an accurate message instead
+    # of a confusing generic failure.
+    pre = await db.execute(select(Video).where(Video.id == video_id))
+    if pre.scalar_one_or_none() is None:
+        raise HTTPException(
+            status_code=410,
+            detail="This video was already removed from the catalog "
+                   "(its source is permanently unavailable). Refresh the page to clear the card.",
+        )
 
-    result = await resolver.resolve_video(video_id, force=force)
+    if client == "tv":
+        result = await resolver.resolve_video_for_tv(video_id, force=force)
+    else:
+        result = await resolver.resolve_video(video_id, force=force)
 
     if result is None:
+        # Distinguish auto-deleted (permanent) from still-present (transient).
+        check = await db.execute(select(Video).where(Video.id == video_id))
+        row = check.scalar_one_or_none()
+        if row is None:
+            raise HTTPException(
+                status_code=410,
+                detail="This video is permanently unavailable at its source "
+                       "(deleted or private) — it has been removed from the catalog.",
+            )
+        err = (row.resolution_error or "no error recorded")[:200]
         raise HTTPException(
-            status_code=404,
-            detail=f"Video {video_id} could not be resolved. It may be unavailable, "
-            "private, geo-blocked, or was identified as a lower-scored duplicate.",
+            status_code=503,
+            detail=f"Temporary problem resolving this video — it stays in the "
+                   f"catalog and will be retried. Last error: {err}",
         )
 
     return result
@@ -470,11 +509,28 @@ async def resolve_batch(
     db: AsyncSession = Depends(get_db_session),
 ):
     """
-    Resolve a batch of pending or expired videos.
+    Resolve a batch of pending videos.
 
-    Checks the server-side abort flag (_batch_abort_requested) between each
-    video — if POST /resolve/stop was called, the batch exits after the current
-    video finishes (within the 90-second yt-dlp timeout at most).
+    Delegates to ResolverService.resolve_batch() — the SAME implementation the
+    background scheduler runs — so the web UI's Resolve button gets every
+    guard for free:
+      - YouTube exclusion while the background-resolve switch is off
+        (YouTube resolves on demand at play time; this button never burns
+        cookies on it)
+      - Rate-limit back-off and cookie-stale pause respected
+      - Consecutive-transient-failure circuit breaker (a blocked provider
+        stops the batch instead of grinding through every slot)
+      - Randomized polite inter-request delays
+
+    This endpoint previously carried its own stale copy of the batch logic
+    with NONE of those guards, plus an "expired pass" that re-resolved
+    already-resolved videos through the standard resolver — which never
+    writes resolved_audio_url, leaving mismatched video/audio URL pairs for
+    the TV cache to serve. Pending-only now, by design.
+
+    The server-side abort flag (_batch_abort_requested) is checked between
+    each video — if POST /resolve/stop was called, the batch exits after the
+    current video finishes (within the 90-second yt-dlp timeout at most).
 
     When channel_ids is provided, only resolves videos from those channels.
     """
@@ -482,98 +538,49 @@ async def resolve_batch(
     _batch_abort_requested = False  # Always reset at batch start
 
     parsed_ids = _parse_channel_ids(channel_ids)
+    if parsed_ids is not None and not parsed_ids:
+        return {
+            "status": "complete",
+            "summary": {"total": 0, "resolved": 0, "failed": 0, "deleted": 0},
+            "message": "No valid channel IDs provided — nothing to resolve.",
+        }
+
     resolver = ResolverService(db)
-
-    RESOLUTION_TTL_HOURS = 3
-
-    # Build video list — channel-scoped or global
-    if parsed_ids is not None:
-        if not parsed_ids:
-            return {"status": "complete", "summary": {"total": 0, "resolved": 0, "failed": 0, "deleted": 0}}
-
-        import datetime
-        pending_stmt = (
-            select(Video)
-            .where(
-                Video.resolution_status == "pending",
-                Video.channel_id.in_(parsed_ids),
-            )
-            .order_by(Video.reddit_score.desc().nullslast())
-            .limit(limit)
-        )
-        pending_result = await db.execute(pending_stmt)
-        pending_videos = pending_result.scalars().all()
-
-        expiry_cutoff = datetime.datetime.utcnow() - datetime.timedelta(hours=RESOLUTION_TTL_HOURS)
-        expired_stmt = (
-            select(Video)
-            .where(
-                Video.resolution_status == "resolved",
-                Video.resolved_at < expiry_cutoff,
-                Video.channel_id.in_(parsed_ids),
-            )
-            .order_by(Video.reddit_score.desc().nullslast())
-            .limit(max(0, limit - len(pending_videos)))
-        )
-        expired_result = await db.execute(expired_stmt)
-        expired_videos = expired_result.scalars().all()
-        all_videos = list(pending_videos) + list(expired_videos)
-
-    else:
-        import datetime
-        pending_stmt = (
-            select(Video)
-            .where(Video.resolution_status == "pending")
-            .order_by(Video.reddit_score.desc().nullslast())
-            .limit(limit)
-        )
-        pending_result = await db.execute(pending_stmt)
-        pending_videos = pending_result.scalars().all()
-
-        expiry_cutoff = datetime.datetime.utcnow() - datetime.timedelta(hours=RESOLUTION_TTL_HOURS)
-        expired_stmt = (
-            select(Video)
-            .where(
-                Video.resolution_status == "resolved",
-                Video.resolved_at < expiry_cutoff,
-            )
-            .order_by(Video.reddit_score.desc().nullslast())
-            .limit(max(0, limit - len(pending_videos)))
-        )
-        expired_result = await db.execute(expired_stmt)
-        expired_videos = expired_result.scalars().all()
-        all_videos = list(pending_videos) + list(expired_videos)
-
-    summary = {"total": len(all_videos), "resolved": 0, "failed": 0, "deleted": 0, "stopped": False}
-
-    for video in all_videos:
-        if _batch_abort_requested:
-            logger.info("Batch resolve: stop requested — exiting early.")
-            summary["stopped"] = True
-            break
-
-        video_id = video.id
-        result = await resolver.resolve_video(video_id, force=True)
-        if result is not None:
-            summary["resolved"] += 1
-        else:
-            check = await db.execute(select(Video).where(Video.id == video_id))
-            if check.scalar_one_or_none() is None:
-                summary["deleted"] += 1
-            else:
-                summary["failed"] += 1
-        await asyncio.sleep(1.0)
+    summary = await resolver.resolve_batch(
+        limit=limit,
+        channel_ids=parsed_ids,
+        should_abort=lambda: _batch_abort_requested,
+    )
 
     scope = f"channels {parsed_ids}" if parsed_ids else "all channels"
-    stopped_note = " [STOPPED BY USER]" if summary["stopped"] else ""
+    stopped_note = " [STOPPED BY USER]" if summary.get("stopped") else ""
     logger.info(
         f"Batch resolve ({scope}){stopped_note}: "
         f"{summary['resolved']} resolved, {summary['failed']} failed, "
         f"{summary['deleted']} deleted out of {summary['total']}"
     )
 
+    # Human-readable summary for the web UI toast — the whole point is
+    # visibility into what actually happened behind the scenes.
+    parts = [f"Resolved {summary['resolved']} of {summary['total']}"]
+    if summary.get("deleted"):
+        parts.append(f"{summary['deleted']} removed (source permanently gone)")
+    if summary.get("failed"):
+        parts.append(f"{summary['failed']} temporary failures (will retry)")
+    if summary.get("skipped_youtube_bg"):
+        parts.append(f"{summary['skipped_youtube_bg']} YouTube left for on-demand resolve")
+    if summary.get("skipped_backoff"):
+        parts.append(f"{summary['skipped_backoff']} skipped (YouTube back-off active)")
+    if summary.get("skipped_cookie_stale"):
+        parts.append(f"{summary['skipped_cookie_stale']} skipped (cookies stale)")
+    if summary.get("stopped_early"):
+        parts.append("stopped early — provider appears blocked")
+    if summary.get("stopped"):
+        parts.append("stopped by user")
+
     _batch_abort_requested = False
-    return {"status": "complete", "summary": summary}
+    return {"status": "complete", "summary": summary, "message": ". ".join(parts) + "."}
+
 
 
 @router.get("/youtube-pause")
@@ -657,6 +664,43 @@ async def resume_cookie_stale():
     return {"status": "resumed", "message": "Cookie-stale pause cleared — YouTube extractions resumed.", **state}
 
 
+@router.get("/youtube-background")
+async def get_youtube_background():
+    """
+    Return the YouTube background-resolve switch state.
+
+    When disabled (the default), the scheduled batch resolve skips YouTube
+    entirely — YouTube videos resolve on demand at play time only, which is
+    what keeps the cookie alive. When enabled, the scheduled pass processes
+    YouTube pendings like any other provider.
+
+    In-memory only: a container restart returns the switch to disabled.
+    """
+    return get_youtube_background_resolve_state()
+
+
+@router.post("/youtube-background")
+async def set_youtube_background(
+    enabled: bool = Query(..., description="True to enable background YouTube resolving, False to disable."),
+):
+    """
+    Enable or disable background (scheduled) YouTube resolving.
+
+    Play-time resolution is never affected — pressing play on a YouTube video
+    always resolves it live regardless of this switch.
+    """
+    state = set_youtube_background_resolve(enabled)
+    verb = "enabled" if enabled else "disabled"
+    return {
+        "status": "ok",
+        "message": f"Background YouTube resolving {verb}. "
+                   + ("The scheduled pass will now include YouTube videos."
+                      if enabled else
+                      "YouTube resolves on demand at play time only."),
+        **state,
+    }
+
+
 @router.post("/stop")
 async def stop_resolve_batch():
     """
@@ -672,45 +716,6 @@ async def stop_resolve_batch():
     _batch_abort_requested = True
     logger.info("Resolve batch stop requested by user.")
     return {"status": "stop_requested", "message": "Batch will stop after the current video finishes."}
-
-
-@router.post("/reset-failed")
-async def reset_failed_videos(
-    channel_ids: Optional[str] = Query(
-        None,
-        description="Comma-separated channel IDs to restrict reset to. "
-                    "If omitted, resets ALL failed videos."
-    ),
-    db: AsyncSession = Depends(get_db_session),
-):
-    """Reset failed videos back to pending. Optionally scoped to specific channels."""
-    parsed_ids = _parse_channel_ids(channel_ids)
-
-    stmt = select(Video).where(Video.resolution_status == "failed")
-    if parsed_ids is not None:
-        if not parsed_ids:
-            return {"status": "reset", "reset_count": 0, "message": "No channel IDs provided."}
-        stmt = stmt.where(Video.channel_id.in_(parsed_ids))
-
-    result = await db.execute(stmt)
-    failed_videos = result.scalars().all()
-
-    count = len(failed_videos)
-    for video in failed_videos:
-        video.resolution_status = "pending"
-        video.resolved_stream_url = None
-        video.resolved_at = None
-        video.resolution_error = None
-
-    await db.commit()
-
-    scope = f"channels {parsed_ids}" if parsed_ids else "all channels"
-    logger.info(f"Reset {count} failed videos to pending ({scope})")
-    return {
-        "status": "reset",
-        "reset_count": count,
-        "message": f"Reset {count} failed videos to pending ({scope}). Use Resolve All to retry.",
-    }
 
 
 @router.post("/backfill-thumbnails")
@@ -747,27 +752,6 @@ async def purge_dash_videos(
         "status": "purged",
         "deleted_count": deleted_count,
         "message": f"Deleted {deleted_count} DASH-only videos from the database ({scope}).",
-    }
-
-
-@router.post("/purge-dead")
-async def purge_dead_videos(
-    channel_ids: Optional[str] = Query(
-        None,
-        description="Comma-separated channel IDs to restrict purge to. If omitted, purges across all channels."
-    ),
-    db: AsyncSession = Depends(get_db_session),
-):
-    """Delete failed videos from the database, optionally scoped to channels."""
-    parsed_ids = _parse_channel_ids(channel_ids)
-    resolver = ResolverService(db)
-    deleted_count = await resolver.purge_dead_videos(channel_ids=parsed_ids)
-    scope = f"channels {parsed_ids}" if parsed_ids else "all channels"
-    logger.info(f"Purged {deleted_count} dead videos ({scope})")
-    return {
-        "status": "purged",
-        "deleted_count": deleted_count,
-        "message": f"Deleted {deleted_count} failed videos from the database ({scope}).",
     }
 
 

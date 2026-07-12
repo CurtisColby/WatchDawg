@@ -52,6 +52,15 @@ a{color:var(--info)}
 .status-row{display:flex;align-items:center;gap:8px;margin-top:6px}
 .dot{width:9px;height:9px;border-radius:50%;background:var(--faint);flex:none}
 .dot.good{background:var(--good)} .dot.bad{background:var(--bad)} .dot.warn{background:var(--warn)}
+.dot.spin{background:var(--accent2);animation:dotpulse 1s ease-in-out infinite}
+@keyframes dotpulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.35;transform:scale(.7)}}
+.jobrow{display:flex;align-items:center;gap:10px;padding:9px 4px;border-bottom:1px solid var(--line)}
+.jobrow:last-child{border-bottom:none}
+.jobrow .jname{font-weight:700;min-width:190px}
+.jobrow .jinfo{flex:1;min-width:0}
+.jobrow .jresult{color:var(--dim);font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.jobrow .jerr{color:var(--bad);font-size:12.5px}
+.jobrow .jnext{color:var(--dim);font-size:12px;white-space:nowrap;text-align:right;min-width:110px}
 code.cfg{background:rgba(0,0,0,.32);padding:2px 7px;border-radius:5px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;user-select:all;word-break:break-all}
 
 /* ---------- Main ---------- */
@@ -257,17 +266,17 @@ h2{font-size:16px;margin:26px 0 12px;color:var(--accent2)}
       <div class="row">
         <select id="f-channel" data-tip="Show videos from just one source."></select>
         <select id="f-category" data-tip="Show videos from sources in one category."></select>
-        <select id="f-status" data-tip="Resolved = ready to stream. Pending = not resolved yet. Failed = last resolve attempt errored (you can reset these in Settings).">
+        <select id="f-status" data-tip="Resolved = ready to stream. Pending = not resolved yet. Problems = anything whose last resolve attempt recorded an error — review these and 🚫 the ones you don't want.">
           <option value="">Any status</option>
           <option value="resolved">Resolved</option>
           <option value="pending">Pending</option>
-          <option value="failed">Failed</option>
+          <option value="problems">⚠️ Problems</option>
         </select>
         <input class="grow" id="f-search" placeholder="🔍 Search titles…" data-tip="Filters the videos currently loaded on this page by title or artist.">
         <button class="btn" id="f-apply" data-tip="Reload the catalog with the filters chosen on the left.">Apply</button>
       </div>
       <div class="row" style="margin-top:10px">
-        <button class="btn small" id="c-resolve-batch" data-tip="Resolve up to 25 pending videos so they're ready to stream. Resolving looks up the actual video stream behind each link.">⚡ Resolve 25 Pending</button>
+        <button class="btn small" id="c-resolve-batch" data-tip="Resolve up to 25 pending videos so they're ready to stream. YouTube is skipped on purpose — it resolves on demand when you press play, which keeps the cookie alive.">⚡ Resolve 25 Pending</button>
         <button class="btn small" id="c-resolve-stop" data-tip="Politely stop a running batch resolve after the current video finishes.">🛑 Stop Resolving</button>
         <button class="btn small" id="c-upgrade" data-tip="Re-check videos stored below 720p and upgrade them if a better quality is now available. Never downgrades.">📈 Upgrade Quality</button>
         <div class="spacer"></div>
@@ -347,14 +356,24 @@ h2{font-size:16px;margin:26px 0 12px;color:var(--accent2)}
   </div>
 
   <div class="card">
+    <h2 style="margin-top:0">📅 Background Scheduler</h2>
+    <div class="muted" style="margin-bottom:10px">Everything running behind the scenes: what each job last did, whether it's running right now, and when it fires next. Updates every 10 seconds while this page is open.</div>
+    <div class="row" style="margin-bottom:8px">
+      <span class="muted" id="ytbg-state" data-tip="When OFF (recommended), the background resolver never touches YouTube — YouTube videos resolve the moment you press play, which keeps the cookie alive. Turning it ON makes the scheduled pass bulk-resolve YouTube pendings and burns cookie requests fast.">YouTube background resolving: …</span>
+      <button class="btn small" id="ytbg-toggle" style="display:none"></button>
+      <div class="spacer"></div>
+      <button class="btn small" id="sched-refresh" data-tip="Re-read job status from the server right now.">↻ Refresh</button>
+    </div>
+    <div id="sched-jobs"><div class="empty">Loading scheduler status…</div></div>
+  </div>
+
+  <div class="card">
     <h2 style="margin-top:0">🧹 Maintenance</h2>
     <div class="muted" style="margin-bottom:10px">Safe cleanup tools. Each one tells you exactly what it did.</div>
     <div class="row">
-      <button class="btn small" id="m-reset-failed" data-tip="Mark every 'failed' video as pending again so the resolver will retry them. Use after a bad network day.">♻️ Reset Failed Videos</button>
       <button class="btn small" id="m-backfill" data-tip="Fill in missing thumbnails for scraped videos (Vimeo/YouTube) that don't have one. Uses yt-dlp metadata.">🖼️ Backfill Thumbnails</button>
       <button class="btn small" id="m-local-thumbs" data-tip="Generate thumbnail images for local video files that don't have one. Extracts a frame from each file using ffmpeg.">📁 Local Thumbnails</button>
       <button class="btn small" id="m-purge-missing" data-tip="Remove local video records whose files no longer exist on disk. Cleans up entries left behind after deleting or moving files.">🧹 Purge Missing Files</button>
-      <button class="btn small" id="m-purge-dead" data-tip="Remove videos whose source link no longer works (deleted or private videos).">💀 Purge Dead Links</button>
       <button class="btn small" id="m-purge-dupes" data-tip="Remove duplicate copies of the same video that snuck in from multiple scrapes.">👯 Purge Duplicates</button>
       <button class="btn small danger" id="m-skip-clear" data-tip="Empty the skip list. Videos you skipped in the past may reappear on the next scrape.">🗑️ Clear Skip List (<span id="skip-count">…</span>)</button>
     </div>
@@ -466,7 +485,7 @@ function go(page){
   if (page==="sources")   loadChannels();
   if (page==="downloads"){ loadDownloaders(); }
   if (page==="catalog")  { fillCatalogFilters(); loadFeed(true); }
-  if (page==="settings") { refreshAuth(); refreshHealth(); refreshSkipCount(); refreshPlex(); }
+  if (page==="settings") { refreshAuth(); refreshHealth(); refreshSkipCount(); refreshPlex(); refreshScheduler(); }
 }
 $$(".nav-btn").forEach(b=>b.addEventListener("click", ()=>go(b.dataset.page)));
 
@@ -973,7 +992,9 @@ async function loadFeed(reset){
   const p = new URLSearchParams({limit: 60, offset: feedOffset});
   if ($("#f-channel").value)  p.set("channel_id", $("#f-channel").value);
   if ($("#f-category").value) p.set("category", $("#f-category").value);
-  if ($("#f-status").value)   p.set("status", $("#f-status").value);
+  const stv = $("#f-status").value;
+  if (stv === "problems") p.set("problems", "true");
+  else if (stv)           p.set("status", stv);
   try{
     const data = await api("/feed?" + p.toString(), {}, true);
     feedVideos = reset ? (data.videos||[]) : feedVideos.concat(data.videos||[]);
@@ -994,7 +1015,8 @@ function renderFeed(){
     const st = v.resolution_status;
     const srcIcon = v.source_provider==="local_folder" ? `<span class="badge dim stat" style="left:6px;right:auto" data-tip="Local file — use 📁 Local Thumbnails button for these.">📁 local</span>` : "";
     const badge = st==="resolved" ? `<span class="badge good stat" data-tip="Ready to stream — the real video link is resolved and cached.">resolved</span>`
-      : st==="failed" ? `<span class="badge bad stat" data-tip="The last attempt to resolve this video's stream failed: ${esc(v.resolution_error||"unknown error")}">failed</span>`
+      : st==="failed" ? `<span class="badge bad stat" data-tip="Legacy failed status. Last error: ${esc(v.resolution_error||"unknown error")}. Try ⚡ to retry, or 🚫 to remove it for good.">failed</span>`
+      : v.resolution_error ? `<span class="badge warn stat" data-tip="Still pending, but the last attempt errored: ${esc(v.resolution_error)}. It retries automatically — or ⚡ to retry now, 🚫 to remove for good.">problem</span>`
       : `<span class="badge dim stat" data-tip="Not resolved yet — the stream link gets looked up on demand or via batch resolve.">pending</span>`;
     const thumb = v.thumbnail_url && v.thumbnail_url !== "unavailable" ? `background-image:url('${esc(v.thumbnail_url)}')` : "";
     return `
@@ -1028,12 +1050,21 @@ window.resolveVideo = async (id, btn)=>{
     const r = await api(`/resolve/${id}?force=true`, {}, false);
     if (r && r.stream_url){
       toast("Resolved — ready to stream.", "ok");
-      const v = feedVideos.find(x=>x.id===id); if(v) v.resolution_status = "resolved";
+      const v = feedVideos.find(x=>x.id===id); if(v){ v.resolution_status = "resolved"; v.resolution_error = null; }
       renderFeed();
     } else {
       toast("Resolve finished, but no stream link came back.", "err");
     }
-  }catch(e){}
+  }catch(e){
+    // 410 Gone = the source is permanently dead and the backend auto-deleted
+    // the record (the toast from api() already said so). Remove the card
+    // immediately instead of leaving a ghost that errors on every click.
+    if (e && e.status === 410){
+      feedVideos = feedVideos.filter(v=>v.id!==id);
+      renderFeed();
+    }
+    // 503 = transient; api() already showed the "stays in catalog" message.
+  }
   btn.disabled = false;
 };
 window.favVideo = async (id)=>{
@@ -1114,6 +1145,90 @@ window.removeFav = async (id)=>{
 
 /* ---------------- SETTINGS page ---------------- */
 $("#health-refresh").onclick = refreshHealth;
+
+/* ---------- Background Scheduler dashboard (Session 63) ---------- */
+function agoText(iso){
+  if (!iso) return "never";
+  const s = Math.max(0, (Date.now() - new Date(iso).getTime())/1000);
+  if (s < 90) return Math.round(s) + "s ago";
+  if (s < 5400) return Math.round(s/60) + " min ago";
+  return Math.round(s/3600) + " h ago";
+}
+function inText(iso){
+  if (!iso) return "—";
+  const s = (new Date(iso).getTime() - Date.now())/1000;
+  if (s <= 5) return "any moment";
+  if (s < 90) return "in " + Math.round(s) + "s";
+  if (s < 5400) return "in " + Math.round(s/60) + " min";
+  return "in " + (s/3600).toFixed(1) + " h";
+}
+async function refreshScheduler(){
+  try{
+    const d = await api("/health/scheduler", {}, true);
+    const jobs = d.jobs || [];
+    if (!jobs.length){
+      $("#sched-jobs").innerHTML = `<div class="empty">Scheduler isn't running.</div>`;
+      return;
+    }
+    $("#sched-jobs").innerHTML = jobs.map(j=>{
+      const dot = j.running ? `<span class="dot spin" data-tip="Running right now."></span>`
+        : j.last_error ? `<span class="dot bad" data-tip="Last run errored."></span>`
+        : `<span class="dot good" data-tip="Idle — last run OK."></span>`;
+      const last = j.last_end
+        ? `${agoText(j.last_end)}${j.last_duration_seconds!=null ? " · took " + j.last_duration_seconds + "s" : ""}`
+        : (j.running ? "running…" : "not yet run");
+      const result = j.last_error
+        ? `<div class="jerr">⚠ ${esc(j.last_error)}</div>`
+        : `<div class="jresult">${esc(j.last_result || "—")}</div>`;
+      return `<div class="jobrow">
+        ${dot}
+        <div class="jname">${esc(j.name)}</div>
+        <div class="jinfo">
+          <div class="jresult" style="color:var(--text)">${esc(last)}</div>
+          ${result}
+        </div>
+        <div class="jnext">next: ${inText(j.next_run)}</div>
+        <button class="btn small" onclick="runJobNow('${j.id}', this)" data-tip="Run this job right now. Its regular schedule continues unchanged.">▶ Run Now</button>
+      </div>`;
+    }).join("");
+  }catch(e){
+    $("#sched-jobs").innerHTML = `<div class="empty">Couldn't reach the scheduler status endpoint.</div>`;
+  }
+  refreshYtBg();
+}
+window.runJobNow = async (jobId, btn)=>{
+  btn.disabled = true;
+  try{
+    const r = await api(`/health/scheduler/run/${jobId}`, {method:"POST"});
+    toast(r.message || "Job triggered.", "ok");
+    setTimeout(refreshScheduler, 1200);
+  }catch(e){}
+  btn.disabled = false;
+};
+async function refreshYtBg(){
+  try{
+    const s = await api("/resolve/youtube-background", {}, true);
+    const on = !!s.youtube_background_resolve_enabled;
+    $("#ytbg-state").textContent = "YouTube background resolving: " + (on ? "ON (burns cookie requests)" : "OFF — resolves on play (recommended)");
+    const b = $("#ytbg-toggle");
+    b.style.display = "";
+    b.textContent = on ? "Turn Off" : "Turn On";
+    b.onclick = async ()=>{
+      b.disabled = true;
+      try{
+        const r = await api(`/resolve/youtube-background?enabled=${!on}`, {method:"POST"});
+        toast(r.message || "Switch updated.", "ok");
+      }catch(e){}
+      b.disabled = false;
+      refreshYtBg();
+    };
+  }catch(e){ $("#ytbg-state").textContent = "YouTube background resolving: unknown"; }
+}
+$("#sched-refresh").onclick = refreshScheduler;
+setInterval(()=>{
+  const pg = $("#page-settings");
+  if (pg && pg.classList.contains("show")) refreshScheduler();
+}, 10000);
 $("#yt-pause-btn").onclick = async function(){
   const isPaused = this.textContent.trim().startsWith("▶");
   this.disabled = true;
@@ -1151,18 +1266,12 @@ if (cookieStaleResumeBtn){
 async function refreshSkipCount(){
   try{ const r = await api("/skip/count", {}, true); $("#skip-count").textContent = r.skip_list_count != null ? r.skip_list_count : "?"; }catch(e){ $("#skip-count").textContent = "?"; }
 }
-$("#m-reset-failed").onclick = async function(){ this.disabled=true; try{ const r=await api("/resolve/reset-failed",{method:"POST"}); toast(r.message||"Failed videos reset to pending.","ok"); }catch(e){} this.disabled=false; };
 $("#m-backfill").onclick   = async function(){ this.disabled=true; try{ const r=await api("/resolve/backfill-thumbnails",{method:"POST"}); toast(r.message||"Thumbnail backfill finished.","ok"); }catch(e){} this.disabled=false; };
 $("#m-local-thumbs").onclick = async function(){ this.disabled=true; try{ const r=await api("/library/generate-thumbnails?limit=200",{method:"POST"}); toast(r.message||"Local thumbnail generation finished.","ok"); }catch(e){} this.disabled=false; };
 $("#m-purge-missing").onclick = async function(){
   const ok = await confirmBox("Purge missing files?", "This scans all local video records and removes any whose files no longer exist on disk. Downloaded/moved files won't come back.", "Purge", true);
   if(!ok) return; this.disabled=true;
   try{ const r=await api("/library/purge-missing-files",{method:"POST"}); toast(r.message||"Missing files purged.","ok"); }catch(e){} this.disabled=false;
-};
-$("#m-purge-dead").onclick = async function(){
-  const ok = await confirmBox("Purge dead links?", "This checks for videos whose source no longer exists and removes them from the Catalog.", "Purge", true);
-  if(!ok) return; this.disabled=true;
-  try{ const r=await api("/resolve/purge-dead",{method:"POST"}); toast(r.message||"Dead links purged.","ok"); }catch(e){} this.disabled=false;
 };
 $("#m-purge-dupes").onclick = async function(){ this.disabled=true; try{ const r=await api("/resolve/purge-duplicates",{method:"POST"}); toast(r.message||"Duplicates purged.","ok"); }catch(e){} this.disabled=false; };
 $("#m-skip-clear").onclick = async ()=>{

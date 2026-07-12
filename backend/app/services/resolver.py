@@ -22,8 +22,9 @@ Key behaviors:
   redirected to the keeper — the user never sees an error.
 - Hard timeout: Each yt-dlp call is capped at YTDLP_TIMEOUT_SECONDS (90s)
   using a ProcessPoolExecutor. If yt-dlp hangs (e.g. on a stalled YouTube
-  connection), the process is killed and the video is marked failed rather
-  than blocking the entire batch indefinitely.
+  connection), the process is killed and the video is treated as a transient
+  failure — its status is left unchanged (it stays pending and retries on a
+  later pass) rather than blocking the entire batch indefinitely.
 """
 
 import asyncio
@@ -32,7 +33,7 @@ import datetime
 import logging
 import os
 import re
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -81,7 +82,7 @@ _tv_resolve_locks: dict = {}
 # is newer than the most recent YouTube success. A single success resets
 # the flag — self-clearing after a cookie refresh, no button to press.
 # In-memory only: a restart resets to "unknown" until the next YouTube
-# extraction, which the TV warm pass provides within one scheduler tick.
+# extraction (the next actual play or manual resolve provides one).
 # ---------------------------------------------------------------------------
 _youtube_cookie_status = {
     "last_success": None,     # datetime of last successful YouTube extraction
@@ -105,8 +106,8 @@ _BOT_CHECK_SIGNATURES = ("sign in to confirm", "not a bot")
 # Self-clearing: once the cooldown expires the next extraction runs normally;
 # if it succeeds the back-off is forgotten. No button to press.
 #
-# Background jobs (resolve_batch, warm_tv_cache) check is_youtube_backed_off()
-# and skip YouTube videos silently during the cooldown — those videos stay
+# The background job (resolve_batch) checks is_youtube_backed_off()
+# and skips YouTube videos silently during the cooldown — those videos stay
 # in their current status and will be picked up on the next tick after the
 # cooldown lifts. Play-time calls (resolve_video_for_tv) also check and
 # return None fast rather than poking YouTube and re-triggering the ban.
@@ -231,7 +232,7 @@ def _is_rate_limit_error(error_msg: Optional[str]) -> bool:
 # It clears in exactly two ways:
 #   1. Automatically, the moment any YouTube extraction succeeds again (the
 #      success branch of _record_youtube_result), i.e. right after you refresh
-#      cookies.txt and the warm pass lands its first good resolve.
+#      cookies.txt and the next play or manual resolve lands a good extraction.
 #   2. Manually, via DELETE /resolve/cookie-stale (the web UI Resume button).
 #
 # In-memory only: a restart clears it until the next bot-check rejection.
@@ -308,13 +309,13 @@ def get_cookie_stale_state() -> dict:
 # YouTube background-resolve switch (Session 56).
 #
 # The reason cookies keep dying is VOLUME: with ~12,000+ pending YouTube videos
-# and resolved URLs that expire in ~3 hours, the background resolve/warm passes
+# and resolved URLs that expire in ~3 hours, background resolve passes
 # hammer YouTube thousands of times a day from one IP + one cookie — a textbook
 # automated-scraper pattern that YouTube responds to by killing the session.
 #
 # Since YouTube resolved URLs go stale within hours anyway, bulk pre-resolving
 # them is mostly wasted cookie-burn. This switch turns OFF all *background*
-# YouTube extraction (the scheduled pending pass and the TV warm pass), so the
+# YouTube extraction (the scheduled pending pass), so the
 # cookie is only ever touched when a video is actually PLAYED.
 #
 # Deliberately does NOT affect:
@@ -335,9 +336,9 @@ _youtube_background_resolve_enabled: bool = False
 
 def is_youtube_background_resolve_enabled() -> bool:
     """
-    Return True if background (scheduled/warm) YouTube extraction is allowed.
+    Return True if background (scheduled) YouTube extraction is allowed.
 
-    The single source of truth checked by resolve_batch() and warm_tv_cache().
+    The single source of truth checked by resolve_batch().
     Play-time paths do NOT check this — pressing play always resolves.
     """
     return _youtube_background_resolve_enabled
@@ -354,7 +355,7 @@ def set_youtube_background_resolve(enabled: bool) -> dict:
     _youtube_background_resolve_enabled = bool(enabled)
     logger.info(
         f"YouTube background resolve {'ENABLED' if enabled else 'DISABLED'} "
-        f"— scheduled pending pass and TV warm pass will "
+        f"— the scheduled pending pass will "
         f"{'process' if enabled else 'skip'} YouTube videos."
     )
     return get_youtube_background_resolve_state()
@@ -1204,7 +1205,7 @@ class ResolverService:
         }
 
     async def resolve_video_for_tv(
-        self, video_id: int, allow_cookie_probe: bool = False
+        self, video_id: int, allow_cookie_probe: bool = False, force: bool = False
     ) -> Optional[dict]:
         """
         TV-specific resolution that returns both video_url and audio_url separately.
@@ -1214,15 +1215,22 @@ class ResolverService:
         (Vimeo signed tokens), 3 hours for progressive MP4 (YouTube).
 
         Concurrency: guarded by a per-video asyncio.Lock. When TiviMate fires
-        rapid retries at a slow video (or the background warm job and a live
-        playback request collide on the same video), only ONE yt-dlp
-        extraction runs; every other caller waits, then reads the freshly
-        cached result — no duplicate yt-dlp processes.
+        rapid retries at a slow video (or two concurrent playback requests
+        collide on the same video), only ONE yt-dlp extraction runs; every
+        other caller waits, then reads the freshly cached result — no
+        duplicate yt-dlp processes.
 
         allow_cookie_probe: when True, bypass ONLY the stale-cookie skip guard
-        (never the rate-limit back-off, which is a real ban). Used by the
-        warm_tv_cache probe so a single YouTube extraction can test whether
-        refreshed cookies now work — a success auto-clears the pause.
+        (never the rate-limit back-off, which is a real ban). Lets a single
+        deliberate YouTube extraction test whether refreshed cookies now
+        work — a success auto-clears the pause.
+
+        force: when True, bypass the TV URL cache and the legacy failed-status
+        skip and always run a fresh extraction. This is what makes
+        GET /resolve/{id}?force=true&client=tv actually force (previously the
+        flag was accepted by the endpoint but silently ignored on this path).
+        Force never bypasses the YouTube back-off or cookie-stale guards —
+        those protect against extending a real ban.
 
         Returns a dict with stream_url (video), audio_url (audio, may be None
         for combined streams), and the usual metadata fields.
@@ -1235,14 +1243,16 @@ class ResolverService:
             logger.warning(f"TV resolve: Video ID {video_id} not found")
             return None
 
-        if video.resolution_status == "failed":
+        if video.resolution_status == "failed" and not force:
             logger.debug(f"TV resolve: skipping permanently failed video {video_id}")
             return None
 
         # Fast path: valid TV cache — return immediately, no lock, no yt-dlp.
-        cached = self._tv_cache_result(video)
-        if cached is not None:
-            return cached
+        # Skipped under force so a forced request always re-extracts.
+        if not force:
+            cached = self._tv_cache_result(video)
+            if cached is not None:
+                return cached
 
         # Back-off guard: if YouTube has rate-limited us, don't make things worse
         # by poking it again at play time. Return None (→ 502) and let the cache
@@ -1259,8 +1269,8 @@ class ResolverService:
             return None
 
         # Cache miss — serialize extraction per video ID so concurrent
-        # requests (TiviMate retries, warm job collisions) never spawn
-        # duplicate yt-dlp processes for the same video.
+        # requests (TiviMate retries, colliding playback requests) never
+        # spawn duplicate yt-dlp processes for the same video.
         lock = _tv_resolve_locks.setdefault(video_id, asyncio.Lock())
         async with lock:
             # While we waited for the lock, another request may have finished
@@ -1276,15 +1286,18 @@ class ResolverService:
                 )
                 return None
 
-            if video.resolution_status == "failed":
+            if video.resolution_status == "failed" and not force:
                 logger.debug(
                     f"TV resolve: video {video_id} marked failed while waiting for lock"
                 )
                 return None
 
-            cached = self._tv_cache_result(video)
-            if cached is not None:
-                return cached
+            # Double-checked cache read — skipped under force so a forced
+            # request re-extracts even if a concurrent caller just resolved it.
+            if not force:
+                cached = self._tv_cache_result(video)
+                if cached is not None:
+                    return cached
 
             return await self._tv_extract_and_cache(video)
 
@@ -1424,9 +1437,29 @@ class ResolverService:
             await self._db.delete(fav)
         await self._db.delete(video)
 
-    async def resolve_batch(self, limit: int = 10) -> dict:
+    async def resolve_batch(
+        self,
+        limit: int = 10,
+        channel_ids: Optional[list] = None,
+        should_abort: Optional[Callable[[], bool]] = None,
+    ) -> dict:
         """
         Resolve a batch of PENDING videos via the standard resolver.
+
+        This is the ONE batch-resolve implementation — both the scheduler's
+        periodic pass and the web UI's "Resolve 25 Pending" button
+        (POST /resolve/batch) run through here, so every guard below applies
+        to both: the YouTube background-resolve switch, the rate-limit
+        back-off, the cookie-stale pause, and the consecutive-failure
+        circuit breaker. (The router endpoint previously carried its own
+        stale copy of this logic with none of those guards.)
+
+        channel_ids: optional list of channel IDs to restrict the batch to
+        (the web UI's per-channel scope). None = all channels.
+
+        should_abort: optional zero-arg callable checked before each video.
+        When it returns True the batch exits cleanly after the current video
+        (the web UI's Stop Resolving button). None = never abort.
 
         Pending-only by design: the standard resolver earns its keep on new
         videos (thumbnail/duration backfill, permanent-failure marking,
@@ -1434,13 +1467,16 @@ class ResolverService:
         resolved_audio_url. Letting it also REFRESH already-resolved videos
         (as it used to) overwrites the video URL while leaving a stale audio
         URL behind: a mismatched pair the TV cache check would happily serve
-        to TiviMate. All URL refreshes now go through warm_tv_cache() /
+        to TiviMate. URL refreshes happen at play time via
         resolve_video_for_tv(), which always writes both URLs together.
         """
         stmt = (
             select(Video)
             .where(Video.resolution_status == "pending")
         )
+
+        if channel_ids:
+            stmt = stmt.where(Video.channel_id.in_(channel_ids))
 
         # When background YouTube resolve is OFF (the default), exclude
         # YouTube from the query itself so the batch slots fill with
@@ -1462,13 +1498,21 @@ class ResolverService:
         videos = result.scalars().all()
 
         all_videos = list(videos)
-        summary = {"total": len(all_videos), "resolved": 0, "failed": 0, "deleted": 0, "skipped_backoff": 0, "skipped_cookie_stale": 0, "skipped_youtube_bg": 0, "stopped_early": False}
+        summary = {"total": len(all_videos), "resolved": 0, "failed": 0, "deleted": 0, "skipped_backoff": 0, "skipped_cookie_stale": 0, "skipped_youtube_bg": 0, "stopped_early": False, "stopped": False}
 
         # Session 59 circuit breaker: consecutive transient failures within
         # this batch. See BATCH_CONSECUTIVE_FAILURE_LIMIT for rationale.
         consecutive_failures = 0
 
         for video in all_videos:
+            # User-requested stop (web UI Stop Resolving button): exit
+            # cleanly before starting the next video. Remaining videos stay
+            # pending and will be picked up on a later pass.
+            if should_abort is not None and should_abort():
+                summary["stopped"] = True
+                logger.info("Batch resolve: stop requested — exiting early.")
+                break
+
             video_id = video.id
             is_yt = _is_youtube_source(video.source_url)
 
@@ -1535,132 +1579,7 @@ class ResolverService:
             f"{summary['skipped_youtube_bg']} skipped (yt-bg-off) "
             f"out of {summary['total']}"
             + (" [STOPPED EARLY — provider appears blocked]" if summary["stopped_early"] else "")
-        )
-        return summary
-
-    async def warm_tv_cache(self, limit: int = 100) -> dict:
-        """
-        Background pre-warm of the TV-path URL cache (YouTube only).
-
-        This is the fix for TiviMate's YouTube 502s: playback goes through
-        resolve_video_for_tv(), whose cache is only warm when BOTH
-        resolved_stream_url and resolved_audio_url are populated and fresh.
-        YouTube extraction (with the Node.js JS-challenge solving) routinely
-        takes 10-30+ seconds — far too slow to run at play time. This job runs
-        it in the background instead, so by the time TiviMate presses play the
-        answer is already sitting in the DB (an instant cache hit).
-
-        Selects resolved videos that need warming:
-          - resolved_audio_url IS NULL  -> never resolved via the TV path, OR
-          - resolved_at older than the 3 h MP4 token TTL -> URLs going stale
-
-        Deliberately excluded:
-          - local_folder videos — no yt-dlp involved, served straight from disk
-          - Vimeo — its HLS tokens die in ~20 minutes, so pre-warming is
-            wasted work; Vimeo resolves fast at play time (no JS challenge)
-            and is verified working with audio on hardware.
-
-        Replaces the old resolve_expired() standard-path refresh, which
-        overwrote resolved_stream_url while leaving resolved_audio_url stale —
-        creating mismatched URL pairs the TV cache would then serve.
-        """
-        from sqlalchemy import or_
-
-        expiry_cutoff = datetime.datetime.utcnow() - datetime.timedelta(hours=RESOLUTION_TTL_HOURS)
-        stmt = (
-            select(Video)
-            .where(
-                Video.resolution_status == "resolved",
-                # NULL-safe provider exclusion: a plain != comparison silently
-                # drops rows where source_provider is NULL (SQL three-valued
-                # logic), and older rows may have no provider set.
-                or_(
-                    Video.source_provider.is_(None),
-                    Video.source_provider.notin_(["local_folder", "vimeo"]),
-                ),
-                Video.source_url.isnot(None),
-                ~Video.source_url.like("%vimeo.com%"),
-                or_(
-                    Video.resolved_audio_url.is_(None),
-                    Video.resolved_at.is_(None),
-                    Video.resolved_at < expiry_cutoff,
-                ),
-            )
-            .order_by(Video.reddit_score.desc().nullslast())
-            .limit(limit)
-        )
-        result = await self._db.execute(stmt)
-        videos = result.scalars().all()
-
-        summary = {"total": len(videos), "warmed": 0, "failed": 0, "deleted": 0, "skipped_backoff": 0, "skipped_cookie_stale": 0, "skipped_youtube_bg": 0}
-
-        # When the cookie-stale pause is active, allow exactly ONE YouTube probe
-        # per warm run so a freshly-refreshed cookie can self-heal: a successful
-        # extraction auto-clears the pause (via _record_youtube_result) and the
-        # rest of the loop then proceeds normally. If the probe still fails, the
-        # pause is re-set and all remaining YouTube videos skip. This is what
-        # makes "auto-clear on first successful YouTube resolve" work without a
-        # manual button press, while never re-flooding YouTube during an outage.
-        cookie_probe_used = False
-
-        for video in videos:
-            video_id = video.id
-            is_yt = _is_youtube_source(video.source_url)
-
-            # Background YouTube resolve switch: when disabled (the default),
-            # skip YouTube videos entirely in the warm pass too. YouTube still
-            # resolves on demand at play time via resolve_video_for_tv(); this
-            # only stops speculative background warming. Checked first so it
-            # also suppresses the cookie-stale probe (no background YouTube work
-            # of any kind while the switch is off).
-            if is_yt and not is_youtube_background_resolve_enabled():
-                summary["skipped_youtube_bg"] += 1
-                continue
-
-            # During YouTube back-off, skip YouTube videos — they stay in their
-            # current status and warm_tv_cache will pick them up after cooldown.
-            if is_yt and is_youtube_backed_off():
-                summary["skipped_backoff"] += 1
-                continue
-
-            # During the cookie-stale pause, skip YouTube videos — except allow
-            # a single probe (the first one) so a refreshed cookie can clear it.
-            probe_this = False
-            if is_yt and is_cookie_stale_paused():
-                if cookie_probe_used:
-                    summary["skipped_cookie_stale"] += 1
-                    continue
-                cookie_probe_used = True
-                probe_this = True
-                logger.info(
-                    f"TV cache warm: cookie-stale pause active — probing video "
-                    f"{video_id} to test whether cookies have been refreshed."
-                )
-
-            result = await self.resolve_video_for_tv(video_id, allow_cookie_probe=probe_this)
-            if result is not None:
-                summary["warmed"] += 1
-            else:
-                check = await self._db.execute(select(Video).where(Video.id == video_id))
-                if check.scalar_one_or_none() is None:
-                    summary["deleted"] += 1
-                else:
-                    summary["failed"] += 1
-
-            # Polite inter-request delay — YouTube needs a longer gap.
-            if is_yt:
-                import random
-                await asyncio.sleep(random.uniform(6.0, 10.0))
-            else:
-                await asyncio.sleep(1.0)
-
-        logger.info(
-            f"TV cache warm complete: {summary['warmed']} warmed, "
-            f"{summary['failed']} failed, {summary['deleted']} deleted, "
-            f"{summary['skipped_backoff']} skipped (back-off), "
-            f"{summary['skipped_cookie_stale']} skipped (cookie-stale), "
-            f"{summary['skipped_youtube_bg']} skipped (yt-bg-off) "
-            f"out of {summary['total']}"
+            + (" [STOPPED BY USER]" if summary["stopped"] else "")
         )
         return summary
 
@@ -1906,23 +1825,6 @@ class ResolverService:
         await self._db.commit()
         scope = f"channels {channel_ids}" if channel_ids else "all channels"
         logger.info(f"Purged {count} DASH-only videos from database ({scope})")
-        return count
-
-    async def purge_dead_videos(self, channel_ids: Optional[list] = None) -> int:
-        """Delete all videos currently marked as failed, optionally scoped to channels."""
-        stmt = select(Video).where(Video.resolution_status == "failed")
-        if channel_ids:
-            stmt = stmt.where(Video.channel_id.in_(channel_ids))
-        result = await self._db.execute(stmt)
-        dead_videos = result.scalars().all()
-
-        count = len(dead_videos)
-        for video in dead_videos:
-            await self._delete_video(video)
-
-        await self._db.commit()
-        scope = f"channels {channel_ids}" if channel_ids else "all channels"
-        logger.info(f"Purged {count} dead videos from database ({scope})")
         return count
 
     async def _extract_with_ytdlp(
