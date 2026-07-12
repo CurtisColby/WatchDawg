@@ -43,6 +43,13 @@ Session 52 additions:
                                Vimeo split-stream content (video-only + audio-only HLS).
                                NULL for combined streams (YouTube MP4, local files, etc.).
                                Migration: ALTER TABLE videos ADD COLUMN resolved_audio_url TEXT
+
+Session 64 additions:
+- Video.favorite / watch_history / watchlist_entry relationships now carry
+  cascade="all, delete-orphan". Fixes the scheduled Batch Resolve crash:
+  deleting a watched Video made the ORM emit UPDATE watch_history SET
+  video_id=NULL, violating the NOT NULL constraint and rolling back the whole
+  batch every tick. No schema migration — ORM-level change only.
 """
 
 import datetime
@@ -146,10 +153,27 @@ class Video(Base):
         onupdate=datetime.datetime.utcnow,
     )
 
-    favorite = relationship("Favorite", back_populates="video", uselist=False)
+    # Session 64: cascade="all, delete-orphan" on all three child relationships.
+    # Without it, SQLAlchemy's default on a parent delete is to NULL the child's
+    # FK — which violates the NOT NULL constraint on watch_history/watchlist and
+    # crashed the entire scheduled Batch Resolve tick with an IntegrityError
+    # whenever a watched video was auto-deleted (permanent-dead or dedup paths).
+    # This is ORM-level cascade: it works regardless of SQLite's unenforced
+    # ondelete=CASCADE (PRAGMA foreign_keys is never set). AsyncSession.delete()
+    # pre-loads these relationships before flush, so the async paths are safe.
+    favorite = relationship(
+        "Favorite", back_populates="video", uselist=False,
+        cascade="all, delete-orphan",
+    )
     channel = relationship("Channel", backref="videos")
-    watch_history = relationship("WatchHistory", back_populates="video", uselist=False)
-    watchlist_entry = relationship("Watchlist", back_populates="video", uselist=False)
+    watch_history = relationship(
+        "WatchHistory", back_populates="video", uselist=False,
+        cascade="all, delete-orphan",
+    )
+    watchlist_entry = relationship(
+        "Watchlist", back_populates="video", uselist=False,
+        cascade="all, delete-orphan",
+    )
 
     def __repr__(self) -> str:
         return f"<Video id={self.id} title='{self.title[:40]}' status={self.resolution_status}>"
