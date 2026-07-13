@@ -5,6 +5,9 @@ Runs periodic tasks inside the FastAPI process using APScheduler:
 1. Scrape job         — fetches new posts from all enabled channels.
 2. Resolve job        — resolves pending videos (pending-only by design; URL
                         refreshes happen at play time via the TV path).
+                        (Session 65) Decoupled from the scrape interval: runs
+                        every RESOLVE_INTERVAL_HOURS (4h) and does NOT fire at
+                        startup — Vimeo IP-block mitigation.
 3. Dedup job          — sweeps all resolved videos for CDN fingerprint duplicates.
 4. Quality upgrade    — re-resolves low-quality videos in chunks.
 5. Live TV probe      — probes live stream URLs for online status (every 15 min).
@@ -38,10 +41,11 @@ Job run registry (Session 63):
 The scheduler starts when the FastAPI app starts and stops on shutdown.
 Intervals are configurable via environment variables.
 
-Batch size rationale (updated):
-  - Scheduled pending resolve: 200 per tick (was 50).
-    Each yt-dlp call takes ~2-5s. 200 calls = 7-17 min worst case,
-    well within the 30-min tick window. Keeps new channels resolving fast.
+Batch size rationale (updated Session 65):
+  - Scheduled pending resolve: 25 per tick, every 4 hours (was 25 every
+    30 min). Max ~150 background resolves/day — six slow drips paced at
+    5-10s per request inside resolve_batch. Vimeo IP-block mitigation;
+    see RESOLVE_INTERVAL_HOURS below.
   - Scheduled expired resolve: 100 per tick (unchanged).
     Expired re-resolve is lower priority — CDN tokens are still valid for
     a few hours, so we don't need to rush these.
@@ -82,13 +86,23 @@ QUALITY_UPGRADE_MIN_HEIGHT = 720  # upgrade anything below 720p
 # Rotating offset — incremented each tick so we walk through the full DB
 _quality_upgrade_offset = 0
 
+# Batch Resolve interval (hours). (Session 65)
+# Previously the resolve job piggybacked on the scrape interval (30 min) —
+# 25/tick every 30 min = ~1,200 Vimeo hits/day max. Vimeo blocked the IP
+# anyway, so the job now has its own much slower cadence: 25/tick every
+# 4 hours = ~150/day ceiling, spread as six gentle drips. Scrape stays at
+# 30 minutes — new posts still land as pending promptly; they just resolve
+# on this slower schedule (YouTube is unaffected: it resolves on-demand at
+# play time). Manual "Run Now" on the dashboard bypasses this interval.
+RESOLVE_INTERVAL_HOURS = 4
+
 # Pending resolve batch size per scheduler tick.
 # Session 59: lowered 200 → 25. At 200/tick every 30 min, background resolving
 # could hit Vimeo up to ~9,600 times/day — a burst pattern that (combined with
 # the old 1.0s inter-request delay in resolve_batch) is the likely trigger for
-# the July 2026 Vimeo 403 IP-block. 25/tick = ~1,200/day max, a slow steady
-# drip that drains the backlog in about a week without looking like a scraper.
-# resolve_batch also now paces non-YouTube requests at 5-10s and stops early
+# the July 2026 Vimeo 403 IP-block. Session 65: the tick itself slowed to
+# every RESOLVE_INTERVAL_HOURS, so 25/tick now means ~150/day max.
+# resolve_batch also paces non-YouTube requests at 5-10s and stops early
 # on 5 consecutive transient failures (provider-block circuit breaker).
 SCHEDULED_PENDING_LIMIT = 25
 
@@ -314,7 +328,8 @@ async def scheduled_scrape():
 @_track_job("resolve_job")
 async def scheduled_resolve():
     """
-    Periodic resolve job. Runs every SCRAPE_INTERVAL_MINUTES alongside scrape.
+    Periodic resolve job. Runs every RESOLVE_INTERVAL_HOURS (Session 65:
+    decoupled from the 30-min scrape tick — Vimeo IP-block mitigation).
 
     Two-pass strategy:
     1. Pending pass  — resolve new pending videos (up to SCHEDULED_PENDING_LIMIT).
@@ -691,14 +706,17 @@ def start_scheduler():
         next_run_time=datetime.datetime.now(),
     )
 
-    # Resolve job — runs on the same interval
+    # Resolve job — own slow cadence, decoupled from scrape. (Session 65)
+    # Deliberately NO next_run_time here: the job must NOT fire at container
+    # startup. With an active Vimeo IP-block, every restart was greeting
+    # Vimeo with a fresh batch. First run is at +RESOLVE_INTERVAL_HOURS;
+    # use the dashboard's Run Now button for an immediate pass.
     scheduler.add_job(
         scheduled_resolve,
-        trigger=IntervalTrigger(minutes=interval_minutes),
+        trigger=IntervalTrigger(hours=RESOLVE_INTERVAL_HOURS),
         id="resolve_job",
         name="Batch Resolve",
         replace_existing=True,
-        next_run_time=datetime.datetime.now(),
     )
 
     # Dedup sweep — runs every DEDUP_INTERVAL_HOURS
@@ -777,8 +795,10 @@ def start_scheduler():
     scheduler.start()
     logger.info(
         f"Background scheduler started. "
-        f"Scrape/resolve interval: {interval_minutes} minutes. "
-        f"Pending resolve limit: {SCHEDULED_PENDING_LIMIT}/tick. "
+        f"Scrape interval: {interval_minutes} minutes. "
+        f"Batch Resolve interval: {RESOLVE_INTERVAL_HOURS} hours "
+        f"(limit {SCHEDULED_PENDING_LIMIT}/tick, no startup fire — "
+        f"Vimeo IP-block mitigation). "
         f"Dedup sweep interval: {DEDUP_INTERVAL_HOURS} hours. "
         f"Quality upgrade interval: {QUALITY_UPGRADE_INTERVAL_HOURS} hours "
         f"(chunk={QUALITY_UPGRADE_CHUNK_SIZE}, min={QUALITY_UPGRADE_MIN_HEIGHT}p). "
@@ -788,7 +808,7 @@ def start_scheduler():
         f"(local={THUMBNAIL_LOCAL_LIMIT}, backfill={THUMBNAIL_BACKFILL_LIMIT} per tick). "
         f"EPG rebuild interval: {EPG_REBUILD_INTERVAL_HOURS} hours (runs at startup). "
         f"XMLTV refresh interval: {XMLTV_REFRESH_INTERVAL_HOURS} hours (runs at startup). "
-        f"All jobs run immediately at startup then repeat on their intervals. "
+        f"All jobs except Batch Resolve run immediately at startup then repeat on their intervals. "
         f"Job run history: GET /health/scheduler."
     )
 
