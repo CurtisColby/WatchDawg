@@ -375,6 +375,7 @@ h2{font-size:16px;margin:26px 0 12px;color:var(--accent2)}
       <button class="btn small" id="m-local-thumbs" data-tip="Generate thumbnail images for local video files that don't have one. Extracts a frame from each file using ffmpeg.">📁 Local Thumbnails</button>
       <button class="btn small" id="m-purge-missing" data-tip="Remove local video records whose files no longer exist on disk. Cleans up entries left behind after deleting or moving files.">🧹 Purge Missing Files</button>
       <button class="btn small" id="m-purge-dupes" data-tip="Remove duplicate copies of the same video that snuck in from multiple scrapes.">👯 Purge Duplicates</button>
+      <button class="btn small danger" id="m-purge-403" data-tip="Remove dead Vimeo videos stuck pending with a 403 error — private, restricted, or deleted videos that block the resolve queue. Only use this when Vimeo is otherwise working: during an active IP block, 403 means Vimeo is blocking YOU, not that the videos are dead. Shows an exact count and asks before deleting. Purged videos are skip-listed and can't come back.">☠️ Purge Vimeo 403s</button>
       <button class="btn small danger" id="m-skip-clear" data-tip="Empty the skip list. Videos you skipped in the past may reappear on the next scrape.">🗑️ Clear Skip List (<span id="skip-count">…</span>)</button>
     </div>
   </div>
@@ -1290,6 +1291,28 @@ $("#m-purge-missing").onclick = async function(){
   try{ const r=await api("/library/purge-missing-files",{method:"POST"}); toast(r.message||"Missing files purged.","ok"); }catch(e){} this.disabled=false;
 };
 $("#m-purge-dupes").onclick = async function(){ this.disabled=true; try{ const r=await api("/resolve/purge-duplicates",{method:"POST"}); toast(r.message||"Duplicates purged.","ok"); }catch(e){} this.disabled=false; };
+
+$("#m-purge-403").onclick = async function(){
+  this.disabled = true;
+  try{
+    // Step 1: dry-run count — nothing is touched.
+    const preview = await api("/resolve/purge-vimeo-403?dry_run=true", {method:"POST"});
+    if (!preview.count){
+      toast("No dead Vimeo 403 videos found — the resolve queue is clean.", "ok");
+      return;
+    }
+    // Step 2: confirm with the exact count before anything is destroyed.
+    const ok = await confirmBox(
+      `Purge ${preview.count} dead Vimeo video${preview.count===1?"":"s"}?`,
+      `These are stuck pending with a 403 error (private, restricted, or deleted on Vimeo) and are blocking the resolve queue. They'll be skip-listed so they can't be re-imported. Don't do this during an active Vimeo IP block — 403 then means Vimeo is blocking you, not that the videos are dead. This can't be undone.`,
+      "Purge Vimeo 403s", true);
+    if(!ok) return;
+    // Step 3: the real purge.
+    const r = await api("/resolve/purge-vimeo-403", {method:"POST"});
+    toast(r.message || "Purged.", "ok");
+  }catch(e){}
+  finally{ this.disabled = false; }
+};
 $("#m-skip-clear").onclick = async ()=>{
   const ok = await confirmBox("Clear the skip list?", "Every video you've ever skipped may reappear on the next scrape. This can't be undone.", "Clear Skip List", true);
   if(!ok) return;

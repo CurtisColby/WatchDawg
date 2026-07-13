@@ -23,6 +23,10 @@ Endpoints:
 - POST /resolve/backfill-thumbnails — Fetch missing thumbnails via yt-dlp metadata pass.
 - POST /resolve/purge-dash          — Delete all DASH-only videos (unplayable in browser).
 - POST /resolve/purge-duplicates    — Delete duplicate CDN files, keeping highest-scored copy.
+- POST /resolve/purge-vimeo-403     — Delete + skip-list pending Vimeo videos whose last
+                                      resolve error was HTTP 403 (dead/private videos that
+                                      camp at the head of the batch queue and trip the
+                                      circuit breaker — Session 66). ?dry_run=true counts only.
 
 Removed endpoints (Session 63): POST /resolve/reset-failed and POST /resolve/purge-dead.
 Both operated on resolution_status == "failed", which no code has written since the
@@ -66,7 +70,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db_session
-from app.models import Video
+from app.models import Video, SkipListEntry
+from app.encryption import encrypt_value
+from app.hashing import hmac_hash
 from app.services.resolver import (
     ResolverService,
     activate_youtube_pause,
@@ -476,6 +482,92 @@ async def purge_duplicate_cdn_files(db: AsyncSession = Depends(get_db_session)):
             f"Found {summary['duplicate_groups_found']} duplicate CDN file groups. "
             f"Deleted {summary['deleted_count']} lower-scored duplicates, "
             f"kept {summary['kept_count']} best copies."
+        ),
+    }
+
+
+@router.post("/purge-vimeo-403")
+async def purge_vimeo_403(
+    dry_run: bool = Query(
+        False,
+        description="When true, only count matching videos — modify nothing.",
+    ),
+    db: AsyncSession = Depends(get_db_session),
+):
+    """
+    Purge "poison head-of-queue" Vimeo videos. (Session 66)
+
+    Targets videos that are pending AND whose last resolve error contains
+    HTTP 403 AND whose source is Vimeo. After an IP block has lifted, a
+    Vimeo 403 means the individual video is private, embed-restricted, or
+    deleted — it will never resolve, but its transient classification keeps
+    it pending forever. Ordered by score, a handful of these camp at the
+    front of the batch queue and trip the 5-consecutive-failure circuit
+    breaker every tick, starving all healthy videos behind them (the
+    Session 65/66 "provider blocked" false alarm).
+
+    Each purged video is handled exactly like the manual 🚫 skip button:
+    an encrypted skip-list entry is written (so a future scrape can never
+    re-import it), then the video row is deleted through the ORM session
+    so the Session 64 cascade cleans favorites / watch history / watchlist.
+
+    IMPORTANT: do NOT run this during an ACTIVE Vimeo IP block — a 403
+    then means Vimeo is blocking YOU, not that the videos are dead, and
+    purging would destroy healthy videos. The web UI's confirm dialog
+    carries this warning; the dry_run counter lets the UI show an exact
+    count before anything is destroyed.
+
+    LOCK DISCIPLINE: response contains counts only, never titles — this
+    surfaces on the Settings page, which locked sessions can see.
+    """
+    stmt = select(Video).where(
+        Video.resolution_status == "pending",
+        Video.resolution_error.isnot(None),
+        Video.resolution_error.contains("403"),
+        Video.source_url.contains("vimeo"),
+    )
+    result = await db.execute(stmt)
+    targets = result.scalars().all()
+
+    if dry_run:
+        return {"status": "dry_run", "count": len(targets)}
+
+    skip_listed = 0
+    already_listed = 0
+    for video in targets:
+        post_hash = hmac_hash(video.source_post_id)
+        existing = await db.execute(
+            select(SkipListEntry).where(
+                SkipListEntry.source_post_id_hash == post_hash
+            )
+        )
+        if existing.scalar_one_or_none() is None:
+            db.add(
+                SkipListEntry(
+                    source_post_id_encrypted=encrypt_value(video.source_post_id),
+                    source_post_id_hash=post_hash,
+                    source_provider=video.source_provider,
+                )
+            )
+            skip_listed += 1
+        else:
+            already_listed += 1
+        await db.delete(video)
+
+    await db.commit()
+    deleted = skip_listed + already_listed
+    logger.info(
+        f"Purge Vimeo 403s: {deleted} videos removed "
+        f"({skip_listed} newly skip-listed, {already_listed} already on skip list)"
+    )
+    return {
+        "status": "purged",
+        "deleted_count": deleted,
+        "skip_listed": skip_listed,
+        "already_listed": already_listed,
+        "message": (
+            f"Purged {deleted} dead Vimeo videos (403). "
+            f"All are skip-listed and cannot be re-imported."
         ),
     }
 
