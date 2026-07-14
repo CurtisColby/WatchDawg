@@ -15,7 +15,11 @@ Key behaviors:
 - Error handling: Dead links, geo-blocks, DMCA takedowns, and private videos
   are caught, flagged as permanent failures, and auto-deleted from the feed.
   Rate-limit errors (HTTP 429, YouTube session rate-limit) are explicitly
-  guarded as transient and will never trigger auto-delete.
+  guarded as transient and will never trigger auto-delete. Sub-request
+  failures ("Unable to download ..." — webpage/JSON metadata/macos API JSON/
+  manifests) are likewise guarded as transient (Session 67): Vimeo's metadata
+  API intermittently 404s for videos that are alive and playable, so a
+  sub-request 404 is never treated as proof the video is dead.
 - Auto-dedup: After successful resolution, the CDN fingerprint is checked
   against all other resolved Vimeo videos. If a duplicate physical file is
   found, the lower-scored copy is deleted and playback is transparently
@@ -501,6 +505,34 @@ RATE_LIMIT_SAFEGUARD_KEYWORDS = [
     "please try again later",
 ]
 
+# Sub-request safeguard (Session 67) — checked BEFORE permanent keywords,
+# alongside the rate-limit guard.
+#
+# yt-dlp errors that begin "Unable to download ..." (webpage, JSON metadata,
+# macos API JSON, MPD manifest, m3u8 information) mean an internal SUB-REQUEST
+# failed — the extractor never got far enough for the provider to actually say
+# anything about the video itself. Vimeo in particular intermittently answers
+# its own player/metadata API with HTTP 404 as anti-bot noise for videos that
+# are alive and playable (confirmed live 2026-07-14: video 129731718 was
+# auto-deleted at 02:31 for "Unable to download macos API JSON: HTTP Error
+# 404", then resolved cleanly from the same container hours later and played
+# in a browser throughout). Because "not found" is in the permanent keyword
+# list, every one of these transient API 404s was being classified permanent
+# and the video auto-deleted on the spot.
+#
+# Rule: any "unable to download" sub-request failure is TRANSIENT — retry
+# later, never auto-delete. Only unambiguous extractor verdicts ("private
+# video", "removed by the uploader", "this video has been removed", ...)
+# remain permanent, because those only appear when the provider genuinely
+# answered about the video. Accepted trade-off: a truly-deleted Vimeo video
+# also 404s its webpage, so genuinely dead videos now stay pending instead of
+# auto-deleting — they surface via the resolution_error text / Problems view
+# and the planned attempts-counter feature. Deletion is an operator decision,
+# not a substring match (same principle as the Session 66 Vimeo-403 lesson).
+SUBREQUEST_TRANSIENT_KEYWORDS = [
+    "unable to download",
+]
+
 # Circuit breaker for background batch resolving (Session 59). If this many
 # CONSECUTIVE transient failures occur within one batch, the provider is
 # almost certainly blocked or down (e.g. the July 2026 Vimeo 403 IP-block) —
@@ -684,6 +716,14 @@ def _extract_sync_worker(url: str, cookies_path: Optional[str]) -> Tuple[Optiona
         for keyword in RATE_LIMIT_SAFEGUARD_KEYWORDS:
             if keyword in error_lower:
                 return None, f"Transient(rate-limit): {error_msg[:300]}", False
+        # GUARD (Session 67): sub-request failures ("Unable to download ...")
+        # are transient. Vimeo's metadata API intermittently 404s for videos
+        # that are alive and playable; "not found" would otherwise match the
+        # permanent list and auto-delete a healthy video. See
+        # SUBREQUEST_TRANSIENT_KEYWORDS for the full rationale.
+        for keyword in SUBREQUEST_TRANSIENT_KEYWORDS:
+            if keyword in error_lower:
+                return None, f"Transient(subrequest): {error_msg[:300]}", False
         for keyword in permanent_keywords:
             if keyword in error_lower:
                 return None, f"Permanent: {error_msg[:300]}", True
@@ -816,6 +856,14 @@ def _extract_tv_sync_worker(url: str, cookies_path: Optional[str], prefer_hls: b
         for keyword in RATE_LIMIT_SAFEGUARD_KEYWORDS:
             if keyword in error_lower:
                 return None, f"Transient(rate-limit): {error_msg[:300]}", False
+        # GUARD (Session 67): sub-request failures ("Unable to download ...")
+        # are transient. Vimeo's metadata API intermittently 404s for videos
+        # that are alive and playable; "not found" would otherwise match the
+        # permanent list and auto-delete a healthy video. See
+        # SUBREQUEST_TRANSIENT_KEYWORDS for the full rationale.
+        for keyword in SUBREQUEST_TRANSIENT_KEYWORDS:
+            if keyword in error_lower:
+                return None, f"Transient(subrequest): {error_msg[:300]}", False
         for keyword in permanent_keywords:
             if keyword in error_lower:
                 return None, f"Permanent: {error_msg[:300]}", True
@@ -872,6 +920,12 @@ def _fetch_thumbnail_sync_worker(url: str, cookies_path: Optional[str]):
         # looking phrases like "video unavailable" (documented above for the
         # resolve path; same logic applies here).
         for kw in RATE_LIMIT_SAFEGUARD_KEYWORDS:
+            if kw in msg:
+                return (None, "transient")
+        # Sub-request safeguard (Session 67) — "Unable to download ..." means
+        # an internal fetch failed, not that the video is dead. Same rationale
+        # as the resolve path; see SUBREQUEST_TRANSIENT_KEYWORDS.
+        for kw in SUBREQUEST_TRANSIENT_KEYWORDS:
             if kw in msg:
                 return (None, "transient")
         for kw in PERMANENT_ERROR_KEYWORDS:
