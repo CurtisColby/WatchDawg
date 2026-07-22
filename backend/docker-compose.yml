@@ -28,6 +28,15 @@ services:
       # Browser cookies for yt-dlp (read-only inside container)
       - ./config/cookies.txt:/config/cookies.txt
 
+      # Vimeo account session cookies — MANDATORY for all Vimeo extraction
+      # since Vimeo disabled anonymous API access on 2026-07-20 (Session 68).
+      # Filename matches the browser cookie-export addon's convention so a
+      # refresh is: re-export from a logged-in vimeo.com tab, copy the file
+      # over this host path, done — picked up on the next extraction, no
+      # restart. NOTE: the host file must exist BEFORE `docker compose up -d`
+      # or Docker will create it as an empty directory and break the mount.
+      - ./config/vimeo.com_cookies.txt:/config/vimeo.com_cookies.txt
+
       # Reddit session cookies for the Reddit provider (read-only inside
       # container). Exported from a logged-in browser in MozillaCookieJar
       # format — same routine as the YouTube cookies above. Re-export to

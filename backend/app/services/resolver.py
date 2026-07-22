@@ -254,6 +254,360 @@ COOKIE_STALE_KEYWORDS = (
 
 _youtube_cookie_stale_paused: bool = False
 
+# Warn-once flag for a missing Vimeo cookie file (Session 68). Vimeo cookie
+# selection happens on every extraction; without this flag the warning would
+# spam the log once per video in every batch.
+_warned_vimeo_cookies_missing: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Vimeo cookie-stale pause (Session 68).
+#
+# Since 2026-07-20 Vimeo requires a logged-in account for ALL extraction
+# (anonymous OAuth killed; yt-dlp #17271). When the exported account cookies
+# expire, every Vimeo extraction fails with "The web client only works when
+# logged-in ..." — which would burn whole batches and trip the circuit
+# breaker until the operator noticed a log line. This mirrors the YouTube
+# cookie-stale pause exactly:
+#
+#   - Detection: the login-required phrase on a VIMEO source (the phrase also
+#     mentions --cookies-from-browser, which overlaps the YouTube
+#     COOKIE_STALE_KEYWORDS — gating on the source URL keeps the two
+#     providers' states independent).
+#   - While stale: the BATCH loop skips Vimeo videos (they stay pending,
+#     never burn attempts, never trip the breaker). Manual Resolve clicks
+#     still attempt — deliberately, so trying one video is the natural way
+#     to test a freshly copied cookie file.
+#   - Self-clearing: the first successful Vimeo extraction clears the flag
+#     (the cookie file is re-read on every extraction, so refresh = copy the
+#     new export over the host file; no restart).
+#   - Surfaced: /health -> "vimeo_cookies" -> the Settings green/red light.
+# ---------------------------------------------------------------------------
+VIMEO_LOGIN_REQUIRED_KEYWORDS = ("only works when logged-in",)
+
+_vimeo_cookie_stale: bool = False
+
+
+def _is_vimeo_login_error(error_msg: Optional[str]) -> bool:
+    """True if an error message is Vimeo's login-required (stale/missing cookie) rejection."""
+    if not error_msg:
+        return False
+    low = error_msg.lower()
+    return any(kw in low for kw in VIMEO_LOGIN_REQUIRED_KEYWORDS)
+
+
+def _set_vimeo_cookie_stale() -> None:
+    global _vimeo_cookie_stale
+    if not _vimeo_cookie_stale:
+        _vimeo_cookie_stale = True
+        logger.warning(
+            "Vimeo cookie-stale pause ACTIVATED — Vimeo rejected the account "
+            "cookies (login required). Batch resolve will skip Vimeo videos "
+            "(they stay pending) until a fresh cookie export succeeds. "
+            "Refresh: export from a logged-in vimeo.com tab -> copy to "
+            "config/vimeo.com_cookies.txt on the host. A manual Resolve on "
+            "any Vimeo video tests the new file and auto-clears this pause."
+        )
+
+
+def _clear_vimeo_cookie_stale(reason: str = "manual") -> None:
+    global _vimeo_cookie_stale
+    if _vimeo_cookie_stale:
+        _vimeo_cookie_stale = False
+        logger.info(
+            f"Vimeo cookie-stale pause CLEARED ({reason}) — resuming Vimeo extractions."
+        )
+
+
+def is_vimeo_cookie_stale() -> bool:
+    return _vimeo_cookie_stale
+
+
+def get_vimeo_cookie_status() -> dict:
+    """Vimeo cookie health for /health and the Settings light. (Session 68)"""
+    import os as _os
+    file_present = _os.path.isfile(settings.vimeo_cookies_path)
+    if not file_present:
+        state = "missing"
+    elif _vimeo_cookie_stale:
+        state = "stale"
+    else:
+        state = "ok"
+    return {
+        "state": state,
+        "file_present": file_present,
+        "path": settings.vimeo_cookies_path,
+    }
+
+
+def _record_vimeo_result(source_url: Optional[str], error_msg: Optional[str]) -> None:
+    """Record a Vimeo extraction outcome for cookie-health tracking. (Session 68)
+
+    Call with error_msg=None on success. Non-Vimeo sources are ignored;
+    non-login errors (dead videos, 404s, timeouts) say nothing about cookies
+    and don't touch the flag — mirrors _record_youtube_result's philosophy.
+    """
+    if not _is_vimeo_source(source_url):
+        return
+    if error_msg is None:
+        _clear_vimeo_cookie_stale(reason="successful Vimeo resolve")
+        return
+    if _is_vimeo_login_error(error_msg):
+        _set_vimeo_cookie_stale()
+
+
+# ---------------------------------------------------------------------------
+# Vimeo-404 verify-then-purge background job (Session 68).
+#
+# The web-UI twin of data/sweep_vimeo_404.py. Same safety model:
+#   - NEVER purges on a stored error alone (the Session 67 lesson: Vimeo's
+#     metadata API intermittently 404s videos that are alive).
+#   - Canary extraction first; if the canary fails, auth/extractor is broken
+#     and the job aborts with zero verdicts.
+#   - Every candidate is live-re-extracted with the Vimeo account cookies at
+#     a polite randomized 5-10s pace (Session 59 rule) — hence a BACKGROUND
+#     job with a pollable status, not a request-response button.
+#   - Only fresh-404-confirmed videos become purge candidates, and the purge
+#     is a SEPARATE explicit call after the operator reviews the counts
+#     (deletion is an operator decision — two-button flow by design).
+#
+# Lock discipline: get_vimeo404_job_status() returns counts only — the
+# confirmed-dead id list stays module-private (Settings is readable by
+# locked sessions).
+# ---------------------------------------------------------------------------
+VIMEO_404_CANARY_URL = "https://vimeo.com/129731718"
+VIMEO_404_VERIFY_DELAY_MIN_S = 5.0
+VIMEO_404_VERIFY_DELAY_MAX_S = 10.0
+VIMEO_404_PURGE_WINDOW_MINUTES = 30  # purge must follow a verify this fresh
+
+_vimeo404_job: dict = {
+    "state": "idle",            # idle | verifying | done | error
+    "progress": 0,
+    "total": 0,
+    "confirmed_dead": 0,
+    "healthy": 0,
+    "unverified": 0,
+    "canary_ok": None,
+    "started_at": None,
+    "finished_at": None,
+    "error": None,
+    "_confirmed_dead_ids": [],  # module-private; stripped from status
+}
+
+
+def get_vimeo404_job_status() -> dict:
+    """Counts-only job status for the web UI (lock discipline: no ids/titles)."""
+    return {k: v for k, v in _vimeo404_job.items() if not k.startswith("_")}
+
+
+def _vimeo404_check_sync(url: str) -> Tuple[str, str]:
+    """Live yt-dlp check for one URL. Runs in the process pool.
+
+    Returns (verdict, detail): "alive" | "dead_404" | "other".
+    """
+    import yt_dlp
+
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "simulate": True,
+        "socket_timeout": 30,
+        "retries": 1,
+    }
+    if os.path.isfile(settings.vimeo_cookies_path):
+        ydl_opts["cookiefile"] = settings.vimeo_cookies_path
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        if info is None:
+            return ("other", "yt-dlp returned no info")
+        return ("alive", "ok")
+    except Exception as e:  # noqa: BLE001 — classify by message text
+        msg = str(e)
+        if "404" in msg:
+            return ("dead_404", msg[:120])
+        return ("other", msg[:120])
+
+
+async def _vimeo404_check(url: str) -> Tuple[str, str]:
+    """Run one live check in the process pool with a hard timeout."""
+    import random
+
+    loop = asyncio.get_event_loop()
+    try:
+        return await asyncio.wait_for(
+            loop.run_in_executor(_process_pool, _vimeo404_check_sync, url),
+            timeout=60.0,
+        )
+    except asyncio.TimeoutError:
+        return ("other", "live check timed out after 60s")
+    except Exception as e:  # noqa: BLE001
+        return ("other", f"live check error: {e}")
+
+
+async def run_vimeo404_verification() -> None:
+    """Background task: live-verify every pending Vimeo video with a stored 404.
+
+    Uses its own DB session (the triggering request's session is gone by the
+    time this runs). Updates _vimeo404_job as it goes for the polling UI.
+    """
+    import datetime as _dt
+    import random
+
+    from app.database import async_session_factory
+
+    job = _vimeo404_job
+    job.update(
+        state="verifying", progress=0, total=0, confirmed_dead=0, healthy=0,
+        unverified=0, canary_ok=None, error=None, finished_at=None,
+        started_at=_dt.datetime.utcnow().isoformat(),
+    )
+    job["_confirmed_dead_ids"] = []
+
+    try:
+        # Canary first: a global auth/extractor failure must never be read
+        # as "every video is dead" (the Session 66-68 confusion).
+        verdict, detail = await _vimeo404_check(VIMEO_404_CANARY_URL)
+        job["canary_ok"] = verdict == "alive"
+        if verdict != "alive":
+            job.update(
+                state="error",
+                error=f"Canary failed ({verdict}): {detail[:120]} — "
+                      "auth or extractor broken; no verdicts issued.",
+                finished_at=_dt.datetime.utcnow().isoformat(),
+            )
+            logger.warning(f"Vimeo-404 verify: canary FAILED — aborting. {detail[:200]}")
+            return
+
+        async with async_session_factory() as db:
+            stmt = select(Video).where(
+                Video.resolution_status == "pending",
+                Video.resolution_error.isnot(None),
+                Video.resolution_error != "",
+            )
+            result = await db.execute(stmt)
+            errored = result.scalars().all()
+            candidates = [
+                v for v in errored
+                if "404" in (v.resolution_error or "")
+                and "vimeo" in (v.source_url or "").lower()
+            ]
+            job["total"] = len(candidates)
+            logger.info(
+                f"Vimeo-404 verify: canary alive; live-checking "
+                f"{len(candidates)} candidate(s)."
+            )
+
+            for i, v in enumerate(candidates, 1):
+                verdict, _detail = await _vimeo404_check(v.source_url or "")
+                if verdict == "dead_404":
+                    job["_confirmed_dead_ids"].append(v.id)
+                    job["confirmed_dead"] += 1
+                elif verdict == "alive":
+                    job["healthy"] += 1
+                else:
+                    job["unverified"] += 1
+                job["progress"] = i
+                if i < len(candidates):
+                    await asyncio.sleep(
+                        random.uniform(
+                            VIMEO_404_VERIFY_DELAY_MIN_S,
+                            VIMEO_404_VERIFY_DELAY_MAX_S,
+                        )
+                    )
+
+        job.update(state="done", finished_at=_dt.datetime.utcnow().isoformat())
+        logger.info(
+            f"Vimeo-404 verify complete: {job['confirmed_dead']} confirmed dead, "
+            f"{job['healthy']} healthy, {job['unverified']} unverified "
+            f"out of {job['total']}."
+        )
+    except Exception as e:  # noqa: BLE001 — job must never crash silently
+        job.update(
+            state="error", error=str(e)[:200],
+            finished_at=_dt.datetime.utcnow().isoformat(),
+        )
+        logger.error(f"Vimeo-404 verify: unexpected error — {e}")
+
+
+async def run_vimeo404_purge() -> dict:
+    """Purge the confirmed-dead set from the last completed verification.
+
+    Guards: verification must be in state 'done', finished within
+    VIMEO_404_PURGE_WINDOW_MINUTES, with a non-empty confirmed set. Each
+    video is re-checked to still exist and still be pending, then handled
+    exactly like POST /skip (skip-list entry + ORM delete; the Session 64
+    cascade cleans child rows). Single commit. Returns counts only.
+    """
+    import datetime as _dt
+
+    from app.database import async_session_factory
+    from app.models import SkipListEntry
+    from app.encryption import encrypt_value
+    from app.hashing import hmac_hash
+
+    job = _vimeo404_job
+    if job["state"] != "done":
+        return {"status": "not_ready",
+                "message": "Run Verify first — purge only follows a completed verification."}
+    if not job["_confirmed_dead_ids"]:
+        return {"status": "nothing", "message": "Verification found nothing confirmed dead."}
+    finished = _dt.datetime.fromisoformat(job["finished_at"])
+    age_min = (_dt.datetime.utcnow() - finished).total_seconds() / 60.0
+    if age_min > VIMEO_404_PURGE_WINDOW_MINUTES:
+        job.update(state="idle")
+        job["_confirmed_dead_ids"] = []
+        return {"status": "expired",
+                "message": f"Verification is {age_min:.0f} min old (limit "
+                           f"{VIMEO_404_PURGE_WINDOW_MINUTES}) — run Verify again."}
+
+    purged = 0
+    already = 0
+    missing = 0
+    async with async_session_factory() as db:
+        for vid in job["_confirmed_dead_ids"]:
+            row = await db.execute(select(Video).where(Video.id == vid))
+            video = row.scalar_one_or_none()
+            if video is None or video.resolution_status != "pending":
+                missing += 1
+                continue
+            post_hash = hmac_hash(video.source_post_id)
+            existing = await db.execute(
+                select(SkipListEntry).where(
+                    SkipListEntry.source_post_id_hash == post_hash
+                )
+            )
+            if existing.scalar_one_or_none() is not None:
+                await db.delete(video)
+                already += 1
+            else:
+                db.add(
+                    SkipListEntry(
+                        source_post_id_encrypted=encrypt_value(video.source_post_id),
+                        source_post_id_hash=post_hash,
+                        source_provider=video.source_provider,
+                    )
+                )
+                await db.delete(video)
+                purged += 1
+        await db.commit()
+
+    # Spent: require a fresh verification before any further purge.
+    job.update(state="idle", progress=0, total=0, confirmed_dead=0,
+               healthy=0, unverified=0)
+    job["_confirmed_dead_ids"] = []
+
+    total = purged + already
+    logger.info(
+        f"Vimeo-404 purge: {purged} skip-listed + deleted, {already} deleted "
+        f"(already skip-listed), {missing} skipped (missing/changed). "
+        f"Total removed: {total}."
+    )
+    return {"status": "purged", "purged": purged, "already_skiplisted": already,
+            "skipped_missing": missing, "total_removed": total}
+
 
 def _is_cookie_stale_error(error_msg: Optional[str]) -> bool:
     """Return True if an error message is a YouTube bot-check / stale-cookie rejection."""
@@ -373,6 +727,16 @@ def get_youtube_background_resolve_state() -> dict:
 def _is_youtube_source(url: Optional[str]) -> bool:
     u = url or ""
     return "youtube.com" in u or "youtu.be" in u
+
+
+def _is_vimeo_source(url: Optional[str]) -> bool:
+    """True if a SOURCE url is a Vimeo video/page URL. (Session 68)
+
+    Distinct from _is_vimeo_cdn_url (which matches resolved CDN stream URLs);
+    this matches the vimeo.com source links stored on Video rows and is used
+    to pick the Vimeo account cookie file for extraction.
+    """
+    return "vimeo.com" in (url or "")
 
 
 def _record_youtube_result(source_url: Optional[str], error_msg: Optional[str]) -> None:
@@ -971,6 +1335,45 @@ class ResolverService:
     def __init__(self, db_session: AsyncSession):
         self._db = db_session
         self._cookies_path = settings.ytdlp_cookies_path
+        self._vimeo_cookies_path = settings.vimeo_cookies_path
+
+    def _cookies_path_for(self, url: Optional[str]) -> Optional[str]:
+        """Pick the cookie file for an extraction based on the source URL. (Session 68)
+
+        WHY THIS EXISTS: On 2026-07-20 Vimeo disabled anonymous API access —
+        yt-dlp's macos client (the only one that could fetch an OAuth token
+        without logging in) started returning 401, and upstream's fix
+        (yt-dlp PR #17272) makes the extractor require account credentials
+        for ALL Vimeo extraction. A logged-in Vimeo account cookie file is
+        therefore mandatory for Vimeo, not an optional fallback.
+
+        Selection:
+          - Vimeo source URLs  -> settings.vimeo_cookies_path
+                                  (/config/vimeo.com_cookies.txt — the exact
+                                  filename the browser cookie-export addon
+                                  produces, so refreshes are a straight copy)
+          - everything else    -> settings.ytdlp_cookies_path (YouTube etc.,
+                                  unchanged behavior)
+
+        If the Vimeo file is missing, fall back to the default file (harmless:
+        cookie jars are domain-scoped, so youtube.com cookies are simply not
+        sent to vimeo.com) and warn once per process so the operator sees why
+        every Vimeo resolve is failing with "only works when logged-in".
+        """
+        global _warned_vimeo_cookies_missing
+        if _is_vimeo_source(url):
+            path = self._vimeo_cookies_path
+            if path and os.path.isfile(path):
+                return path
+            if not _warned_vimeo_cookies_missing:
+                _warned_vimeo_cookies_missing = True
+                logger.warning(
+                    "No Vimeo cookie file found — since 2026-07-20 Vimeo requires "
+                    "a logged-in account for ALL extraction, so every Vimeo resolve "
+                    "will fail until one is provided. Export cookies from a "
+                    f"logged-in vimeo.com browser tab to: {path}"
+                )
+        return self._cookies_path
 
     async def resolve_video(self, video_id: int, force: bool = False) -> Optional[dict]:
         """
@@ -1008,6 +1411,9 @@ class ResolverService:
         logger.info(f"Re-resolving video {video_id} (source: {video.source_url[:80]})")
         stream_info, error_msg, is_permanent = await self._extract_with_ytdlp(video.source_url)
         _record_youtube_result(
+            video.source_url, None if stream_info is not None else error_msg
+        )
+        _record_vimeo_result(  # Session 68: Vimeo cookie-health tracking
             video.source_url, None if stream_info is not None else error_msg
         )
 
@@ -1073,6 +1479,18 @@ class ResolverService:
             # like rate-limit. Marking it failed would bury a good video in the
             # fail log over an expired cookie. The pause was already activated by
             # _record_youtube_result; the video retries once cookies are refreshed.
+            # Vimeo login-required (Session 68): cookies expired or missing.
+            # Checked BEFORE the generic cookie-stale branch because Vimeo's
+            # message also mentions --cookies-from-browser and would match the
+            # YouTube keywords, mislabeling the log. Leaves pending; the pause
+            # was already activated by _record_vimeo_result.
+            if _is_vimeo_source(video.source_url) and _is_vimeo_login_error(error_msg):
+                logger.warning(
+                    f"Vimeo login-required error for video {video_id} — cookies "
+                    f"expired/missing. Leaving status pending; Vimeo batch "
+                    f"resolves pause until a fresh cookie file succeeds."
+                )
+                return None
             if _is_cookie_stale_error(error_msg):
                 logger.warning(
                     f"Stale-cookie error for video {video_id} — "
@@ -1392,7 +1810,7 @@ class ResolverService:
                     functools.partial(
                         _extract_tv_sync_worker,
                         video.source_url,
-                        self._cookies_path,
+                        self._cookies_path_for(video.source_url),  # Session 68
                         is_vimeo,  # prefer_hls
                     ),
                 ),
@@ -1406,6 +1824,9 @@ class ResolverService:
             return None
 
         _record_youtube_result(
+            video.source_url, None if result_dict is not None else error_msg
+        )
+        _record_vimeo_result(  # Session 68: Vimeo cookie-health tracking
             video.source_url, None if result_dict is not None else error_msg
         )
 
@@ -1552,7 +1973,7 @@ class ResolverService:
         videos = result.scalars().all()
 
         all_videos = list(videos)
-        summary = {"total": len(all_videos), "resolved": 0, "failed": 0, "deleted": 0, "skipped_backoff": 0, "skipped_cookie_stale": 0, "skipped_youtube_bg": 0, "stopped_early": False, "stopped": False}
+        summary = {"total": len(all_videos), "resolved": 0, "failed": 0, "deleted": 0, "skipped_backoff": 0, "skipped_cookie_stale": 0, "skipped_vimeo_stale": 0, "skipped_youtube_bg": 0, "stopped_early": False, "stopped": False}
 
         # Session 59 circuit breaker: consecutive transient failures within
         # this batch. See BATCH_CONSECUTIVE_FAILURE_LIMIT for rationale.
@@ -1587,6 +2008,13 @@ class ResolverService:
             # they stay pending (not failed) until cookies are refreshed.
             if is_yt and is_cookie_stale_paused():
                 summary["skipped_cookie_stale"] += 1
+                continue
+
+            # During the VIMEO cookie-stale pause (Session 68), skip Vimeo
+            # videos identically — pending, not failed, no breaker trips —
+            # until a fresh cookie export succeeds (manual Resolve tests it).
+            if _is_vimeo_source(video.source_url) and is_vimeo_cookie_stale():
+                summary["skipped_vimeo_stale"] += 1
                 continue
 
             result = await self.resolve_video(video_id, force=True)
@@ -1630,6 +2058,7 @@ class ResolverService:
             f"{summary['failed']} failed, {summary['deleted']} deleted, "
             f"{summary['skipped_backoff']} skipped (back-off), "
             f"{summary['skipped_cookie_stale']} skipped (cookie-stale), "
+            f"{summary['skipped_vimeo_stale']} skipped (vimeo-cookie-stale), "
             f"{summary['skipped_youtube_bg']} skipped (yt-bg-off) "
             f"out of {summary['total']}"
             + (" [STOPPED EARLY — provider appears blocked]" if summary["stopped_early"] else "")
@@ -1694,7 +2123,7 @@ class ResolverService:
                         _process_pool,
                         _fetch_thumbnail_sync_worker,
                         video.source_url,
-                        self._cookies_path,
+                        self._cookies_path_for(video.source_url),  # Session 68
                     ),
                     timeout=60.0,
                 )
@@ -1930,7 +2359,7 @@ class ResolverService:
                     _process_pool,
                     _extract_sync_worker,
                     url,
-                    self._cookies_path,
+                    self._cookies_path_for(url),  # Session 68
                 ),
                 timeout=float(YTDLP_TIMEOUT_SECONDS),
             )

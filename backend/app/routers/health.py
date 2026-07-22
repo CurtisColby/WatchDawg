@@ -33,11 +33,21 @@ async def health_check(db: AsyncSession = Depends(get_db_session)):
     except Exception:
         youtube_cookies = {"state": "unknown"}
 
+    # Vimeo cookie health (Session 68) — mandatory account cookies since
+    # Vimeo killed anonymous extraction on 2026-07-20. Same import-inside
+    # pattern: a resolver import problem can never take /health down.
+    try:
+        from app.services.resolver import get_vimeo_cookie_status
+        vimeo_cookies = get_vimeo_cookie_status()
+    except Exception:
+        vimeo_cookies = {"state": "unknown"}
+
     return {
         "status": "healthy" if db_ok else "degraded",
         "database": "connected" if db_ok else "unreachable",
         "service": "watchdawg-backend",
         "youtube_cookies": youtube_cookies,
+        "vimeo_cookies": vimeo_cookies,
     }
 
 

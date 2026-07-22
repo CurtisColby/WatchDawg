@@ -16,6 +16,9 @@ Pre-Milestone D change:
   Subfolders Public/ and Private/ are created on first download.
 
 Session 60 addition:
+- vimeo_cookies_path: Path to the Vimeo account session cookie file
+  (MozillaCookieJar format) — mandatory for all Vimeo extraction since
+  Vimeo disabled anonymous API access on 2026-07-20. (Session 68)
 - reddit_cookies_path: Path to the Reddit session cookie file
   (MozillaCookieJar format) used by the Reddit provider. Mounted
   read-only into the container via docker-compose.yml, same pattern
@@ -51,6 +54,21 @@ class Settings(BaseSettings):
 
     # --- yt-dlp ---
     ytdlp_cookies_path: str = Field(default="/config/cookies.txt")
+    # Path to Vimeo account session cookies (MozillaCookieJar format),
+    # exported from a logged-in vimeo.com browser tab. (Session 68)
+    #
+    # REQUIRED for all Vimeo extraction since 2026-07-20: Vimeo disabled
+    # anonymous API access (yt-dlp issue #17271 / PR #17272), so every
+    # Vimeo resolve fails with "The web client only works when logged-in"
+    # unless account cookies are provided.
+    #
+    # The filename deliberately matches the browser cookie-export addon's
+    # naming convention (vimeo.com_cookies.txt) so the refresh routine is:
+    # export from a logged-in vimeo.com tab (must include HttpOnly/session
+    # cookies — the addon's default), then copy the file straight to
+    # ~/watchdawg-backend/config/ on the host, overwriting. No rename, no
+    # restart — the resolver reads the file on every extraction.
+    vimeo_cookies_path: str = Field(default="/config/vimeo.com_cookies.txt")
 
     # --- Reddit ---
     reddit_subreddits: str = Field(default="SexyMusicVideos")

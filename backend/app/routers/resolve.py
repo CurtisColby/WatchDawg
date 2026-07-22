@@ -27,6 +27,11 @@ Endpoints:
                                       resolve error was HTTP 403 (dead/private videos that
                                       camp at the head of the batch queue and trip the
                                       circuit breaker — Session 66). ?dry_run=true counts only.
+- POST /resolve/vimeo-404-verify    — Start the background live-verification of pending
+                                      Vimeo videos with stored 404 errors (Session 68).
+- GET  /resolve/vimeo-404-status    — Poll the verification job (counts only).
+- POST /resolve/vimeo-404-purge     — Delete + skip-list the confirmed-dead set from the
+                                      last completed verification (two-button flow).
 
 Removed endpoints (Session 63): POST /resolve/reset-failed and POST /resolve/purge-dead.
 Both operated on resolution_status == "failed", which no code has written since the
@@ -570,6 +575,59 @@ async def purge_vimeo_403(
             f"All are skip-listed and cannot be re-imported."
         ),
     }
+
+
+# ---------------------------------------------------------------------------
+# Vimeo-404 verify-then-purge (Session 68).
+#
+# Two-button flow by design (deletion is an operator decision):
+#   1. POST /resolve/vimeo-404-verify  — start the background live-verify job
+#   2. GET  /resolve/vimeo-404-status  — poll progress + counts for the UI
+#   3. POST /resolve/vimeo-404-purge   — delete + skip-list the confirmed set
+# Verification live-re-extracts every pending Vimeo video with a stored 404
+# (canary first; polite 5-10s pacing) — never purges on a stored error alone
+# (Session 67: Vimeo intermittently 404s videos that are alive). Counts-only
+# responses per lock discipline. Declared with the static routes ABOVE the
+# /{video_id} catch-all — route order is load-bearing.
+# ---------------------------------------------------------------------------
+import asyncio as _asyncio  # noqa: E402 — narrow alias for the verify task
+
+
+@router.post("/vimeo-404-verify")
+async def vimeo_404_verify():
+    """Start the background Vimeo-404 live-verification job (idempotent)."""
+    from app.services.resolver import (
+        get_vimeo404_job_status,
+        run_vimeo404_verification,
+    )
+
+    status = get_vimeo404_job_status()
+    if status["state"] == "verifying":
+        return {"status": "already_running", **status}
+    _asyncio.create_task(run_vimeo404_verification())
+    logger.info("Vimeo-404 verification job started from the web UI.")
+    return {"status": "started", **get_vimeo404_job_status()}
+
+
+@router.get("/vimeo-404-status")
+async def vimeo_404_status():
+    """Poll the verification job. Counts only — no ids or titles (lock discipline)."""
+    from app.services.resolver import get_vimeo404_job_status
+    return get_vimeo404_job_status()
+
+
+@router.post("/vimeo-404-purge")
+async def vimeo_404_purge():
+    """Purge the confirmed-dead set from the last completed verification.
+
+    Refuses unless a verification completed within the freshness window —
+    the service enforces the guards; this endpoint just reports the result.
+    """
+    from app.services.resolver import run_vimeo404_purge
+    result = await run_vimeo404_purge()
+    if result.get("status") not in ("purged", "nothing"):
+        raise HTTPException(status_code=409, detail=result.get("message", "Not ready"))
+    return result
 
 
 @router.post("/upgrade")

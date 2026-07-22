@@ -347,6 +347,20 @@ h2{font-size:16px;margin:26px 0 12px;color:var(--accent2)}
   </div>
 
   <div class="card">
+    <h2 style="margin-top:0">🎬 Vimeo Cookies</h2>
+    <div class="row" style="margin-bottom:10px" data-tip="Live status, updated automatically. Green = Vimeo is accepting the account cookies. Red = Vimeo is rejecting requests (cookies expired) or the cookie file is missing — refresh using the steps below.">
+      <span class="dot" id="vimeo-cookie-dot"></span><span id="vimeo-cookie-status-txt" class="muted">Checking…</span>
+    </div>
+    <div class="muted" style="margin-bottom:6px"><b>Why:</b> Since July 20, 2026, Vimeo requires a <b>logged-in account</b> for every video lookup — anonymous access is gone for good. When the exported cookies expire, all Vimeo resolves fail, the status above turns red, and scheduled Vimeo resolves auto-pause (videos stay pending, nothing is lost). Refreshing takes two minutes:</div>
+    <ol class="muted" style="margin:0 0 8px 18px;line-height:1.8">
+      <li>On a computer where you're <b>logged into Vimeo</b>, go to <b>vimeo.com</b> and export cookies with your cookie-export browser extension (Netscape format — e.g. “Get cookies.txt LOCALLY”, same as YouTube). Export while on the Vimeo tab.</li>
+      <li>Copy the file onto the server (the filename already matches — no rename):<br><code class="cfg">cp ~/Downloads/vimeo.com_cookies.txt ~/watchdawg-backend/config/vimeo.com_cookies.txt</code></li>
+      <li>Done — <b>no restart needed</b>. Resolve any Vimeo video (or wait for the next scheduler tick); the first success turns the light green and un-pauses Vimeo automatically.</li>
+    </ol>
+    <div class="muted">To verify by hand from the server:<br><code class="cfg">docker exec watchdawg-backend yt-dlp --cookies /config/vimeo.com_cookies.txt --simulate --print title "https://vimeo.com/129731718"</code><br>— it should print a video title, not a “The web client only works when logged-in” error.</div>
+  </div>
+
+  <div class="card">
     <h2 style="margin-top:0">🩺 Server Health</h2>
     <div class="row">
       <span id="health-detail" class="muted">…</span>
@@ -376,6 +390,7 @@ h2{font-size:16px;margin:26px 0 12px;color:var(--accent2)}
       <button class="btn small" id="m-purge-missing" data-tip="Remove local video records whose files no longer exist on disk. Cleans up entries left behind after deleting or moving files.">🧹 Purge Missing Files</button>
       <button class="btn small" id="m-purge-dupes" data-tip="Remove duplicate copies of the same video that snuck in from multiple scrapes.">👯 Purge Duplicates</button>
       <button class="btn small danger" id="m-purge-403" data-tip="Remove dead Vimeo videos stuck pending with a 403 error — private, restricted, or deleted videos that block the resolve queue. Only use this when Vimeo is otherwise working: during an active IP block, 403 means Vimeo is blocking YOU, not that the videos are dead. Shows an exact count and asks before deleting. Purged videos are skip-listed and can't come back.">☠️ Purge Vimeo 403s</button>
+      <button class="btn small danger" id="m-verify-404" data-tip="Two-step cleanup for Vimeo videos stuck pending with a 404 error. Step 1 live-checks each one against Vimeo right now with your account cookies (5-10s apart, takes a minute or two) — because Vimeo sometimes 404s videos that are actually alive, nothing is deleted on a stored error alone. Step 2 shows the confirmed-dead count and asks before deleting. Purged videos are skip-listed and can't come back.">🔍 Verify &amp; Purge Vimeo 404s <span id="v404-progress"></span></button>
       <button class="btn small danger" id="m-skip-clear" data-tip="Empty the skip list. Videos you skipped in the past may reappear on the next scrape.">🗑️ Clear Skip List (<span id="skip-count">…</span>)</button>
     </div>
   </div>
@@ -520,6 +535,28 @@ function updateCookieStatus(c){
   txt.textContent = "⚠️ YouTube is rejecting requests — refresh your cookies using the steps below. Failing since " + since + " (" + (c.bot_error_count||0) + " failure" + (c.bot_error_count===1?"":"s") + ").";
   return true;
 }
+function updateVimeoCookieStatus(v){
+  // Session 68 — the Vimeo green/red light. Returns true when attention is needed.
+  const dot = $("#vimeo-cookie-dot"), txt = $("#vimeo-cookie-status-txt");
+  if (!dot || !txt) return false;
+  if (!v || v.state === "unknown"){
+    dot.className = "dot";
+    txt.textContent = "Status appears after the next Vimeo resolve (usually within one scheduler tick).";
+    return false;
+  }
+  if (v.state === "ok"){
+    dot.className = "dot good";
+    txt.textContent = "Cookies present and Vimeo is accepting them.";
+    return false;
+  }
+  dot.className = "dot bad";
+  if (v.state === "missing"){
+    txt.textContent = "⚠️ No Vimeo cookie file found — every Vimeo resolve will fail until one is provided. Follow the steps below.";
+  } else {
+    txt.textContent = "⚠️ Vimeo is rejecting the cookies (login required) — they've expired. Scheduled Vimeo resolves are auto-paused (videos stay pending). Refresh using the steps below; the first successful resolve clears this automatically.";
+  }
+  return true;
+}
 function updateYtPause(c){
   // Update pause button label + countdown from health data.
   const btn = $("#yt-pause-btn"), statusTxt = $("#yt-pause-status");
@@ -544,6 +581,7 @@ async function refreshHealth(){
     const h = await api("/health", {}, true);
     const ok = h && h.status==="healthy";
     const cookieStale = updateCookieStatus(h && h.youtube_cookies);
+    updateVimeoCookieStatus(h && h.vimeo_cookies);  // Session 68
     if (ok && cookieStale){
       $("#health-dot").className = "dot warn";
       $("#health-txt").textContent = "YouTube cookies stale";
@@ -557,6 +595,7 @@ async function refreshHealth(){
       : "Backend responded but reported: " + esc((h&&h.status)||"unknown");
   }catch(e){
     updateCookieStatus(null);
+    updateVimeoCookieStatus(null);  // Session 68
     $("#health-dot").className = "dot bad";
     $("#health-txt").textContent = "Server unreachable";
     $("#health-detail").textContent = "The backend did not respond. Check that the Docker container is running on the PlexServer.";
@@ -1312,6 +1351,48 @@ $("#m-purge-403").onclick = async function(){
     toast(r.message || "Purged.", "ok");
   }catch(e){}
   finally{ this.disabled = false; }
+};
+// Session 68 — Vimeo-404 verify-then-purge (two-button flow: verify live, review, purge).
+$("#m-verify-404").onclick = async function(){
+  const btn = this, prog = $("#v404-progress");
+  btn.disabled = true;
+  try{
+    // Step 1: start (or join) the background live-verification job.
+    let s = await api("/resolve/vimeo-404-verify", {method:"POST"});
+    if (s.state === "verifying" || s.status === "started" || s.status === "already_running"){
+      toast("Live-checking each stuck Vimeo video against Vimeo right now — this takes a minute or two.", "ok");
+    }
+    // Step 2: poll until the job settles.
+    while (true){
+      await new Promise(r => setTimeout(r, 3000));
+      s = await api("/resolve/vimeo-404-status", {});
+      if (s.state === "verifying"){
+        prog.textContent = s.total ? ` (${s.progress}/${s.total})` : " (…)";
+        continue;
+      }
+      break;
+    }
+    prog.textContent = "";
+    if (s.state === "error"){
+      toast(s.error || "Verification failed — nothing was judged or deleted.", "err");
+      return;
+    }
+    if (!s.confirmed_dead){
+      const extra = s.healthy ? ` ${s.healthy} had stale errors but are alive — left alone.` : "";
+      toast(`No confirmed-dead Vimeo videos.${extra}`, "ok");
+      return;
+    }
+    // Step 3: review + confirm with exact counts before anything is destroyed.
+    const ok = await confirmBox(
+      `Purge ${s.confirmed_dead} confirmed-dead Vimeo video${s.confirmed_dead===1?"":"s"}?`,
+      `Each of these was just re-checked live against Vimeo with your account cookies and got a fresh 404 — they no longer exist there. ${s.healthy?`${s.healthy} other video${s.healthy===1?" was":"s were"} found alive and will NOT be touched. `:""}${s.unverified?`${s.unverified} couldn't be verified and will NOT be touched. `:""}Purged videos are skip-listed so they can't be re-imported. This can't be undone.`,
+      "Purge Confirmed Dead", true);
+    if(!ok) return;
+    // Step 4: the real purge (server re-guards freshness).
+    const r = await api("/resolve/vimeo-404-purge", {method:"POST"});
+    toast(`Removed ${r.total_removed||0} dead Vimeo video${(r.total_removed||0)===1?"":"s"}. Run Resolve 25 Pending to keep the queue moving.`, "ok");
+  }catch(e){}
+  finally{ btn.disabled = false; prog.textContent = ""; }
 };
 $("#m-skip-clear").onclick = async ()=>{
   const ok = await confirmBox("Clear the skip list?", "Every video you've ever skipped may reappear on the next scrape. This can't be undone.", "Clear Skip List", true);
