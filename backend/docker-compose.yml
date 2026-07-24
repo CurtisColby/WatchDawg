@@ -25,24 +25,27 @@ services:
       # Persistent database storage
       - ./data:/app/data
 
-      # Browser cookies for yt-dlp (read-only inside container)
-      - ./config/cookies.txt:/config/cookies.txt
-
-      # Vimeo account session cookies — MANDATORY for all Vimeo extraction
-      # since Vimeo disabled anonymous API access on 2026-07-20 (Session 68).
-      # Filename matches the browser cookie-export addon's convention so a
-      # refresh is: re-export from a logged-in vimeo.com tab, copy the file
-      # over this host path, done — picked up on the next extraction, no
-      # restart. NOTE: the host file must exist BEFORE `docker compose up -d`
-      # or Docker will create it as an empty directory and break the mount.
-      - ./config/vimeo.com_cookies.txt:/config/vimeo.com_cookies.txt
-
-      # Reddit session cookies for the Reddit provider (read-only inside
-      # container). Exported from a logged-in browser in MozillaCookieJar
-      # format — same routine as the YouTube cookies above. Re-export to
-      # this host file when Reddit rotates the session; the provider
-      # re-reads it on every scrape run, no restart needed.
-      - ./config/reddit_cookies.txt:/config/reddit_cookies.txt
+      # Cookie files for yt-dlp and the Reddit provider — mounted as a
+      # DIRECTORY, not per-file (Session 69). Contains:
+      #   cookies.txt            — YouTube (yt-dlp)
+      #   vimeo.com_cookies.txt  — Vimeo account session, MANDATORY for all
+      #                            Vimeo extraction since Vimeo disabled
+      #                            anonymous API access 2026-07-20 (S68).
+      #                            Filename matches the browser cookie-export
+      #                            addon's convention: refresh = re-export
+      #                            from a logged-in vimeo.com tab, copy over
+      #                            the host file, done — no restart.
+      #   reddit_cookies.txt     — Reddit session (MozillaCookieJar), re-read
+      #                            on every scrape run.
+      #
+      # WHY a directory mount: yt-dlp WRITES cookies back on exit via
+      # write-then-rename, which gives the file a NEW INODE. A single-file
+      # bind mount pins the original inode, so the first Vimeo extraction
+      # after any cookie refresh silently ORPHANED the mount — host edits
+      # stopped reaching the container (root cause of the Jul 23 outage).
+      # Directory mounts follow paths, not inodes, so rewrites and refreshes
+      # always propagate. Container paths are unchanged (/config/...).
+      - ./config:/config
 
       # Downloads root — contains Public/ and Private/ subfolders.
       # Host folder: /media/colby/NAS1/WD_Downloads
