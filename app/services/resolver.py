@@ -15,15 +15,20 @@ Key behaviors:
 - Error handling: Dead links, geo-blocks, DMCA takedowns, and private videos
   are caught, flagged as permanent failures, and auto-deleted from the feed.
   Rate-limit errors (HTTP 429, YouTube session rate-limit) are explicitly
-  guarded as transient and will never trigger auto-delete.
+  guarded as transient and will never trigger auto-delete. Sub-request
+  failures ("Unable to download ..." — webpage/JSON metadata/macos API JSON/
+  manifests) are likewise guarded as transient (Session 67): Vimeo's metadata
+  API intermittently 404s for videos that are alive and playable, so a
+  sub-request 404 is never treated as proof the video is dead.
 - Auto-dedup: After successful resolution, the CDN fingerprint is checked
   against all other resolved Vimeo videos. If a duplicate physical file is
   found, the lower-scored copy is deleted and playback is transparently
   redirected to the keeper — the user never sees an error.
 - Hard timeout: Each yt-dlp call is capped at YTDLP_TIMEOUT_SECONDS (90s)
   using a ProcessPoolExecutor. If yt-dlp hangs (e.g. on a stalled YouTube
-  connection), the process is killed and the video is marked failed rather
-  than blocking the entire batch indefinitely.
+  connection), the process is killed and the video is treated as a transient
+  failure — its status is left unchanged (it stays pending and retries on a
+  later pass) rather than blocking the entire batch indefinitely.
 """
 
 import asyncio
@@ -32,7 +37,7 @@ import datetime
 import logging
 import os
 import re
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -55,15 +60,761 @@ RESOLUTION_TTL_HOURS = 3
 # Short TTL for HLS/DASH adaptive URLs — Vimeo signed tokens expire ~15-30min.
 ADAPTIVE_TTL_MINUTES = 20
 
+# Per-video locks for TV-path resolution (resolve_video_for_tv).
+# TiviMate retries a slow video rapidly — without a lock, each retry spawns
+# another concurrent yt-dlp process for the SAME video, piling up work and
+# making the timeout worse. With the lock, the first request does the real
+# extraction; every concurrent request for the same video waits, then gets
+# an instant cache hit from the result the first one stored.
+# The dict lives at module level so all requests (and the background
+# scheduler) in this FastAPI process share the same locks. Entries are tiny
+# asyncio.Lock objects — a few thousand videos costs negligible memory.
+_tv_resolve_locks: dict = {}
+
+# ---------------------------------------------------------------------------
+# YouTube cookie health (Session 53).
+#
+# YouTube expires exported browser cookies every few weeks; when they go
+# stale, every extraction fails with "Sign in to confirm you're not a bot"
+# and the only symptom used to be buried log lines. This tracker records,
+# in the MAIN process (extraction workers run in a separate process pool,
+# so their module state is invisible here), the outcome of every YouTube
+# extraction as results come back. /health exposes it and the web UI's
+# Settings page shows a live flag, so nobody has to watch logs.
+#
+# Rule: cookies are considered stale when the most recent bot-check error
+# is newer than the most recent YouTube success. A single success resets
+# the flag — self-clearing after a cookie refresh, no button to press.
+# In-memory only: a restart resets to "unknown" until the next YouTube
+# extraction (the next actual play or manual resolve provides one).
+# ---------------------------------------------------------------------------
+_youtube_cookie_status = {
+    "last_success": None,     # datetime of last successful YouTube extraction
+    "last_bot_error": None,   # datetime of last bot-check rejection
+    "bot_error_count": 0,     # failures since the last success
+}
+
+_BOT_CHECK_SIGNATURES = ("sign in to confirm", "not a bot")
+
+# ---------------------------------------------------------------------------
+# YouTube rate-limit back-off (Session 54).
+#
+# When YouTube rate-limits a session the error message contains the phrase
+# "rate-limited by YouTube for up to an hour." We track this in-process and
+# refuse to make ANY further YouTube yt-dlp calls until the cooldown expires.
+# This prevents the scheduler from hammering YouTube every 30 minutes while
+# already in the penalty box, which would extend the ban indefinitely.
+#
+# Back-off duration: YOUTUBE_BACKOFF_MINUTES (default 70 — slightly longer
+# than YouTube's stated "up to an hour" so we don't immediately re-trigger).
+# Self-clearing: once the cooldown expires the next extraction runs normally;
+# if it succeeds the back-off is forgotten. No button to press.
+#
+# The background job (resolve_batch) checks is_youtube_backed_off()
+# and skips YouTube videos silently during the cooldown — those videos stay
+# in their current status and will be picked up on the next tick after the
+# cooldown lifts. Play-time calls (resolve_video_for_tv) also check and
+# return None fast rather than poking YouTube and re-triggering the ban.
+# ---------------------------------------------------------------------------
+YOUTUBE_BACKOFF_MINUTES = 70
+
+_youtube_backoff_until: Optional[datetime.datetime] = None
+
+
+def _set_youtube_backoff() -> None:
+    """Start the rate-limit cooldown. Called when a rate-limit error is seen."""
+    global _youtube_backoff_until
+    until = datetime.datetime.utcnow() + datetime.timedelta(minutes=YOUTUBE_BACKOFF_MINUTES)
+    _youtube_backoff_until = until
+    logger.warning(
+        f"YouTube rate-limit back-off activated — skipping all YouTube "
+        f"extractions until {until.strftime('%H:%M UTC')} "
+        f"({YOUTUBE_BACKOFF_MINUTES} min cooldown)."
+    )
+
+
+def is_youtube_backed_off() -> bool:
+    """Return True if we are currently in the YouTube rate-limit cooldown."""
+    global _youtube_backoff_until
+    if _youtube_backoff_until is None:
+        return False
+    if datetime.datetime.utcnow() < _youtube_backoff_until:
+        return True
+    # Cooldown expired — clear it
+    _youtube_backoff_until = None
+    logger.info("YouTube rate-limit back-off expired — resuming YouTube extractions.")
+    return False
+
+
+def activate_youtube_pause(minutes: int = YOUTUBE_BACKOFF_MINUTES) -> dict:
+    """
+    Manually activate the YouTube back-off for the given number of minutes.
+
+    Called by POST /resolve/youtube-pause from the web UI or command line.
+    Identical effect to a rate-limit error triggering _set_youtube_backoff(),
+    except the duration is configurable and the source is logged as "manual".
+    Returns the pause state dict so the caller can confirm.
+    """
+    global _youtube_backoff_until
+    until = datetime.datetime.utcnow() + datetime.timedelta(minutes=minutes)
+    _youtube_backoff_until = until
+    logger.warning(
+        f"YouTube back-off manually activated — all YouTube extractions "
+        f"paused until {until.strftime('%H:%M UTC')} ({minutes} min)."
+    )
+    return get_youtube_pause_state()
+
+
+def cancel_youtube_pause() -> dict:
+    """
+    Cancel an active YouTube back-off immediately.
+
+    Called by DELETE /resolve/youtube-pause from the web UI Resume button.
+    Returns the pause state dict (will show paused=False).
+    """
+    global _youtube_backoff_until
+    _youtube_backoff_until = None
+    logger.info("YouTube back-off manually cancelled — resuming YouTube extractions now.")
+    return get_youtube_pause_state()
+
+
+def get_youtube_pause_state() -> dict:
+    """
+    Return current pause state for /health and the web UI.
+
+    paused: bool — whether the back-off is currently active
+    minutes_remaining: int | None — minutes left (None if not paused)
+    until_utc: str | None — ISO timestamp when pause expires (None if not paused)
+    """
+    now = datetime.datetime.utcnow()
+    if _youtube_backoff_until is not None and now < _youtube_backoff_until:
+        remaining = int((_youtube_backoff_until - now).total_seconds() / 60) + 1
+        return {
+            "paused": True,
+            "minutes_remaining": remaining,
+            "until_utc": _youtube_backoff_until.isoformat() + "Z",
+        }
+    return {
+        "paused": False,
+        "minutes_remaining": None,
+        "until_utc": None,
+    }
+
+
+def _is_rate_limit_error(error_msg: Optional[str]) -> bool:
+    """Return True if an error message matches a known rate-limit pattern."""
+    if not error_msg:
+        return False
+    low = error_msg.lower()
+    for keyword in RATE_LIMIT_SAFEGUARD_KEYWORDS:
+        if keyword in low:
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# YouTube cookie-stale pause (Session 56).
+#
+# Distinct from the rate-limit back-off above. When the exported browser
+# cookies expire, YouTube stops returning rate-limit phrases and instead
+# rejects every request with a bot-check challenge:
+#
+#   ERROR: [youtube] <id>: Sign in to confirm you're not a bot. Use
+#   --cookies-from-browser or --cookies for the authentication. See
+#   https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp
+#
+# Left unhandled, this error is classed as a plain transient failure and the
+# video is marked "failed" — one dead entry per resolve, permanently polluting
+# the fail log until manually cleared. A single stale cookie can bury hundreds
+# of otherwise-good videos this way.
+#
+# This pause is a circuit-breaker: the FIRST bot-check rejection flips a
+# boolean that makes every background/play-time path skip YouTube extraction
+# entirely (leaving those videos pending, never failed, never deleted), while
+# Vimeo and local content keep resolving normally. Unlike the rate-limit
+# back-off there is NO timer — a stale cookie does not fix itself on a clock.
+# It clears in exactly two ways:
+#   1. Automatically, the moment any YouTube extraction succeeds again (the
+#      success branch of _record_youtube_result), i.e. right after you refresh
+#      cookies.txt and the next play or manual resolve lands a good extraction.
+#   2. Manually, via DELETE /resolve/cookie-stale (the web UI Resume button).
+#
+# In-memory only: a restart clears it until the next bot-check rejection.
+# ---------------------------------------------------------------------------
+
+# Apostrophe-free anchors — the live log uses a curly apostrophe in "you're",
+# so we deliberately match only up to "you" and rely on the yt-dlp cookie
+# guidance phrases, which are ASCII-stable regardless of quote style.
+COOKIE_STALE_KEYWORDS = (
+    "sign in to confirm you",
+    "--cookies for the authentication",
+    "--cookies-from-browser",
+    "how-do-i-pass-cookies",
+)
+
+_youtube_cookie_stale_paused: bool = False
+
+# Warn-once flag for a missing Vimeo cookie file (Session 68). Vimeo cookie
+# selection happens on every extraction; without this flag the warning would
+# spam the log once per video in every batch.
+_warned_vimeo_cookies_missing: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Vimeo cookie-stale pause (Session 68).
+#
+# Since 2026-07-20 Vimeo requires a logged-in account for ALL extraction
+# (anonymous OAuth killed; yt-dlp #17271). When the exported account cookies
+# expire, every Vimeo extraction fails with "The web client only works when
+# logged-in ..." — which would burn whole batches and trip the circuit
+# breaker until the operator noticed a log line. This mirrors the YouTube
+# cookie-stale pause exactly:
+#
+#   - Detection: the login-required phrase on a VIMEO source (the phrase also
+#     mentions --cookies-from-browser, which overlaps the YouTube
+#     COOKIE_STALE_KEYWORDS — gating on the source URL keeps the two
+#     providers' states independent).
+#   - While stale: the BATCH loop skips Vimeo videos (they stay pending,
+#     never burn attempts, never trip the breaker). Manual Resolve clicks
+#     still attempt — deliberately, so trying one video is the natural way
+#     to test a freshly copied cookie file.
+#   - Self-clearing: the first successful Vimeo extraction clears the flag
+#     (the cookie file is re-read on every extraction, so refresh = copy the
+#     new export over the host file; no restart).
+#   - Surfaced: /health -> "vimeo_cookies" -> the Settings green/red light.
+# ---------------------------------------------------------------------------
+VIMEO_LOGIN_REQUIRED_KEYWORDS = ("only works when logged-in",)
+
+_vimeo_cookie_stale: bool = False
+
+
+def _is_vimeo_login_error(error_msg: Optional[str]) -> bool:
+    """True if an error message is Vimeo's login-required (stale/missing cookie) rejection."""
+    if not error_msg:
+        return False
+    low = error_msg.lower()
+    return any(kw in low for kw in VIMEO_LOGIN_REQUIRED_KEYWORDS)
+
+
+def _set_vimeo_cookie_stale() -> None:
+    global _vimeo_cookie_stale
+    if not _vimeo_cookie_stale:
+        _vimeo_cookie_stale = True
+        logger.warning(
+            "Vimeo cookie-stale pause ACTIVATED — Vimeo rejected the account "
+            "cookies (login required). Batch resolve will skip Vimeo videos "
+            "(they stay pending) until a fresh cookie export succeeds. "
+            "Refresh: export from a logged-in vimeo.com tab -> copy to "
+            "config/vimeo.com_cookies.txt on the host. A manual Resolve on "
+            "any Vimeo video tests the new file and auto-clears this pause."
+        )
+
+
+def _clear_vimeo_cookie_stale(reason: str = "manual") -> None:
+    global _vimeo_cookie_stale
+    if _vimeo_cookie_stale:
+        _vimeo_cookie_stale = False
+        logger.info(
+            f"Vimeo cookie-stale pause CLEARED ({reason}) — resuming Vimeo extractions."
+        )
+
+
+def is_vimeo_cookie_stale() -> bool:
+    return _vimeo_cookie_stale
+
+
+def get_vimeo_cookie_status() -> dict:
+    """Vimeo cookie health for /health and the Settings light. (Session 68)"""
+    import os as _os
+    file_present = _os.path.isfile(settings.vimeo_cookies_path)
+    if not file_present:
+        state = "missing"
+    elif _vimeo_cookie_stale:
+        state = "stale"
+    else:
+        state = "ok"
+    return {
+        "state": state,
+        "file_present": file_present,
+        "path": settings.vimeo_cookies_path,
+    }
+
+
+def _record_vimeo_result(source_url: Optional[str], error_msg: Optional[str]) -> None:
+    """Record a Vimeo extraction outcome for cookie-health tracking. (Session 68)
+
+    Call with error_msg=None on success. Non-Vimeo sources are ignored;
+    non-login errors (dead videos, 404s, timeouts) say nothing about cookies
+    and don't touch the flag — mirrors _record_youtube_result's philosophy.
+    """
+    if not _is_vimeo_source(source_url):
+        return
+    if error_msg is None:
+        _clear_vimeo_cookie_stale(reason="successful Vimeo resolve")
+        return
+    if _is_vimeo_login_error(error_msg):
+        _set_vimeo_cookie_stale()
+
+
+# ---------------------------------------------------------------------------
+# Vimeo-404 verify-then-purge background job (Session 68).
+#
+# The web-UI twin of data/sweep_vimeo_404.py. Same safety model:
+#   - NEVER purges on a stored error alone (the Session 67 lesson: Vimeo's
+#     metadata API intermittently 404s videos that are alive).
+#   - Canary extraction first; if the canary fails, auth/extractor is broken
+#     and the job aborts with zero verdicts.
+#   - Every candidate is live-re-extracted with the Vimeo account cookies at
+#     a polite randomized 5-10s pace (Session 59 rule) — hence a BACKGROUND
+#     job with a pollable status, not a request-response button.
+#   - Only fresh-404-confirmed videos become purge candidates, and the purge
+#     is a SEPARATE explicit call after the operator reviews the counts
+#     (deletion is an operator decision — two-button flow by design).
+#
+# Lock discipline: get_vimeo404_job_status() returns counts only — the
+# confirmed-dead id list stays module-private (Settings is readable by
+# locked sessions).
+# ---------------------------------------------------------------------------
+VIMEO_404_CANARY_URL = "https://vimeo.com/129731718"
+VIMEO_404_VERIFY_DELAY_MIN_S = 5.0
+VIMEO_404_VERIFY_DELAY_MAX_S = 10.0
+VIMEO_404_PURGE_WINDOW_MINUTES = 30  # purge must follow a verify this fresh
+
+_vimeo404_job: dict = {
+    "state": "idle",            # idle | verifying | done | error
+    "progress": 0,
+    "total": 0,
+    "confirmed_dead": 0,
+    "healthy": 0,
+    "unverified": 0,
+    "canary_ok": None,
+    "started_at": None,
+    "finished_at": None,
+    "error": None,
+    "_confirmed_dead_ids": [],  # module-private; stripped from status
+}
+
+
+def get_vimeo404_job_status() -> dict:
+    """Counts-only job status for the web UI (lock discipline: no ids/titles)."""
+    return {k: v for k, v in _vimeo404_job.items() if not k.startswith("_")}
+
+
+def _vimeo404_check_sync(url: str) -> Tuple[str, str]:
+    """Live yt-dlp check for one URL. Runs in the process pool.
+
+    Returns (verdict, detail): "alive" | "dead_404" | "other".
+    """
+    import yt_dlp
+
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "simulate": True,
+        "socket_timeout": 30,
+        "retries": 1,
+    }
+    if os.path.isfile(settings.vimeo_cookies_path):
+        ydl_opts["cookiefile"] = settings.vimeo_cookies_path
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        if info is None:
+            return ("other", "yt-dlp returned no info")
+        return ("alive", "ok")
+    except Exception as e:  # noqa: BLE001 — classify by message text
+        msg = str(e)
+        if "404" in msg:
+            return ("dead_404", msg[:120])
+        return ("other", msg[:120])
+
+
+async def _vimeo404_check(url: str) -> Tuple[str, str]:
+    """Run one live check in the process pool with a hard timeout."""
+    import random
+
+    loop = asyncio.get_event_loop()
+    try:
+        return await asyncio.wait_for(
+            loop.run_in_executor(_process_pool, _vimeo404_check_sync, url),
+            timeout=60.0,
+        )
+    except asyncio.TimeoutError:
+        return ("other", "live check timed out after 60s")
+    except Exception as e:  # noqa: BLE001
+        return ("other", f"live check error: {e}")
+
+
+async def run_vimeo404_verification() -> None:
+    """Background task: live-verify every pending Vimeo video with a stored 404.
+
+    Uses its own DB session (the triggering request's session is gone by the
+    time this runs). Updates _vimeo404_job as it goes for the polling UI.
+    """
+    import datetime as _dt
+    import random
+
+    from app.database import async_session_factory
+
+    job = _vimeo404_job
+    job.update(
+        state="verifying", progress=0, total=0, confirmed_dead=0, healthy=0,
+        unverified=0, canary_ok=None, error=None, finished_at=None,
+        started_at=_dt.datetime.utcnow().isoformat(),
+    )
+    job["_confirmed_dead_ids"] = []
+
+    try:
+        # Canary first: a global auth/extractor failure must never be read
+        # as "every video is dead" (the Session 66-68 confusion).
+        verdict, detail = await _vimeo404_check(VIMEO_404_CANARY_URL)
+        job["canary_ok"] = verdict == "alive"
+        if verdict != "alive":
+            job.update(
+                state="error",
+                error=f"Canary failed ({verdict}): {detail[:120]} — "
+                      "auth or extractor broken; no verdicts issued.",
+                finished_at=_dt.datetime.utcnow().isoformat(),
+            )
+            logger.warning(f"Vimeo-404 verify: canary FAILED — aborting. {detail[:200]}")
+            return
+
+        async with async_session_factory() as db:
+            stmt = select(Video).where(
+                Video.resolution_status == "pending",
+                Video.resolution_error.isnot(None),
+                Video.resolution_error != "",
+            )
+            result = await db.execute(stmt)
+            errored = result.scalars().all()
+            candidates = [
+                v for v in errored
+                if "404" in (v.resolution_error or "")
+                and "vimeo" in (v.source_url or "").lower()
+            ]
+            job["total"] = len(candidates)
+            logger.info(
+                f"Vimeo-404 verify: canary alive; live-checking "
+                f"{len(candidates)} candidate(s)."
+            )
+
+            for i, v in enumerate(candidates, 1):
+                verdict, _detail = await _vimeo404_check(v.source_url or "")
+                if verdict == "dead_404":
+                    job["_confirmed_dead_ids"].append(v.id)
+                    job["confirmed_dead"] += 1
+                elif verdict == "alive":
+                    job["healthy"] += 1
+                else:
+                    job["unverified"] += 1
+                job["progress"] = i
+                if i < len(candidates):
+                    await asyncio.sleep(
+                        random.uniform(
+                            VIMEO_404_VERIFY_DELAY_MIN_S,
+                            VIMEO_404_VERIFY_DELAY_MAX_S,
+                        )
+                    )
+
+        job.update(state="done", finished_at=_dt.datetime.utcnow().isoformat())
+        logger.info(
+            f"Vimeo-404 verify complete: {job['confirmed_dead']} confirmed dead, "
+            f"{job['healthy']} healthy, {job['unverified']} unverified "
+            f"out of {job['total']}."
+        )
+    except Exception as e:  # noqa: BLE001 — job must never crash silently
+        job.update(
+            state="error", error=str(e)[:200],
+            finished_at=_dt.datetime.utcnow().isoformat(),
+        )
+        logger.error(f"Vimeo-404 verify: unexpected error — {e}")
+
+
+async def run_vimeo404_purge() -> dict:
+    """Purge the confirmed-dead set from the last completed verification.
+
+    Guards: verification must be in state 'done', finished within
+    VIMEO_404_PURGE_WINDOW_MINUTES, with a non-empty confirmed set. Each
+    video is re-checked to still exist and still be pending, then handled
+    exactly like POST /skip (skip-list entry + ORM delete; the Session 64
+    cascade cleans child rows). Single commit. Returns counts only.
+    """
+    import datetime as _dt
+
+    from app.database import async_session_factory
+    from app.models import SkipListEntry
+    from app.encryption import encrypt_value
+    from app.hashing import hmac_hash
+
+    job = _vimeo404_job
+    if job["state"] != "done":
+        return {"status": "not_ready",
+                "message": "Run Verify first — purge only follows a completed verification."}
+    if not job["_confirmed_dead_ids"]:
+        return {"status": "nothing", "message": "Verification found nothing confirmed dead."}
+    finished = _dt.datetime.fromisoformat(job["finished_at"])
+    age_min = (_dt.datetime.utcnow() - finished).total_seconds() / 60.0
+    if age_min > VIMEO_404_PURGE_WINDOW_MINUTES:
+        job.update(state="idle")
+        job["_confirmed_dead_ids"] = []
+        return {"status": "expired",
+                "message": f"Verification is {age_min:.0f} min old (limit "
+                           f"{VIMEO_404_PURGE_WINDOW_MINUTES}) — run Verify again."}
+
+    purged = 0
+    already = 0
+    missing = 0
+    async with async_session_factory() as db:
+        for vid in job["_confirmed_dead_ids"]:
+            row = await db.execute(select(Video).where(Video.id == vid))
+            video = row.scalar_one_or_none()
+            if video is None or video.resolution_status != "pending":
+                missing += 1
+                continue
+            post_hash = hmac_hash(video.source_post_id)
+            existing = await db.execute(
+                select(SkipListEntry).where(
+                    SkipListEntry.source_post_id_hash == post_hash
+                )
+            )
+            if existing.scalar_one_or_none() is not None:
+                await db.delete(video)
+                already += 1
+            else:
+                db.add(
+                    SkipListEntry(
+                        source_post_id_encrypted=encrypt_value(video.source_post_id),
+                        source_post_id_hash=post_hash,
+                        source_provider=video.source_provider,
+                    )
+                )
+                await db.delete(video)
+                purged += 1
+        await db.commit()
+
+    # Spent: require a fresh verification before any further purge.
+    job.update(state="idle", progress=0, total=0, confirmed_dead=0,
+               healthy=0, unverified=0)
+    job["_confirmed_dead_ids"] = []
+
+    total = purged + already
+    logger.info(
+        f"Vimeo-404 purge: {purged} skip-listed + deleted, {already} deleted "
+        f"(already skip-listed), {missing} skipped (missing/changed). "
+        f"Total removed: {total}."
+    )
+    return {"status": "purged", "purged": purged, "already_skiplisted": already,
+            "skipped_missing": missing, "total_removed": total}
+
+
+def _is_cookie_stale_error(error_msg: Optional[str]) -> bool:
+    """Return True if an error message is a YouTube bot-check / stale-cookie rejection."""
+    if not error_msg:
+        return False
+    low = error_msg.lower()
+    for keyword in COOKIE_STALE_KEYWORDS:
+        if keyword in low:
+            return True
+    return False
+
+
+def _set_cookie_stale_pause() -> None:
+    """Flip the cookie-stale pause on. Called when a bot-check rejection is seen."""
+    global _youtube_cookie_stale_paused
+    if not _youtube_cookie_stale_paused:
+        _youtube_cookie_stale_paused = True
+        logger.warning(
+            "YouTube cookie-stale pause ACTIVATED — cookies appear expired. "
+            "Skipping all YouTube extractions (videos stay pending, not failed) "
+            "until a fresh cookie succeeds or the web UI Resume button is used."
+        )
+
+
+def _clear_cookie_stale_pause(reason: str = "manual") -> None:
+    """Flip the cookie-stale pause off. Called on first success or manual resume."""
+    global _youtube_cookie_stale_paused
+    if _youtube_cookie_stale_paused:
+        _youtube_cookie_stale_paused = False
+        logger.info(
+            f"YouTube cookie-stale pause CLEARED ({reason}) — resuming YouTube extractions."
+        )
+
+
+def is_cookie_stale_paused() -> bool:
+    """Return True if YouTube extraction is currently paused due to stale cookies."""
+    return _youtube_cookie_stale_paused
+
+
+def cancel_cookie_stale_pause() -> dict:
+    """
+    Manually clear the cookie-stale pause.
+
+    Called by DELETE /resolve/cookie-stale from the web UI Resume button.
+    Safe to call even if no pause is active. Returns the state dict.
+    """
+    _clear_cookie_stale_pause(reason="manual resume")
+    return get_cookie_stale_state()
+
+
+def get_cookie_stale_state() -> dict:
+    """Return the current cookie-stale pause state for /health and the web UI."""
+    return {"cookie_stale_paused": _youtube_cookie_stale_paused}
+
+
+# ---------------------------------------------------------------------------
+# YouTube background-resolve switch (Session 56).
+#
+# The reason cookies keep dying is VOLUME: with ~12,000+ pending YouTube videos
+# and resolved URLs that expire in ~3 hours, background resolve passes
+# hammer YouTube thousands of times a day from one IP + one cookie — a textbook
+# automated-scraper pattern that YouTube responds to by killing the session.
+#
+# Since YouTube resolved URLs go stale within hours anyway, bulk pre-resolving
+# them is mostly wasted cookie-burn. This switch turns OFF all *background*
+# YouTube extraction (the scheduled pending pass), so the
+# cookie is only ever touched when a video is actually PLAYED.
+#
+# Deliberately does NOT affect:
+#   - Vimeo / local content — they don't use the cookie and pre-resolve as before.
+#   - resolve_video() / resolve_video_for_tv() — the on-demand PLAY-TIME paths.
+#     Pressing play on a YouTube video still resolves it live. This switch only
+#     stops the *speculative* background grind, not on-play resolution.
+#
+# Default: DISABLED (background YouTube resolve OFF). Flip to True — or wire the
+# planned Settings-page toggle to set_youtube_background_resolve(True) — to turn
+# the background passes back on (e.g. once ffmpeg remux-on-play lands and makes
+# a fuller YouTube catalog worthwhile).
+#
+# In-memory only, like the pauses above: a restart returns to this default.
+# ---------------------------------------------------------------------------
+_youtube_background_resolve_enabled: bool = False
+
+
+def is_youtube_background_resolve_enabled() -> bool:
+    """
+    Return True if background (scheduled) YouTube extraction is allowed.
+
+    The single source of truth checked by resolve_batch().
+    Play-time paths do NOT check this — pressing play always resolves.
+    """
+    return _youtube_background_resolve_enabled
+
+
+def set_youtube_background_resolve(enabled: bool) -> dict:
+    """
+    Enable or disable background YouTube extraction.
+
+    Intended for a future Settings-page toggle (GET/POST endpoint). Returns the
+    state dict so the caller can confirm.
+    """
+    global _youtube_background_resolve_enabled
+    _youtube_background_resolve_enabled = bool(enabled)
+    logger.info(
+        f"YouTube background resolve {'ENABLED' if enabled else 'DISABLED'} "
+        f"— the scheduled pending pass will "
+        f"{'process' if enabled else 'skip'} YouTube videos."
+    )
+    return get_youtube_background_resolve_state()
+
+
+def get_youtube_background_resolve_state() -> dict:
+    """Return the current background-resolve switch state for /health and the web UI."""
+    return {"youtube_background_resolve_enabled": _youtube_background_resolve_enabled}
+
+
+def _is_youtube_source(url: Optional[str]) -> bool:
+    u = url or ""
+    return "youtube.com" in u or "youtu.be" in u
+
+
+def _is_vimeo_source(url: Optional[str]) -> bool:
+    """True if a SOURCE url is a Vimeo video/page URL. (Session 68)
+
+    Distinct from _is_vimeo_cdn_url (which matches resolved CDN stream URLs);
+    this matches the vimeo.com source links stored on Video rows and is used
+    to pick the Vimeo account cookie file for extraction.
+    """
+    return "vimeo.com" in (url or "")
+
+
+def _record_youtube_result(source_url: Optional[str], error_msg: Optional[str]) -> None:
+    """
+    Record the outcome of a yt-dlp extraction for cookie-health tracking
+    and rate-limit back-off.
+
+    Call with error_msg=None on success. Non-YouTube sources are ignored;
+    non-bot-check errors (dead videos, timeouts) don't touch the cookie
+    status — they say nothing about cookies. Rate-limit errors trigger
+    the back-off regardless of bot-check status.
+    """
+    if not _is_youtube_source(source_url):
+        return
+    now = datetime.datetime.utcnow()
+    if error_msg is None:
+        _youtube_cookie_status["last_success"] = now
+        _youtube_cookie_status["bot_error_count"] = 0
+        # A successful YouTube extraction means the cookie is good again —
+        # auto-clear the cookie-stale pause (self-healing after a refresh).
+        _clear_cookie_stale_pause(reason="successful YouTube resolve")
+        return
+    # Rate-limit errors activate the back-off cooldown (separate from cookie health).
+    if _is_rate_limit_error(error_msg):
+        _set_youtube_backoff()
+    # Bot-check / stale-cookie rejection: activate the cookie-stale pause so the
+    # scheduler stops feeding YouTube videos into the "failed" bucket.
+    if _is_cookie_stale_error(error_msg):
+        _set_cookie_stale_pause()
+    low = error_msg.lower()
+    if any(sig in low for sig in _BOT_CHECK_SIGNATURES):
+        _youtube_cookie_status["last_bot_error"] = now
+        _youtube_cookie_status["bot_error_count"] += 1
+        if _youtube_cookie_status["bot_error_count"] == 1:
+            logger.warning(
+                "YouTube cookie health: bot-check rejection detected — "
+                "cookies are likely stale (flagged on /health and the web UI)"
+            )
+
+
+def get_youtube_cookie_status() -> dict:
+    """
+    Cookie health + pause state summary for /health.
+    state: 'ok' | 'stale' | 'unknown'
+    Also includes the current pause state so the web UI gets everything
+    in one call.
+    """
+    s = _youtube_cookie_status
+    if s["last_success"] is None and s["last_bot_error"] is None:
+        state = "unknown"
+    elif s["last_bot_error"] is not None and (
+        s["last_success"] is None or s["last_bot_error"] > s["last_success"]
+    ):
+        state = "stale"
+    else:
+        state = "ok"
+    result = {
+        "state": state,
+        "last_success": s["last_success"].isoformat() + "Z" if s["last_success"] else None,
+        "last_bot_error": s["last_bot_error"].isoformat() + "Z" if s["last_bot_error"] else None,
+        "bot_error_count": s["bot_error_count"],
+    }
+    result.update(get_youtube_pause_state())
+    result.update(get_cookie_stale_state())
+    result.update(get_youtube_background_resolve_state())
+    return result
+
 # Hard wall-clock timeout for a single yt-dlp extraction call.
 # If yt-dlp hasn't returned within this many seconds, the subprocess is killed
 # and the video is marked failed (transient). This prevents one hung YouTube
 # video from blocking the entire batch queue for minutes.
 YTDLP_TIMEOUT_SECONDS = 90
 
-# Reusable process pool for yt-dlp calls — one worker per call, capped at 4
-# concurrent extractions to avoid hammering platforms.
-_process_pool = concurrent.futures.ProcessPoolExecutor(max_workers=4)
+# Reusable process pool for yt-dlp calls — capped at 2 concurrent extractions.
+# Was 4; reduced in Session 54 to avoid triggering YouTube rate limits.
+# 2 workers means at most 2 simultaneous yt-dlp processes hitting YouTube,
+# which combined with the inter-request sleep keeps us well under the limit.
+_process_pool = concurrent.futures.ProcessPoolExecutor(max_workers=2)
 
 FORMAT_SELECTOR = (
     # Prefer combined mp4 streams (video+audio) up to 1080p
@@ -117,6 +868,45 @@ RATE_LIMIT_SAFEGUARD_KEYWORDS = [
     "too many requests",
     "please try again later",
 ]
+
+# Sub-request safeguard (Session 67) — checked BEFORE permanent keywords,
+# alongside the rate-limit guard.
+#
+# yt-dlp errors that begin "Unable to download ..." (webpage, JSON metadata,
+# macos API JSON, MPD manifest, m3u8 information) mean an internal SUB-REQUEST
+# failed — the extractor never got far enough for the provider to actually say
+# anything about the video itself. Vimeo in particular intermittently answers
+# its own player/metadata API with HTTP 404 as anti-bot noise for videos that
+# are alive and playable (confirmed live 2026-07-14: video 129731718 was
+# auto-deleted at 02:31 for "Unable to download macos API JSON: HTTP Error
+# 404", then resolved cleanly from the same container hours later and played
+# in a browser throughout). Because "not found" is in the permanent keyword
+# list, every one of these transient API 404s was being classified permanent
+# and the video auto-deleted on the spot.
+#
+# Rule: any "unable to download" sub-request failure is TRANSIENT — retry
+# later, never auto-delete. Only unambiguous extractor verdicts ("private
+# video", "removed by the uploader", "this video has been removed", ...)
+# remain permanent, because those only appear when the provider genuinely
+# answered about the video. Accepted trade-off: a truly-deleted Vimeo video
+# also 404s its webpage, so genuinely dead videos now stay pending instead of
+# auto-deleting — they surface via the resolution_error text / Problems view
+# and the planned attempts-counter feature. Deletion is an operator decision,
+# not a substring match (same principle as the Session 66 Vimeo-403 lesson).
+SUBREQUEST_TRANSIENT_KEYWORDS = [
+    "unable to download",
+]
+
+# Circuit breaker for background batch resolving (Session 59). If this many
+# CONSECUTIVE transient failures occur within one batch, the provider is
+# almost certainly blocked or down (e.g. the July 2026 Vimeo 403 IP-block) —
+# the batch stops early instead of hammering a blocked provider with the
+# remaining slots. Hammering is exactly what keeps IP blocks alive. Remaining
+# videos stay pending and the next scheduled tick probes again automatically,
+# so resolving resumes on its own the moment the block lifts. The counter
+# resets on any successful resolve OR any permanent-delete (both prove the
+# provider is actually responding).
+BATCH_CONSECUTIVE_FAILURE_LIMIT = 5
 
 # Vimeo CDN domains — fingerprinting ONLY fires for URLs from these domains.
 # This prevents the broad /video/{hash}/ pattern from false-matching YouTube
@@ -290,34 +1080,60 @@ def _extract_sync_worker(url: str, cookies_path: Optional[str]) -> Tuple[Optiona
         for keyword in RATE_LIMIT_SAFEGUARD_KEYWORDS:
             if keyword in error_lower:
                 return None, f"Transient(rate-limit): {error_msg[:300]}", False
+        # GUARD (Session 67): sub-request failures ("Unable to download ...")
+        # are transient. Vimeo's metadata API intermittently 404s for videos
+        # that are alive and playable; "not found" would otherwise match the
+        # permanent list and auto-delete a healthy video. See
+        # SUBREQUEST_TRANSIENT_KEYWORDS for the full rationale.
+        for keyword in SUBREQUEST_TRANSIENT_KEYWORDS:
+            if keyword in error_lower:
+                return None, f"Transient(subrequest): {error_msg[:300]}", False
         for keyword in permanent_keywords:
             if keyword in error_lower:
                 return None, f"Permanent: {error_msg[:300]}", True
         return None, f"Transient: {error_msg[:300]}", False
 
 
-def _extract_tv_sync_worker(url: str, cookies_path: Optional[str]) -> Tuple[Optional[dict], Optional[str], bool]:
+def _extract_tv_sync_worker(url: str, cookies_path: Optional[str], prefer_hls: bool = False) -> Tuple[Optional[dict], Optional[str], bool]:
     """
     TV-specific yt-dlp extraction. Returns both video_url and audio_url separately
     so the client can pass them to VLC or another external player that can merge
     split streams natively — something ExoPlayer cannot do without a manifest.
 
-    Format selector targets the best split stream (bestvideo+bestaudio) with no
-    height cap. For YouTube this gets 1080p/1440p/4K video + separate audio.
-    For sources that only have combined streams, audio_url will be None and
-    stream_url covers both tracks.
+    prefer_hls=True: used for Vimeo, which serves HLS-only split streams.
+    Explicitly filters for m3u8_native protocol so we always get HLS sub-playlist
+    URLs rather than progressive MP4 URLs — required for the master manifest
+    approach where TiviMate fetches both sub-playlists in parallel.
+
+    prefer_hls=False (default): used for YouTube and others that serve split
+    progressive MP4 (video-only + audio-only) — these go through the DASH
+    manifest path which ExoPlayer handles natively.
 
     Returns (stream_info_dict | None, error_msg | None, is_permanent: bool).
     """
     import yt_dlp
 
-    TV_FORMAT_SELECTOR = (
-        "bestvideo[vcodec^=avc1]+bestaudio[ext=m4a]/"
-        "bestvideo[vcodec^=avc1]+bestaudio/"
-        "bestvideo+bestaudio[ext=m4a]/"
-        "bestvideo+bestaudio/"
-        "best"
-    )
+    if prefer_hls:
+        # Vimeo: explicitly prefer HLS split streams so URLs are m3u8 sub-playlists
+        # that can be declared in a synthetic HLS master manifest. Without the
+        # protocol filter yt-dlp may pick progressive MP4 which can't go into
+        # an #EXT-X-STREAM-INF entry.
+        TV_FORMAT_SELECTOR = (
+            "bestvideo[vcodec^=avc1][protocol^=m3u8]+bestaudio[protocol^=m3u8]/"
+            "bestvideo[vcodec^=avc1]+bestaudio[ext=m4a]/"
+            "bestvideo[vcodec^=avc1]+bestaudio/"
+            "bestvideo+bestaudio[ext=m4a]/"
+            "bestvideo+bestaudio/"
+            "best"
+        )
+    else:
+        TV_FORMAT_SELECTOR = (
+            "bestvideo[vcodec^=avc1]+bestaudio[ext=m4a]/"
+            "bestvideo[vcodec^=avc1]+bestaudio/"
+            "bestvideo+bestaudio[ext=m4a]/"
+            "bestvideo+bestaudio/"
+            "best"
+        )
 
     ydl_opts = {
         "format": TV_FORMAT_SELECTOR,
@@ -404,14 +1220,36 @@ def _extract_tv_sync_worker(url: str, cookies_path: Optional[str]) -> Tuple[Opti
         for keyword in RATE_LIMIT_SAFEGUARD_KEYWORDS:
             if keyword in error_lower:
                 return None, f"Transient(rate-limit): {error_msg[:300]}", False
+        # GUARD (Session 67): sub-request failures ("Unable to download ...")
+        # are transient. Vimeo's metadata API intermittently 404s for videos
+        # that are alive and playable; "not found" would otherwise match the
+        # permanent list and auto-delete a healthy video. See
+        # SUBREQUEST_TRANSIENT_KEYWORDS for the full rationale.
+        for keyword in SUBREQUEST_TRANSIENT_KEYWORDS:
+            if keyword in error_lower:
+                return None, f"Transient(subrequest): {error_msg[:300]}", False
         for keyword in permanent_keywords:
             if keyword in error_lower:
                 return None, f"Permanent: {error_msg[:300]}", True
         return None, f"Transient: {error_msg[:300]}", False
 
 
-def _fetch_thumbnail_sync_worker(url: str, cookies_path: Optional[str]) -> Optional[str]:
-    """Module-level thumbnail fetch — picklable for ProcessPoolExecutor."""
+def _fetch_thumbnail_sync_worker(url: str, cookies_path: Optional[str]):
+    """Module-level thumbnail fetch — picklable for ProcessPoolExecutor.
+
+    Session 58: returns a (thumbnail_url, outcome) tuple instead of a bare
+    Optional[str]. Outcomes:
+      "ok"        — thumbnail found (thumbnail_url is the URL)
+      "no_thumb"  — extraction succeeded but the video genuinely has no
+                    thumbnail; safe to mark terminally
+      "permanent" — the video is dead (404/private/removed); safe to mark
+                    terminally so it stops clogging the backfill queue
+      "transient" — rate limit, network error, timeout, or anything else
+                    temporary; caller must LEAVE thumbnail_url NULL so the
+                    video is retried on a later pass. The old behavior
+                    stamped 'unavailable' on these, permanently poisoning
+                    records during outages like a Vimeo 403 block.
+    """
     import yt_dlp
 
     ydl_opts = {
@@ -430,15 +1268,34 @@ def _fetch_thumbnail_sync_worker(url: str, cookies_path: Optional[str]) -> Optio
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
         if info is None:
-            return None
+            return (None, "transient")
         thumbnails = info.get("thumbnails") or []
         if thumbnails:
             best = thumbnails[-1].get("url")
             if best:
-                return best
-        return info.get("thumbnail")
-    except Exception:
-        return None
+                return (best, "ok")
+        single = info.get("thumbnail")
+        if single:
+            return (single, "ok")
+        return (None, "no_thumb")
+    except Exception as e:
+        msg = str(e).lower()
+        # Rate-limit safeguard first — these messages can contain permanent-
+        # looking phrases like "video unavailable" (documented above for the
+        # resolve path; same logic applies here).
+        for kw in RATE_LIMIT_SAFEGUARD_KEYWORDS:
+            if kw in msg:
+                return (None, "transient")
+        # Sub-request safeguard (Session 67) — "Unable to download ..." means
+        # an internal fetch failed, not that the video is dead. Same rationale
+        # as the resolve path; see SUBREQUEST_TRANSIENT_KEYWORDS.
+        for kw in SUBREQUEST_TRANSIENT_KEYWORDS:
+            if kw in msg:
+                return (None, "transient")
+        for kw in PERMANENT_ERROR_KEYWORDS:
+            if kw in msg:
+                return (None, "permanent")
+        return (None, "transient")
 
 
 class StreamInfo:
@@ -478,6 +1335,45 @@ class ResolverService:
     def __init__(self, db_session: AsyncSession):
         self._db = db_session
         self._cookies_path = settings.ytdlp_cookies_path
+        self._vimeo_cookies_path = settings.vimeo_cookies_path
+
+    def _cookies_path_for(self, url: Optional[str]) -> Optional[str]:
+        """Pick the cookie file for an extraction based on the source URL. (Session 68)
+
+        WHY THIS EXISTS: On 2026-07-20 Vimeo disabled anonymous API access —
+        yt-dlp's macos client (the only one that could fetch an OAuth token
+        without logging in) started returning 401, and upstream's fix
+        (yt-dlp PR #17272) makes the extractor require account credentials
+        for ALL Vimeo extraction. A logged-in Vimeo account cookie file is
+        therefore mandatory for Vimeo, not an optional fallback.
+
+        Selection:
+          - Vimeo source URLs  -> settings.vimeo_cookies_path
+                                  (/config/vimeo.com_cookies.txt — the exact
+                                  filename the browser cookie-export addon
+                                  produces, so refreshes are a straight copy)
+          - everything else    -> settings.ytdlp_cookies_path (YouTube etc.,
+                                  unchanged behavior)
+
+        If the Vimeo file is missing, fall back to the default file (harmless:
+        cookie jars are domain-scoped, so youtube.com cookies are simply not
+        sent to vimeo.com) and warn once per process so the operator sees why
+        every Vimeo resolve is failing with "only works when logged-in".
+        """
+        global _warned_vimeo_cookies_missing
+        if _is_vimeo_source(url):
+            path = self._vimeo_cookies_path
+            if path and os.path.isfile(path):
+                return path
+            if not _warned_vimeo_cookies_missing:
+                _warned_vimeo_cookies_missing = True
+                logger.warning(
+                    "No Vimeo cookie file found — since 2026-07-20 Vimeo requires "
+                    "a logged-in account for ALL extraction, so every Vimeo resolve "
+                    "will fail until one is provided. Export cookies from a "
+                    f"logged-in vimeo.com browser tab to: {path}"
+                )
+        return self._cookies_path
 
     async def resolve_video(self, video_id: int, force: bool = False) -> Optional[dict]:
         """
@@ -514,6 +1410,12 @@ class ResolverService:
         # Resolve with yt-dlp (hard timeout via ProcessPoolExecutor)
         logger.info(f"Re-resolving video {video_id} (source: {video.source_url[:80]})")
         stream_info, error_msg, is_permanent = await self._extract_with_ytdlp(video.source_url)
+        _record_youtube_result(
+            video.source_url, None if stream_info is not None else error_msg
+        )
+        _record_vimeo_result(  # Session 68: Vimeo cookie-health tracking
+            video.source_url, None if stream_info is not None else error_msg
+        )
 
         if stream_info is not None:
             url_type = "HLS" if _is_hls_url(stream_info.stream_url) else \
@@ -562,11 +1464,60 @@ class ResolverService:
             return None
 
         else:
-            video.resolution_status = "failed"
-            video.resolved_at = datetime.datetime.utcnow()
+            # Rate-limit errors: leave the video as pending (or resolved if it
+            # was previously resolved) so the scheduler retries it after the
+            # back-off expires. Marking it failed would remove it from the
+            # pending queue permanently — it would never be retried.
+            if _is_rate_limit_error(error_msg):
+                logger.warning(
+                    f"Rate-limit error for video {video_id} — "
+                    f"leaving status unchanged so it retries after back-off. "
+                    f"Error: {error_msg[:200]}"
+                )
+                return None
+            # Stale-cookie (bot-check) errors: leave the video pending, exactly
+            # like rate-limit. Marking it failed would bury a good video in the
+            # fail log over an expired cookie. The pause was already activated by
+            # _record_youtube_result; the video retries once cookies are refreshed.
+            # Vimeo login-required (Session 68): cookies expired or missing.
+            # Checked BEFORE the generic cookie-stale branch because Vimeo's
+            # message also mentions --cookies-from-browser and would match the
+            # YouTube keywords, mislabeling the log. Leaves pending; the pause
+            # was already activated by _record_vimeo_result.
+            if _is_vimeo_source(video.source_url) and _is_vimeo_login_error(error_msg):
+                logger.warning(
+                    f"Vimeo login-required error for video {video_id} — cookies "
+                    f"expired/missing. Leaving status pending; Vimeo batch "
+                    f"resolves pause until a fresh cookie file succeeds."
+                )
+                return None
+            if _is_cookie_stale_error(error_msg):
+                logger.warning(
+                    f"Stale-cookie error for video {video_id} — "
+                    f"leaving status pending so it retries after cookie refresh. "
+                    f"Error: {error_msg[:200]}"
+                )
+                return None
+            # ALL other transient errors (Session 59): leave the status
+            # unchanged — pending stays pending — so the video is retried on a
+            # later pass. Record the error text for visibility in the web UI.
+            #
+            # The old behavior wrote resolution_status="failed" here, which
+            # permanently removed the video from the pending queue. During the
+            # July 2026 Vimeo 403 IP-block, a single scheduled tick buried 200
+            # good videos this way (the 403 text matched neither the rate-limit
+            # nor cookie-stale keyword guards above). Keyword guards can never
+            # cover every phrasing, so the safe default for anything transient
+            # is retry-later, never bury-forever. Genuinely dead videos are
+            # handled by the is_permanent branch (auto-delete) — the "failed"
+            # status is no longer written by this method.
             video.resolution_error = error_msg or "Unknown error"
             await self._db.commit()
-            logger.warning(f"Failed to resolve video {video_id}: {error_msg}")
+            logger.warning(
+                f"Transient failure for video {video_id} — leaving status "
+                f"'{video.resolution_status}' so it retries on a later pass. "
+                f"Error: {(error_msg or 'Unknown error')[:200]}"
+            )
             return None
 
     async def dedup_after_resolve(self, video: Video) -> Optional[dict]:
@@ -692,17 +1643,66 @@ class ResolverService:
             "thumbnail_url": video.thumbnail_url,
         }
 
-    async def resolve_video_for_tv(self, video_id: int) -> Optional[dict]:
+    def _tv_cache_result(self, video: Video) -> Optional[dict]:
+        """
+        Return the cached TV-path resolution for a video, or None on cache miss.
+
+        A valid TV cache requires BOTH a fresh resolved_at timestamp (checked
+        by _is_cache_valid — 20 min for HLS, 3 h for MP4) AND a non-NULL
+        resolved_audio_url. The audio column doubles as the "was this video
+        ever resolved via the TV path?" marker:
+          NULL  -> never TV-resolved (standard resolver only) -> cache miss
+          ""    -> TV-resolved as a combined stream (no separate audio)
+          "..." -> TV-resolved as split video + audio streams
+        """
+        if not self._is_cache_valid(video):
+            return None
+        if video.resolved_audio_url is None:
+            return None
+
+        kind = "split" if video.resolved_audio_url else "combined"
+        logger.info(
+            f"TV resolve cache hit ({kind}): video {video.id} "
+            f"'{(video.title or '')[:60]}'"
+        )
+        return {
+            "id": video.id,
+            "title": video.title,
+            "artist": video.artist,
+            "stream_url": video.resolved_stream_url,
+            "audio_url": video.resolved_audio_url or None,
+            "format": video.resolved_format,
+            "source_url": video.source_url,
+            "thumbnail_url": video.thumbnail_url,
+        }
+
+    async def resolve_video_for_tv(
+        self, video_id: int, allow_cookie_probe: bool = False, force: bool = False
+    ) -> Optional[dict]:
         """
         TV-specific resolution that returns both video_url and audio_url separately.
 
-        This allows the Android TV client to pass split stream URLs directly to
-        VLC (or another external player) which can merge them natively — giving
-        full quality (1080p/1440p/4K) without any server-side transcoding.
+        Caches both stream_url and audio_url in the DB so repeat plays are instant.
+        The cache TTL matches _is_cache_valid() — 20 minutes for HLS/adaptive URLs
+        (Vimeo signed tokens), 3 hours for progressive MP4 (YouTube).
 
-        Does NOT cache the result — TV URLs are fetched fresh each time since
-        we need both URLs and the DB only stores one stream_url. The TTL on
-        YouTube URLs is ~6 hours so repeated plays within that window are fast.
+        Concurrency: guarded by a per-video asyncio.Lock. When TiviMate fires
+        rapid retries at a slow video (or two concurrent playback requests
+        collide on the same video), only ONE yt-dlp extraction runs; every
+        other caller waits, then reads the freshly cached result — no
+        duplicate yt-dlp processes.
+
+        allow_cookie_probe: when True, bypass ONLY the stale-cookie skip guard
+        (never the rate-limit back-off, which is a real ban). Lets a single
+        deliberate YouTube extraction test whether refreshed cookies now
+        work — a success auto-clears the pause.
+
+        force: when True, bypass the TV URL cache and the legacy failed-status
+        skip and always run a fresh extraction. This is what makes
+        GET /resolve/{id}?force=true&client=tv actually force (previously the
+        flag was accepted by the endpoint but silently ignored on this path).
+        Force never bypasses the YouTube back-off or cookie-stale guards —
+        those protect against extending a real ban.
 
         Returns a dict with stream_url (video), audio_url (audio, may be None
         for combined streams), and the usual metadata fields.
@@ -715,74 +1715,104 @@ class ResolverService:
             logger.warning(f"TV resolve: Video ID {video_id} not found")
             return None
 
-        if video.resolution_status == "failed":
+        if video.resolution_status == "failed" and not force:
             logger.debug(f"TV resolve: skipping permanently failed video {video_id}")
             return None
 
-        # Only YouTube uses the split extractor (bestvideo+bestaudio → DASH manifest).
-        # Vimeo and Reddit serve combined streams and must use the standard resolver
-        # so their CDN URLs are proxied correctly through /proxy/stream.
-        is_youtube = (
-            "youtube.com" in (video.source_url or "") or
-            "youtu.be" in (video.source_url or "") or
-            video.source_provider == "youtube"
+        # Fast path: valid TV cache — return immediately, no lock, no yt-dlp.
+        # Skipped under force so a forced request always re-extracts.
+        if not force:
+            cached = self._tv_cache_result(video)
+            if cached is not None:
+                return cached
+
+        # Back-off guard: if YouTube has rate-limited us, don't make things worse
+        # by poking it again at play time. Return None (→ 502) and let the cache
+        # warm up once the cooldown expires, rather than extending the ban.
+        _cookie_stale_block = is_cookie_stale_paused() and not allow_cookie_probe
+        if _is_youtube_source(video.source_url) and (
+            is_youtube_backed_off() or _cookie_stale_block
+        ):
+            reason = "rate-limit back-off" if is_youtube_backed_off() else "stale-cookie pause"
+            logger.warning(
+                f"TV resolve: YouTube {reason} active — skipping extraction "
+                f"for video {video_id} '{(video.title or '')[:50]}'"
+            )
+            return None
+
+        # Cache miss — serialize extraction per video ID so concurrent
+        # requests (TiviMate retries, colliding playback requests) never
+        # spawn duplicate yt-dlp processes for the same video.
+        lock = _tv_resolve_locks.setdefault(video_id, asyncio.Lock())
+        async with lock:
+            # While we waited for the lock, another request may have finished
+            # resolving this exact video. Re-read the row and re-check the
+            # cache before doing any work of our own (double-checked locking).
+            try:
+                await self._db.refresh(video)
+            except Exception:
+                # Row vanished — a concurrent resolve found the video
+                # permanently gone and deleted it from the DB.
+                logger.warning(
+                    f"TV resolve: video {video_id} was deleted while waiting for lock"
+                )
+                return None
+
+            if video.resolution_status == "failed" and not force:
+                logger.debug(
+                    f"TV resolve: video {video_id} marked failed while waiting for lock"
+                )
+                return None
+
+            # Double-checked cache read — skipped under force so a forced
+            # request re-extracts even if a concurrent caller just resolved it.
+            if not force:
+                cached = self._tv_cache_result(video)
+                if cached is not None:
+                    return cached
+
+            return await self._tv_extract_and_cache(video)
+
+    async def _tv_extract_and_cache(self, video: Video) -> Optional[dict]:
+        """
+        Run the split (video + audio) yt-dlp extraction for a video and cache
+        both URLs in the DB. Callers MUST hold the per-video TV resolve lock —
+        this is only called from resolve_video_for_tv().
+        """
+        video_id = video.id
+
+        # Use the split extractor (bestvideo+bestaudio) for all providers —
+        # not just YouTube. Vimeo increasingly serves video-only and audio-only
+        # HLS streams with no combined rendition, so the standard single-URL
+        # resolver produces video-with-no-audio. Running the TV sync worker
+        # for all providers ensures we always get both URLs when they exist.
+        # The TV sync worker's TV_FORMAT_SELECTOR already handles fallback to
+        # combined streams when no split rendition exists, so this is safe for
+        # providers that do serve combined streams (we just get audio_url=None).
+        logger.info(
+            f"TV resolve: extracting split URLs for video {video_id} "
+            f"(provider={video.source_provider}) '{(video.title or '')[:60]}'"
         )
 
-        if not is_youtube:
-            logger.info(
-                f"TV resolve: non-YouTube source ({video.source_provider}) for video {video_id} "
-                f"— using standard resolver"
-            )
-            stream_info, error_msg, is_permanent = await self._extract_with_ytdlp(video.source_url)
-            if stream_info is None:
-                if is_permanent:
-                    logger.warning(f"TV resolve: video {video_id} permanently gone — {error_msg}")
-                    await self._delete_video(video)
-                    await self._db.commit()
-                else:
-                    logger.warning(f"TV resolve: transient error for video {video_id}: {error_msg}")
-                return None
-            # Non-YouTube resolve: check if yt-dlp returned a split stream
-            # (FORMAT_SELECTOR now falls back to bestvideo+bestaudio for Vimeo
-            # videos that have no combined format). If split, extract audio URL
-            # from requested_formats[1] so ExoPlayer gets both tracks.
-            import urllib.parse as _urlparse
+        # Vimeo needs HLS-preferring format selection so both URLs come back
+        # as m3u8 sub-playlists, compatible with the synthetic master manifest.
+        is_vimeo = (
+            "vimeo.com" in (video.source_url or "") or
+            video.source_provider == "vimeo"
+        )
 
-            stream_url = stream_info.stream_url
-            audio_url = stream_info.get("audio_url") if isinstance(stream_info, dict) else None
-
-            # Vimeo CDN URLs require Referer: https://vimeo.com/ — ExoPlayer
-            # on Android cannot inject this header, so route through backend proxy.
-            if _is_vimeo_cdn_url(stream_url):
-                proxy_base = f"http://localhost:{settings.app_port}/proxy/stream"
-                stream_url = f"{proxy_base}?url={_urlparse.quote(stream_url, safe='')}"
-                logger.info(f"TV resolve: Vimeo video stream wrapped through proxy for video {video_id}")
-            if audio_url and _is_vimeo_cdn_url(audio_url):
-                proxy_base = f"http://localhost:{settings.app_port}/proxy/stream"
-                audio_url = f"{proxy_base}?url={_urlparse.quote(audio_url, safe='')}"
-                logger.info(f"TV resolve: Vimeo audio stream wrapped through proxy for video {video_id}")
-
-            return {
-                "id": video.id,
-                "title": video.title,
-                "artist": video.artist,
-                "stream_url": stream_url,
-                "audio_url": audio_url,
-                "format": stream_info.format_note,
-                "source_url": video.source_url,
-                "thumbnail_url": video.thumbnail_url,
-            }
-
-        logger.info(f"TV resolve: YouTube — extracting split URLs for video {video_id} '{(video.title or '')[:60]}'")
-
+        import functools
         loop = asyncio.get_event_loop()
         try:
             result_dict, error_msg, is_permanent = await asyncio.wait_for(
                 loop.run_in_executor(
                     _process_pool,
-                    _extract_tv_sync_worker,
-                    video.source_url,
-                    self._cookies_path,
+                    functools.partial(
+                        _extract_tv_sync_worker,
+                        video.source_url,
+                        self._cookies_path_for(video.source_url),  # Session 68
+                        is_vimeo,  # prefer_hls
+                    ),
                 ),
                 timeout=float(YTDLP_TIMEOUT_SECONDS),
             )
@@ -793,11 +1823,34 @@ class ResolverService:
             logger.error(f"TV resolve: extraction error for video {video_id}: {e}")
             return None
 
+        _record_youtube_result(
+            video.source_url, None if result_dict is not None else error_msg
+        )
+        _record_vimeo_result(  # Session 68: Vimeo cookie-health tracking
+            video.source_url, None if result_dict is not None else error_msg
+        )
+
         if result_dict is None:
             if is_permanent:
                 logger.warning(f"TV resolve: video {video_id} permanently gone — {error_msg}")
                 await self._delete_video(video)
                 await self._db.commit()
+            elif _is_rate_limit_error(error_msg):
+                # Rate-limit: don't touch the video's status. Leave it for retry
+                # after the back-off expires. Back-off was already activated by
+                # _record_youtube_result above.
+                logger.warning(
+                    f"TV resolve: rate-limit error for video {video_id} — "
+                    f"leaving status unchanged for retry after back-off."
+                )
+            elif _is_cookie_stale_error(error_msg):
+                # Stale cookie: leave status unchanged for retry after refresh.
+                # The cookie-stale pause was already activated by
+                # _record_youtube_result above.
+                logger.warning(
+                    f"TV resolve: stale-cookie error for video {video_id} — "
+                    f"leaving status unchanged for retry after cookie refresh."
+                )
             else:
                 logger.warning(f"TV resolve: transient error for video {video_id}: {error_msg}")
             return None
@@ -805,14 +1858,46 @@ class ResolverService:
         audio_url = result_dict.get("audio_url")
         logger.info(
             f"TV resolve: video {video_id} | height={result_dict.get('height')} | "
-            f"split={'yes' if audio_url else 'no'}"
+            f"split={'yes' if audio_url else 'no'} | provider={video.source_provider}"
         )
+
+        stream_url = result_dict["stream_url"]
+
+        # Vimeo CDN URLs require Referer: https://vimeo.com/ — generic players
+        # like TiviMate cannot inject this header, so wrap through backend proxy.
+        # (YouTube CDN URLs are signed tokens that work without special headers.)
+        import urllib.parse as _urlparse
+        if _is_vimeo_cdn_url(stream_url):
+            proxy_base = f"http://localhost:{settings.app_port}/proxy/stream"
+            stream_url = f"{proxy_base}?url={_urlparse.quote(stream_url, safe='')}"
+            logger.info(f"TV resolve: Vimeo video stream wrapped through proxy for video {video_id}")
+        if audio_url and _is_vimeo_cdn_url(audio_url):
+            proxy_base = f"http://localhost:{settings.app_port}/proxy/stream"
+            audio_url = f"{proxy_base}?url={_urlparse.quote(audio_url, safe='')}"
+            logger.info(f"TV resolve: Vimeo audio stream wrapped through proxy for video {video_id}")
+
+        # Cache both URLs in the DB so repeat plays within the TTL window are instant.
+        # Use empty string "" as the sentinel for "resolved as combined stream" so we
+        # can distinguish it from NULL meaning "never resolved via TV path".
+        try:
+            video.resolved_stream_url = stream_url
+            video.resolved_audio_url = audio_url if audio_url is not None else ""
+            video.resolved_format = result_dict.get("format_note") or video.resolved_format
+            video.resolved_at = datetime.datetime.utcnow()
+            video.resolution_status = "resolved"
+            await self._db.commit()
+            logger.info(
+                f"TV resolve: cached split URLs for video {video_id} "
+                f"(audio={'yes' if audio_url else 'combined'})"
+            )
+        except Exception as e:
+            logger.warning(f"TV resolve: failed to cache URLs for video {video_id}: {e}")
 
         return {
             "id": video.id,
             "title": video.title,
             "artist": video.artist,
-            "stream_url": result_dict["stream_url"],
+            "stream_url": stream_url,
             "audio_url": audio_url,
             "format": result_dict.get("format_note"),
             "source_url": video.source_url,
@@ -827,133 +1912,241 @@ class ResolverService:
             await self._db.delete(fav)
         await self._db.delete(video)
 
-    async def resolve_batch(self, limit: int = 10) -> dict:
-        """Resolve a batch of pending videos."""
+    async def resolve_batch(
+        self,
+        limit: int = 10,
+        channel_ids: Optional[list] = None,
+        should_abort: Optional[Callable[[], bool]] = None,
+    ) -> dict:
+        """
+        Resolve a batch of PENDING videos via the standard resolver.
+
+        This is the ONE batch-resolve implementation — both the scheduler's
+        periodic pass and the web UI's "Resolve 25 Pending" button
+        (POST /resolve/batch) run through here, so every guard below applies
+        to both: the YouTube background-resolve switch, the rate-limit
+        back-off, the cookie-stale pause, and the consecutive-failure
+        circuit breaker. (The router endpoint previously carried its own
+        stale copy of this logic with none of those guards.)
+
+        channel_ids: optional list of channel IDs to restrict the batch to
+        (the web UI's per-channel scope). None = all channels.
+
+        should_abort: optional zero-arg callable checked before each video.
+        When it returns True the batch exits cleanly after the current video
+        (the web UI's Stop Resolving button). None = never abort.
+
+        Pending-only by design: the standard resolver earns its keep on new
+        videos (thumbnail/duration backfill, permanent-failure marking,
+        auto-dedup) but it only writes resolved_stream_url — it never touches
+        resolved_audio_url. Letting it also REFRESH already-resolved videos
+        (as it used to) overwrites the video URL while leaving a stale audio
+        URL behind: a mismatched pair the TV cache check would happily serve
+        to TiviMate. URL refreshes happen at play time via
+        resolve_video_for_tv(), which always writes both URLs together.
+        """
         stmt = (
             select(Video)
             .where(Video.resolution_status == "pending")
+        )
+
+        if channel_ids:
+            stmt = stmt.where(Video.channel_id.in_(channel_ids))
+
+        # When background YouTube resolve is OFF (the default), exclude
+        # YouTube from the query itself so the batch slots fill with
+        # Vimeo/local content. Without this, YouTube's ~12k pending videos
+        # (higher scores) fill all 200 slots and get skipped in the loop,
+        # leaving zero slots for Vimeo.
+        if not is_youtube_background_resolve_enabled():
+            stmt = stmt.where(
+                ~Video.source_url.contains("youtube.com"),
+                ~Video.source_url.contains("youtu.be"),
+            )
+
+        stmt = (
+            stmt
             .order_by(Video.reddit_score.desc().nullslast())
             .limit(limit)
         )
         result = await self._db.execute(stmt)
         videos = result.scalars().all()
 
-        expiry_cutoff = datetime.datetime.utcnow() - datetime.timedelta(hours=RESOLUTION_TTL_HOURS)
-        expired_stmt = (
-            select(Video)
-            .where(
-                Video.resolution_status == "resolved",
-                Video.resolved_at < expiry_cutoff,
-            )
-            .order_by(Video.reddit_score.desc().nullslast())
-            .limit(max(0, limit - len(videos)))
-        )
-        expired_result = await self._db.execute(expired_stmt)
-        expired_videos = expired_result.scalars().all()
+        all_videos = list(videos)
+        summary = {"total": len(all_videos), "resolved": 0, "failed": 0, "deleted": 0, "skipped_backoff": 0, "skipped_cookie_stale": 0, "skipped_vimeo_stale": 0, "skipped_youtube_bg": 0, "stopped_early": False, "stopped": False}
 
-        all_videos = list(videos) + list(expired_videos)
-        summary = {"total": len(all_videos), "resolved": 0, "failed": 0, "deleted": 0}
+        # Session 59 circuit breaker: consecutive transient failures within
+        # this batch. See BATCH_CONSECUTIVE_FAILURE_LIMIT for rationale.
+        consecutive_failures = 0
 
         for video in all_videos:
+            # User-requested stop (web UI Stop Resolving button): exit
+            # cleanly before starting the next video. Remaining videos stay
+            # pending and will be picked up on a later pass.
+            if should_abort is not None and should_abort():
+                summary["stopped"] = True
+                logger.info("Batch resolve: stop requested — exiting early.")
+                break
+
             video_id = video.id
+            is_yt = _is_youtube_source(video.source_url)
+
+            # Background YouTube resolve switch: when disabled (the default),
+            # skip YouTube videos entirely in this background pass — they stay
+            # pending and resolve on demand when actually played. Cookie-saver.
+            if is_yt and not is_youtube_background_resolve_enabled():
+                summary["skipped_youtube_bg"] += 1
+                continue
+
+            # During YouTube back-off, skip YouTube videos without touching their
+            # status — they stay pending and will be picked up after cooldown lifts.
+            if is_yt and is_youtube_backed_off():
+                summary["skipped_backoff"] += 1
+                continue
+
+            # During the cookie-stale pause, skip YouTube videos the same way —
+            # they stay pending (not failed) until cookies are refreshed.
+            if is_yt and is_cookie_stale_paused():
+                summary["skipped_cookie_stale"] += 1
+                continue
+
+            # During the VIMEO cookie-stale pause (Session 68), skip Vimeo
+            # videos identically — pending, not failed, no breaker trips —
+            # until a fresh cookie export succeeds (manual Resolve tests it).
+            if _is_vimeo_source(video.source_url) and is_vimeo_cookie_stale():
+                summary["skipped_vimeo_stale"] += 1
+                continue
+
             result = await self.resolve_video(video_id, force=True)
             if result is not None:
                 summary["resolved"] += 1
+                consecutive_failures = 0
             else:
                 check = await self._db.execute(select(Video).where(Video.id == video_id))
                 if check.scalar_one_or_none() is None:
+                    # Permanent-delete: the provider responded (it told us the
+                    # video is dead), so this does NOT count toward the breaker.
                     summary["deleted"] += 1
+                    consecutive_failures = 0
                 else:
                     summary["failed"] += 1
-            await asyncio.sleep(1.0)
+                    consecutive_failures += 1
+                    if consecutive_failures >= BATCH_CONSECUTIVE_FAILURE_LIMIT:
+                        summary["stopped_early"] = True
+                        logger.warning(
+                            f"Batch resolve: {consecutive_failures} consecutive "
+                            f"transient failures — provider appears blocked or "
+                            f"down. Stopping this batch early; remaining videos "
+                            f"stay pending and will be retried on the next tick."
+                        )
+                        break
+
+            # Polite inter-request delay. YouTube needs a longer pause to avoid
+            # re-triggering rate limits. Session 59: Vimeo/other sources moved
+            # from a fixed 1.0s to a randomized 5-10s — the old pace (~200 hits
+            # in ~3 minutes every tick) is a scraper signature and the likely
+            # trigger for the July 2026 Vimeo IP-block. A slow steady drip over
+            # the whole day is far safer than fast bursts.
+            import random
+            if is_yt:
+                await asyncio.sleep(random.uniform(6.0, 10.0))
+            else:
+                await asyncio.sleep(random.uniform(5.0, 10.0))
 
         logger.info(
             f"Batch resolve complete: {summary['resolved']} resolved, "
-            f"{summary['failed']} failed, {summary['deleted']} deleted "
+            f"{summary['failed']} failed, {summary['deleted']} deleted, "
+            f"{summary['skipped_backoff']} skipped (back-off), "
+            f"{summary['skipped_cookie_stale']} skipped (cookie-stale), "
+            f"{summary['skipped_vimeo_stale']} skipped (vimeo-cookie-stale), "
+            f"{summary['skipped_youtube_bg']} skipped (yt-bg-off) "
             f"out of {summary['total']}"
-        )
-        return summary
-
-    async def resolve_expired(self, limit: int = 100) -> dict:
-        """Re-resolve videos whose cached stream URLs have gone stale."""
-        expiry_cutoff = datetime.datetime.utcnow() - datetime.timedelta(hours=RESOLUTION_TTL_HOURS)
-        stmt = (
-            select(Video)
-            .where(
-                Video.resolution_status == "resolved",
-                Video.resolved_at < expiry_cutoff,
-            )
-            .order_by(Video.reddit_score.desc().nullslast())
-            .limit(limit)
-        )
-        result = await self._db.execute(stmt)
-        videos = result.scalars().all()
-
-        summary = {"total": len(videos), "resolved": 0, "failed": 0, "deleted": 0}
-
-        for video in videos:
-            video_id = video.id
-            result = await self.resolve_video(video_id, force=True)
-            if result is not None:
-                summary["resolved"] += 1
-            else:
-                check = await self._db.execute(select(Video).where(Video.id == video_id))
-                if check.scalar_one_or_none() is None:
-                    summary["deleted"] += 1
-                else:
-                    summary["failed"] += 1
-            await asyncio.sleep(1.0)
-
-        logger.info(
-            f"Expired resolve complete: {summary['resolved']} refreshed, "
-            f"{summary['failed']} failed, {summary['deleted']} deleted "
-            f"out of {summary['total']}"
+            + (" [STOPPED EARLY — provider appears blocked]" if summary["stopped_early"] else "")
+            + (" [STOPPED BY USER]" if summary["stopped"] else "")
         )
         return summary
 
     async def backfill_thumbnails(self, limit: int = 50, channel_ids: Optional[list] = None) -> dict:
-        """Metadata-only yt-dlp pass to fill missing thumbnails, optionally scoped to channels."""
+        """Metadata-only yt-dlp pass to fill missing thumbnails, optionally scoped to channels.
+
+        Excludes local_folder videos — yt-dlp cannot fetch thumbnails for local
+        file paths. Use /library/generate-thumbnails for local content instead.
+
+        Session 58 fixes:
+        - NULL-provider trap: a plain != 'local_folder' comparison silently
+          dropped rows where source_provider is NULL (SQL three-valued logic),
+          so older scraped videos with no provider stamp were never backfilled.
+          Now NULL-provider rows are explicitly included.
+        - Outcome-aware marking: only genuinely thumbnail-less or permanently
+          dead videos get the terminal 'unavailable' stamp. Transient failures
+          (rate limits, 403 blocks, timeouts) leave thumbnail_url NULL so the
+          video is retried on a later pass instead of being poisoned forever.
+        """
         from sqlalchemy import or_
 
         stmt = (
             select(Video)
-            .where(or_(Video.thumbnail_url.is_(None), Video.thumbnail_url == ""))
-            .order_by(Video.id.asc())
-            .limit(limit)
+            .where(
+                or_(Video.thumbnail_url.is_(None), Video.thumbnail_url == ""),
+                or_(
+                    Video.source_provider.is_(None),
+                    Video.source_provider != "local_folder",
+                ),
+            )
         )
         if channel_ids:
-            stmt = (
-                select(Video)
-                .where(
-                    or_(Video.thumbnail_url.is_(None), Video.thumbnail_url == ""),
-                    Video.channel_id.in_(channel_ids),
-                )
-                .order_by(Video.id.asc())
-                .limit(limit)
+            stmt = stmt.where(Video.channel_id.in_(channel_ids))
+
+        # Session 65: honor the YouTube on-demand policy here too. Each
+        # backfill is a yt-dlp metadata call made with the YouTube cookie, so
+        # with the background switch OFF (the default) YouTube videos are
+        # excluded at the SQL level — same pattern as resolve_batch. YouTube
+        # thumbnails arrive when the video is resolved on demand at play
+        # time, or when the switch is deliberately enabled.
+        if not is_youtube_background_resolve_enabled():
+            stmt = stmt.where(
+                ~Video.source_url.contains("youtube.com"),
+                ~Video.source_url.contains("youtu.be"),
             )
+
+        stmt = stmt.order_by(Video.id.asc()).limit(limit)
         result = await self._db.execute(stmt)
         videos = result.scalars().all()
 
-        summary = {"total": len(videos), "filled": 0, "skipped": 0, "failed": 0}
+        summary = {"total": len(videos), "filled": 0, "skipped": 0, "failed": 0, "deferred": 0}
 
         loop = asyncio.get_event_loop()
         for video in videos:
             try:
-                thumbnail_url = await asyncio.wait_for(
+                thumbnail_url, outcome = await asyncio.wait_for(
                     loop.run_in_executor(
                         _process_pool,
                         _fetch_thumbnail_sync_worker,
                         video.source_url,
-                        self._cookies_path,
+                        self._cookies_path_for(video.source_url),  # Session 68
                     ),
                     timeout=60.0,
                 )
-                if thumbnail_url:
+                if outcome == "ok" and thumbnail_url:
                     video.thumbnail_url = thumbnail_url
                     summary["filled"] += 1
                     logger.info(f"Backfill thumbnail: video {video.id} -> {thumbnail_url[:80]}")
-                else:
+                elif outcome in ("no_thumb", "permanent"):
+                    # Terminal: the video has no thumbnail or is dead. Mark it
+                    # so it doesn't clog the queue on the next run. The catalog
+                    # treats this the same as no thumbnail.
+                    video.thumbnail_url = "unavailable"
                     summary["skipped"] += 1
+                    logger.info(
+                        f"Backfill thumbnail: video {video.id} marked unavailable ({outcome})"
+                    )
+                else:
+                    # Transient (rate limit / network / block): leave NULL so a
+                    # later pass retries. Do NOT stamp 'unavailable'.
+                    summary["deferred"] += 1
+                    logger.info(
+                        f"Backfill thumbnail: video {video.id} deferred (transient error)"
+                    )
             except asyncio.TimeoutError:
                 summary["failed"] += 1
                 logger.warning(f"Backfill thumbnail: timed out for video {video.id}")
@@ -967,8 +2160,8 @@ class ResolverService:
         scope = f"channels {channel_ids}" if channel_ids else "all channels"
         logger.info(
             f"Thumbnail backfill complete ({scope}): {summary['filled']} filled, "
-            f"{summary['skipped']} skipped, {summary['failed']} failed "
-            f"out of {summary['total']}"
+            f"{summary['skipped']} skipped, {summary['deferred']} deferred, "
+            f"{summary['failed']} failed out of {summary['total']}"
         )
         return summary
 
@@ -1014,12 +2207,30 @@ class ResolverService:
                 Video.resolution_status == "resolved",
                 Video.resolved_format.isnot(None),
             )
+        )
+        if channel_ids:
+            stmt = stmt.where(Video.channel_id.in_(channel_ids))
+
+        # Session 65: honor the YouTube on-demand policy. When the background
+        # YouTube resolve switch is OFF (the default), exclude YouTube from
+        # the quality-upgrade query entirely — same SQL-level exclusion as
+        # resolve_batch. Before this guard, this job re-ran yt-dlp on ~25
+        # (mostly YouTube) videos every 6 hours regardless of the switch,
+        # back-off, or cookie-stale pause: the primary cookie-burner found in
+        # the Session 65 log audit. Low-res YouTube videos simply keep their
+        # current quality until the switch is deliberately enabled.
+        if not is_youtube_background_resolve_enabled():
+            stmt = stmt.where(
+                ~Video.source_url.contains("youtube.com"),
+                ~Video.source_url.contains("youtu.be"),
+            )
+
+        stmt = (
+            stmt
             .order_by(Video.reddit_score.desc().nullslast())
             .offset(chunk_offset)
             .limit(chunk_size * 4)  # over-fetch so we have enough after height filter
         )
-        if channel_ids:
-            stmt = stmt.where(Video.channel_id.in_(channel_ids))
         result = await self._db.execute(stmt)
         candidates = result.scalars().all()
 
@@ -1035,9 +2246,20 @@ class ResolverService:
             "same_or_lower": 0,
             "errored": 0,
             "skipped_permanent": 0,
+            "skipped_paused": 0,
         }
 
         for video in low_quality:
+            # Session 65: even when the background switch is ON, respect the
+            # rate-limit back-off and cookie-stale pauses — the same guards
+            # resolve_batch applies. Hammering yt-dlp while the cookie is
+            # already bot-flagged is exactly what gets a session burned.
+            if _is_youtube_source(video.source_url) and (
+                is_youtube_backed_off() or is_cookie_stale_paused()
+            ):
+                summary["skipped_paused"] += 1
+                continue
+
             old_height = _parse_height(video.resolved_format)
             try:
                 logger.info(
@@ -1092,7 +2314,8 @@ class ResolverService:
         logger.info(
             f"Quality upgrade complete: {summary['upgraded']} upgraded, "
             f"{summary['same_or_lower']} unchanged, {summary['errored']} errored, "
-            f"{summary['skipped_permanent']} permanent-gone "
+            f"{summary['skipped_permanent']} permanent-gone, "
+            f"{summary['skipped_paused']} skipped-paused "
             f"out of {summary['checked']} checked"
         )
         return summary
@@ -1117,23 +2340,6 @@ class ResolverService:
         logger.info(f"Purged {count} DASH-only videos from database ({scope})")
         return count
 
-    async def purge_dead_videos(self, channel_ids: Optional[list] = None) -> int:
-        """Delete all videos currently marked as failed, optionally scoped to channels."""
-        stmt = select(Video).where(Video.resolution_status == "failed")
-        if channel_ids:
-            stmt = stmt.where(Video.channel_id.in_(channel_ids))
-        result = await self._db.execute(stmt)
-        dead_videos = result.scalars().all()
-
-        count = len(dead_videos)
-        for video in dead_videos:
-            await self._delete_video(video)
-
-        await self._db.commit()
-        scope = f"channels {channel_ids}" if channel_ids else "all channels"
-        logger.info(f"Purged {count} dead videos from database ({scope})")
-        return count
-
     async def _extract_with_ytdlp(
         self, url: str
     ) -> Tuple[Optional[StreamInfo], Optional[str], bool]:
@@ -1153,7 +2359,7 @@ class ResolverService:
                     _process_pool,
                     _extract_sync_worker,
                     url,
-                    self._cookies_path,
+                    self._cookies_path_for(url),  # Session 68
                 ),
                 timeout=float(YTDLP_TIMEOUT_SECONDS),
             )

@@ -8,12 +8,38 @@ This is the brain of the discovery pipeline. It:
 4. Inserts new discoveries into the videos table with status "pending".
 
 For Reddit sources specifically, the scraper checks whether each discovered
-video can be played directly (v.redd.it native video, YouTube links, Vimeo
-links). If it CAN be played directly it goes into the feed as normal.
-If it CANNOT (e.g. Redgifs or other hostile CDNs), it is auto-downloaded
-via yt-dlp directly into /Music Videos/Reddit/<subreddit_name>/ and stored
-as a Library file only — it never appears in the feed. This sidesteps CDN
+video can be played directly (v.redd.it native video via its reddit.com
+post permalink, YouTube links, Vimeo links). If it CAN be played directly
+it goes into the feed as normal. If it CANNOT (e.g. Redgifs or other
+hostile CDNs), it is auto-downloaded via yt-dlp into the Library downloads
+tree — Private/Reddit/<subreddit_name>/ for locked channels,
+Public/Reddit/<subreddit_name>/ for unlocked ones — and stored as a
+Library file only. It never appears in the feed. This sidesteps CDN
 Referer/auth issues permanently for non-playable Reddit sources.
+
+Session 60 fixes (first run with real Reddit data):
+- _get_reddit_download_dir referenced settings.music_videos_path, which
+  was renamed to downloads_path pre-Milestone D — every auto-download
+  was skipped with "no download dir available". Now lock-aware:
+  locked channel → private_downloads_path, unlocked → public_downloads_path.
+- reddit.com added to REDDIT_DIRECTLY_PLAYABLE_DOMAINS: the provider
+  stores v.redd.it posts as reddit.com post permalinks (so yt-dlp gets
+  muxed audio+video), which were being misrouted to the (broken)
+  auto-download path instead of the feed.
+- Domain normalizer used str.lstrip("www."), which strips a character
+  SET, not a prefix — replaced with str.removeprefix("www.").
+
+Session 70 addition — placeholder-title ingest filter:
+  yt-dlp's flat-playlist listing returns dead YouTube entries as real rows
+  with a synthetic title: "[Private video]" / "[Deleted video]". Before this
+  change they were ingested as ordinary pending videos — 250 of them had
+  accumulated in the DB. They can never resolve, and each play attempt burns
+  a full YouTube extraction (and cookie credit) for a guaranteed failure.
+  They are now dropped at ingest and counted in ScrapeResult.placeholders.
+
+  Deliberately a DROP, not a skip-list entry: if a video goes public again
+  its title reverts to the real one and it is ingested normally on the next
+  scrape. Nothing to un-skip by hand. Self-healing.
 
 The orchestrator doesn't care which provider it's talking to — it works
 with any BaseProvider implementation through the standard interface.
@@ -59,7 +85,12 @@ logger = logging.getLogger(__name__)
 # Domains that can be played directly through the feed without downloading.
 # Anything NOT in this set from a Reddit source will be auto-downloaded.
 REDDIT_DIRECTLY_PLAYABLE_DOMAINS = {
-    # Native Reddit video — already works perfectly via v.redd.it
+    # Native Reddit video — the provider stores these as reddit.com post
+    # permalinks (NOT v.redd.it URLs) so yt-dlp extracts the full muxed
+    # stream from the post page. v.redd.it kept for direct-link posts.
+    "reddit.com",
+    "www.reddit.com",
+    "old.reddit.com",
     "v.redd.it",
     # YouTube — resolved via yt-dlp + DASH manifest, works great
     "youtube.com",
@@ -74,6 +105,44 @@ REDDIT_DIRECTLY_PLAYABLE_DOMAINS = {
 # Per-subreddit cap on auto-downloaded files.
 # When a subreddit folder hits this count, new downloads are skipped.
 REDDIT_DOWNLOAD_CAP_PER_SUB = 500
+
+
+# ---------------------------------------------------------------------------
+# Placeholder-title filter (Session 70)
+# ---------------------------------------------------------------------------
+
+# Synthetic titles yt-dlp emits for playlist entries that no longer have any
+# content behind them. These are not real videos: no thumbnail, no duration,
+# nothing to resolve, nothing to recover.
+#
+# Matching is EXACT (after strip + lowercase) — never a substring test. A
+# substring match on "private" or "deleted" would eat legitimate titles like
+# "Private Dancer" or "Deleted Scenes". Session 67's lesson applies: the
+# conservative classifier is the correct one.
+#
+# Applied to ALL providers, not just YouTube. The titles only originate from
+# YouTube flat-playlist listings, but no genuine Vimeo or Reddit item is
+# titled exactly "[private video]", so a global check costs nothing and
+# avoids a provider-specific branch. Worst realistic case is one oddly-named
+# Reddit post being skipped.
+PLACEHOLDER_TITLES = frozenset({
+    "[private video]",
+    "[deleted video]",
+    "[unavailable video]",
+})
+
+
+def _is_placeholder_title(title: Optional[str]) -> bool:
+    """
+    Return True if this title is a yt-dlp dead-entry placeholder.
+
+    Exact match only, case- and whitespace-insensitive. Returns False for
+    None/empty titles — an untitled video is a metadata problem, not a
+    confirmed-dead one, and is not this filter's business.
+    """
+    if not title:
+        return False
+    return title.strip().lower() in PLACEHOLDER_TITLES
 
 
 def _extract_vimeo_numeric_id(source_post_id: str) -> Optional[str]:
@@ -93,17 +162,19 @@ def _extract_vimeo_numeric_id(source_post_id: str) -> Optional[str]:
 def _reddit_url_is_directly_playable(source_url: str) -> bool:
     """
     Return True if a Reddit post URL points to a domain we can resolve
-    and play directly in the feed (YouTube, Vimeo, v.redd.it).
+    and play directly in the feed (YouTube, Vimeo, Reddit-hosted video).
 
     Return False for everything else (Redgifs, Streamable, direct .mp4
     on hostile CDNs, etc.) — those will be auto-downloaded instead.
     """
     try:
         parsed = urlparse(source_url)
-        domain = parsed.netloc.lower().lstrip("www.")
+        # removeprefix, NOT lstrip: lstrip("www.") strips any leading
+        # run of the characters {w, .}, not the literal prefix "www."
+        domain = parsed.netloc.lower().removeprefix("www.")
         # Check against our known-playable set (strip www. for comparison)
         for playable in REDDIT_DIRECTLY_PLAYABLE_DOMAINS:
-            if domain == playable.lstrip("www.") or domain == playable:
+            if domain == playable.removeprefix("www.") or domain == playable:
                 return True
         return False
     except Exception:
@@ -148,11 +219,13 @@ class ScrapeResult:
         self.errors: int = 0          # Failed to insert
         self.downloaded: int = 0      # Auto-downloaded to Library (Reddit non-playable)
         self.download_skipped: int = 0  # Skipped download (cap hit or already exists)
+        self.placeholders: int = 0    # Dead yt-dlp placeholder entries dropped (Session 70)
 
     def __repr__(self) -> str:
         return (
             f"<ScrapeResult discovered={self.discovered} new={self.new} "
             f"dupes={self.duplicates} skipped={self.skipped} "
+            f"placeholders={self.placeholders} "
             f"downloaded={self.downloaded} errors={self.errors}>"
         )
 
@@ -165,6 +238,7 @@ class ScrapeResult:
             "errors": self.errors,
             "downloaded": self.downloaded,
             "download_skipped": self.download_skipped,
+            "placeholders": self.placeholders,
         }
 
 
@@ -186,8 +260,8 @@ class ScraperService:
         Execute a full scrape cycle for the given provider.
 
         For Reddit sources:
-        - Directly playable URLs (YouTube, Vimeo, v.redd.it) → inserted as
-          feed entries with status "pending" as normal.
+        - Directly playable URLs (YouTube, Vimeo, Reddit-hosted video)
+          → inserted as feed entries with status "pending" as normal.
         - Non-playable URLs (Redgifs etc.) → auto-downloaded to Library,
           never inserted into the feed.
 
@@ -246,6 +320,24 @@ class ScraperService:
 
         # Step 4: Filter and insert / download
         for video in discovered:
+            # Placeholder check (Session 70) — FIRST, ahead of everything else.
+            #
+            # Position is deliberate on three counts:
+            #  1. Cheapest test in the loop (string compare; the skip-list
+            #     check below computes an HMAC).
+            #  2. Guarantees a dead entry can never reach the Reddit
+            #     auto-download branch and spawn a doomed yt-dlp job.
+            #  3. Counts every placeholder the provider handed us, including
+            #     ones already sitting in the DB — so the number stays visible
+            #     until the one-time cleanup has run.
+            if _is_placeholder_title(video.title):
+                logger.debug(
+                    f"Placeholder entry dropped at ingest: "
+                    f"{video.source_post_id} title={video.title!r}"
+                )
+                result.placeholders += 1
+                continue
+
             # Dedup check — scoped to this channel
             if video.source_post_id in existing_ids:
                 result.duplicates += 1
@@ -321,12 +413,20 @@ class ScraperService:
             result.errors += result.new
             result.new = 0
 
+        if result.placeholders:
+            logger.info(
+                f"Scrape: dropped {result.placeholders} dead placeholder "
+                f"entries ([Private video] / [Deleted video]) before ingest"
+            )
+
         logger.info(f"Scrape complete: {result}")
         return result
 
     async def _get_reddit_download_dir(self, channel_id: int) -> Optional[str]:
         """
-        Build the /Music Videos/Reddit/<subreddit_name>/ path for this channel.
+        Build the Library download path for this Reddit channel:
+          locked channel   → {private_downloads_path}/Reddit/<subreddit_name>/
+          unlocked channel → {public_downloads_path}/Reddit/<subreddit_name>/
         Creates the directory if it doesn't exist.
         Returns None on failure.
         """
@@ -345,7 +445,13 @@ class ScraperService:
                 sub_name = match.group(1)
 
             safe_sub = _sanitize_folder_name(sub_name)
-            base_dir = settings.music_videos_path
+            # Lock-aware base: locked sources live in the PIN-protected
+            # Private tree, unlocked ones in Public — same rule as every
+            # other Library download.
+            if getattr(channel, "locked", False):
+                base_dir = settings.private_downloads_path
+            else:
+                base_dir = settings.public_downloads_path
             download_dir = os.path.join(base_dir, "Reddit", safe_sub)
 
             os.makedirs(download_dir, exist_ok=True)
@@ -371,6 +477,8 @@ class ScraperService:
         2. Insert a Video + Favorite DB record (download_status="downloading").
         3. Run yt-dlp download in a thread.
         4. Update Favorite with result (complete/failed) and local_file_path.
+        5. On success, generate the sidecar thumbnail (Session 62) —
+           off-thread, non-fatal on failure.
 
         Returns True if a download was attempted (success or fail),
         False if skipped (cap hit, no dir, already exists).
@@ -456,6 +564,7 @@ class ScraperService:
         )
 
         # Refresh records after thread completes
+        downloaded_path = None  # Session 62: captured for thumbnail generation
         async with self._db.begin_nested():
             fav_stmt = select(Favorite).where(Favorite.id == favorite.id)
             fav_result = await self._db.execute(fav_stmt)
@@ -468,6 +577,7 @@ class ScraperService:
                     fav.local_file_path = actual_path or output_path
                     fav.downloaded_at = datetime.datetime.utcnow()
                     fav.download_error = None
+                    downloaded_path = fav.local_file_path
                     logger.info(
                         f"Reddit auto-download: COMPLETE — "
                         f"video_id={db_video.id} path={fav.local_file_path}"
@@ -483,6 +593,34 @@ class ScraperService:
                     result.errors += 1
 
         await self._db.commit()
+
+        # ------------------------------------------------------------------
+        # Session 62: generate the sidecar thumbnail immediately after a
+        # successful download, so new Reddit files land in the Files on Disk
+        # view with a preview already made. Runs off-thread (same as the
+        # download itself) so scraping never blocks. Non-fatal: on failure we
+        # log and move on — the Generate Thumbnails button's folder-walk pass
+        # (Session 62, library.py) picks up any stragglers.
+        # ------------------------------------------------------------------
+        if success and downloaded_path and os.path.isfile(downloaded_path):
+            from app.routers.library import _generate_thumb_sync, _thumb_path_for
+            thumb_path = _thumb_path_for(downloaded_path)
+            if not os.path.isfile(thumb_path):
+                thumb_ok = await asyncio.to_thread(
+                    _generate_thumb_sync, downloaded_path, thumb_path
+                )
+                if thumb_ok:
+                    logger.info(
+                        f"Reddit auto-download: sidecar thumbnail generated "
+                        f"for video_id={db_video.id}"
+                    )
+                else:
+                    logger.warning(
+                        f"Reddit auto-download: thumbnail generation failed "
+                        f"for video_id={db_video.id} — the Generate Thumbnails "
+                        f"folder-walk pass will retry it"
+                    )
+
         return True
 
     async def _get_existing_post_ids(

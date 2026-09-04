@@ -9,6 +9,7 @@ Endpoints:
 - PATCH  /channel/{id}/lock          — Toggle locked/unlocked (PIN gate).
 - PATCH  /channel/{id}/category      — Set channel category.
 - PATCH  /channel/{id}/genre_tags    — Set genre tags (Milestone R-1).
+- PATCH  /channel/{id}/name          — Rename channel display name (Session 64).
 - POST   /channel/{id}/scrape        — Scrape a single channel on demand.
 - DELETE /channel/{id}/videos        — Clear all videos from a channel.
 
@@ -28,7 +29,7 @@ from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Header, Response
 from pydantic import BaseModel, Field
-from sqlalchemy import select, func, delete
+from sqlalchemy import select, func, delete, and_, not_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db_session
@@ -52,6 +53,22 @@ _active_downloads: dict = {}
 # Lets the web UI show "Last run: X downloaded, Y skipped, Z failed" plus the
 # per-item results after the active entry has been cleaned up.
 _last_download_results: dict = {}
+
+# ---------------------------------------------------------------------------
+# Shuffle queue — Session 71
+#
+# In-memory dict keyed by channel_id. Each value is a list of video IDs
+# shuffled randomly. The /channel/{id}/shuffle endpoint pops the next ID
+# off the list and 302-redirects to /channel/stream/{video_id}. When the
+# list runs dry it reloads from the DB and reshuffles — full rotation
+# before any repeats. Resets on container restart (no persistence needed).
+#
+# Purpose: give each WatchDawg source a single URL that behaves like a
+# shuffled TV channel. Paste http://192.168.50.42:6868/channel/{id}/shuffle
+# into NostalgiaTV or SurfTV as a custom live channel — each request gets
+# a different video.
+# ---------------------------------------------------------------------------
+_shuffle_queues: dict[int, list[int]] = {}
 
 
 # --- Request/Response Models ---
@@ -82,6 +99,19 @@ class ChannelGenreTagsRequest(BaseModel):
             "Comma-separated free-form genre tags. "
             "Example: 'Nature,Documentary'  "
             "Empty string clears all tags."
+        )
+    )
+
+
+class ChannelRenameRequest(BaseModel):
+    name: str = Field(
+        ...,
+        description=(
+            "New display name for the channel (1-200 chars after trim). "
+            "Cosmetic only — url, unique_key, and channel_type are never "
+            "touched, so scraping and dedup are unaffected. Useful for "
+            "prefixes like 'YOUTUBE — ...' so TiviMate shows which sources "
+            "resolve live on play. (Session 64)"
         )
     )
 
@@ -329,8 +359,11 @@ class LocalFolderProvider:
 
     async def fetch_posts(self, limit: int = 5000):
         """
-        Walk the folder and return one DiscoveredVideo per video file.
-        Sorted alphabetically. Capped at limit.
+        Recursively walk the folder and return one DiscoveredVideo per video
+        file, including files in subfolders (Session 58 — the old scan used
+        os.scandir and only saw the top level, leaving subfolder files
+        invisible to the catalog). Skips .temp partial downloads and sidecar
+        thumbnails. Sorted alphabetically by relative path. Capped at limit.
         """
         from app.providers.base import DiscoveredVideo
         import os
@@ -342,30 +375,39 @@ class LocalFolderProvider:
             )
             return discovered
 
+        all_files = []
         try:
-            entries = sorted(os.scandir(self.folder_path), key=lambda e: e.name.lower())
+            for dirpath, _dirnames, filenames in os.walk(self.folder_path):
+                for filename in filenames:
+                    # Skip yt-dlp partial downloads like "11508.temp.mp4"
+                    if ".temp" in filename.lower():
+                        continue
+                    # Skip sidecar thumbnails ("<video>.watchdawg_thumb.jpg")
+                    if filename.endswith(".watchdawg_thumb.jpg"):
+                        continue
+                    _, ext = os.path.splitext(filename)
+                    if ext.lower() not in _LOCAL_VIDEO_EXTS:
+                        continue
+                    all_files.append(os.path.join(dirpath, filename))
         except OSError as e:
             logger.error(f"LocalFolderProvider: cannot scan {self.folder_path}: {e}")
             return discovered
 
+        all_files.sort(key=lambda p: p.lower())
+
         from app.config import settings as _cfg
         watchdawg_root = _cfg.downloads_path.rstrip("/")
 
-        for entry in entries:
-            if not entry.is_file():
-                continue
-            _, ext = os.path.splitext(entry.name)
-            if ext.lower() not in _LOCAL_VIDEO_EXTS:
-                continue
-
-            abs_path = entry.path
+        for abs_path in all_files:
+            entry_name = os.path.basename(abs_path)
             # Relative path from /watchdawg/ root — used as stream path and dedup key
+
             if abs_path.startswith(watchdawg_root + "/"):
                 rel_path = abs_path[len(watchdawg_root) + 1:]
             else:
                 rel_path = abs_path
 
-            title = os.path.splitext(entry.name)[0]
+            title = os.path.splitext(entry_name)[0]
             # Build the stream URL — served by /library/stream/
             base_url = "http://192.168.50.42:6868"
             import urllib.parse
@@ -412,6 +454,7 @@ async def _scrape_local_folder_channel(
 
     Returns a dict matching ScrapeResult.to_dict() format.
     """
+    import os
     from app.models import Video
     from sqlalchemy import select as _select
 
@@ -438,13 +481,26 @@ async def _scrape_local_folder_channel(
             dupe_count += 1
             continue
 
+        # Session 58: if a sidecar thumbnail already exists on disk for this
+        # file, link it immediately so the catalog shows it without waiting
+        # for a thumbnail generation pass.
+        thumbnail_url = dv.thumbnail_url
+        _sidecar = dv.source_url + ".watchdawg_thumb.jpg"
+        if os.path.isfile(_sidecar):
+            from app.config import settings as _cfg2
+            import urllib.parse as _up
+            _root = _cfg2.downloads_path.rstrip("/")
+            if _sidecar.startswith(_root + "/"):
+                _rel = _sidecar[len(_root) + 1:]
+                thumbnail_url = f"/library/thumb/{_up.quote(_rel, safe='/')}"
+
         db_video = Video(
             source_provider="local_folder",
             source_post_id=dv.source_post_id,
             source_url=dv.source_url,
             title=dv.title,
             artist=dv.artist,
-            thumbnail_url=dv.thumbnail_url,
+            thumbnail_url=thumbnail_url,
             duration_seconds=dv.duration_seconds,
             reddit_score=0,
             resolution_status="resolved",
@@ -767,6 +823,46 @@ async def set_channel_genre_tags(
         "channel_id": channel_id,
         "name": channel.name,
         "genre_tags": channel.genre_tags,
+    }
+
+
+@router.patch("/{channel_id}/name")
+async def rename_channel(
+    channel_id: int,
+    request: ChannelRenameRequest,
+    db: AsyncSession = Depends(get_db_session),
+):
+    """
+    Rename a channel (display name only). (Session 64)
+
+    Touches Channel.name and nothing else — url, unique_key, and
+    channel_type are preserved, so scraping and dedup behave identically.
+    TiviMate picks the new name up on its next playlist refresh (Xtream
+    category names are read live from the DB).
+    """
+    new_name = (request.name or "").strip()
+    if not new_name:
+        raise HTTPException(status_code=400, detail="Name cannot be empty.")
+    if len(new_name) > 200:
+        raise HTTPException(status_code=400, detail="Name too long (max 200 characters).")
+
+    stmt = select(Channel).where(Channel.id == channel_id)
+    result = await db.execute(stmt)
+    channel = result.scalar_one_or_none()
+
+    if channel is None:
+        raise HTTPException(status_code=404, detail="Channel not found")
+
+    old_name = channel.name
+    channel.name = new_name
+    await db.commit()
+
+    logger.info(f"Channel renamed: '{old_name}' -> '{new_name}'")
+    return {
+        "status": "renamed",
+        "channel_id": channel_id,
+        "old_name": old_name,
+        "name": channel.name,
     }
 
 
@@ -1319,11 +1415,29 @@ def _m3u_group_for_channel(channel) -> str:
 
 
 def _is_hls_stream(url: str) -> bool:
-    """Return True if the URL points to an HLS manifest."""
+    """
+    Return True if the URL points to an HLS manifest.
+
+    Handles both direct CDN URLs (path ends in .m3u8) and proxy-wrapped URLs
+    where the real CDN URL is URL-encoded inside the ?url= query parameter
+    (e.g. http://host/proxy/stream?url=https%3A%2F%2F...media.m3u8%3F...).
+    """
     if not url:
         return False
     path = url.split("?")[0].lower()
-    return path.endswith(".m3u8") or "m3u8" in path
+    if path.endswith(".m3u8") or "m3u8" in path:
+        return True
+    # Proxy-wrapped URL: the CDN URL lives URL-encoded in the query string.
+    # Decode once and check the inner URL's path the same way.
+    if "/proxy/stream" in path and "?" in url:
+        import urllib.parse as _up
+        query = url.split("?", 1)[1]
+        params = _up.parse_qs(query)
+        inner = (params.get("url") or [""])[0]
+        if inner:
+            inner_path = inner.split("?")[0].lower()
+            return inner_path.endswith(".m3u8") or "m3u8" in inner_path
+    return False
 
 
 @router.get("/all/live.m3u", response_class=Response)
@@ -1379,6 +1493,675 @@ async def export_all_channels_live_m3u(
     )
 
 
+# ---------------------------------------------------------------------------
+# Public / Private split M3U exports — Session 55
+#
+# Two additional playlists that split the catalog by the channel-level `locked`
+# flag, so the public (unlocked) and private (PIN-locked) content can be added
+# to TiviMate (or OwnTV) as separate playlists instead of the all-in-one
+# /channel/all/live.m3u.
+#
+#   Public  → channels where enabled AND NOT locked
+#   Private → channels where enabled AND locked
+#
+# Strict split: a channel appears in exactly one of the two playlists, never
+# both. The original /all/live.m3u is left untouched and still serves
+# everything.
+#
+# These two serve every video that isn't permanently failed — the same
+# filter as the Xtream catalog (aligned in Session 61) — with ONE exception:
+#   resolution_status != "failed"  AND NOT (pending vimeo.com)
+# Pending videos are included on purpose: YouTube background resolving is
+# OFF by design (Session 56, cookie protection), so scraped YouTube videos
+# live permanently at "pending" and resolve on demand at play time via
+# /channel/stream (remux-on-play, Session 57). Hiding pending would make
+# YouTube content unreachable. Anything already on disk (downloaded /
+# bulk-downloaded / local folder) is served disk-first at play time.
+# Pending VIMEO is the exception (Session 61): Vimeo background-resolves
+# on the normal schedule, so its pendings wait for the background resolver
+# — dead links get auto-deleted quietly instead of erroring in TiviMate,
+# and each video appears here automatically the moment it resolves (these
+# playlists are live queries). Keyed on URL, not provider, so Reddit posts
+# linking to Vimeo are covered too.
+#
+# ROUTE ORDER: these literal paths must stay ABOVE /{channel_id}/live.m3u so
+# FastAPI matches "public"/"private" as literals, not as an int channel_id.
+# ---------------------------------------------------------------------------
+
+@router.get("/public/live.m3u", response_class=Response)
+async def export_public_channels_live_m3u(
+    db: AsyncSession = Depends(get_db_session),
+):
+    """
+    Export all playable videos from enabled, UNLOCKED channels as one combined
+    live M3U playlist (the public stream). group-title driven by genre_tags or
+    category. Every non-failed video is served except pending Vimeo (which
+    waits for the background resolver — Session 61); other pending videos
+    resolve on demand at play time. Videos shuffled randomly in Python on
+    every fetch.
+    Add http://192.168.50.42:6868/channel/public/live.m3u to TiviMate.
+    """
+    base_url = "http://192.168.50.42:6868"
+
+    ch_stmt = (
+        select(Channel)
+        .where(Channel.enabled == True, Channel.locked == False)
+        .order_by(Channel.name)
+    )
+    ch_result = await db.execute(ch_stmt)
+    channels = ch_result.scalars().all()
+
+    lines = ["#EXTM3U"]
+    for channel in channels:
+        group = _m3u_group_for_channel(channel)
+
+        video_stmt = (
+            select(Video)
+            .where(
+                Video.channel_id == channel.id,
+                Video.source_url.isnot(None),
+                Video.source_url != "",
+                Video.resolution_status != "failed",
+                not_(
+                    and_(
+                        Video.resolution_status == "pending",
+                        Video.source_url.contains("vimeo.com"),
+                    )
+                ),
+            )
+            .order_by(Video.created_at.desc())
+        )
+        video_result = await db.execute(video_stmt)
+        videos = list(video_result.scalars().all())
+        random.shuffle(videos)
+
+        for v in videos:
+            duration = v.duration_seconds or -1
+            title = (v.title or "Untitled").replace(",", " ")
+            logo = v.thumbnail_url or ""
+            stream_url = f"{base_url}/channel/stream/{v.id}"
+            lines.append(
+                f'#EXTINF:{duration} tvg-name="{title}" tvg-logo="{logo}" '
+                f'group-title="{group}",{title}'
+            )
+            lines.append(stream_url)
+
+    content_str = "\n".join(lines)
+    return Response(
+        content=content_str,
+        media_type="application/x-mpegurl",
+        headers={"Content-Disposition": 'inline; filename="watchdawg_public.m3u"'},
+    )
+
+
+@router.get("/private/live.m3u", response_class=Response)
+async def export_private_channels_live_m3u(
+    db: AsyncSession = Depends(get_db_session),
+):
+    """
+    Export all playable videos from enabled, LOCKED channels as one combined
+    live M3U playlist (the private stream). group-title driven by genre_tags or
+    category. Every non-failed video is served except pending Vimeo (which
+    waits for the background resolver — Session 61); other pending videos
+    resolve on demand at play time. Videos shuffled randomly in Python on
+    every fetch.
+    Add http://192.168.50.42:6868/channel/private/live.m3u to TiviMate.
+    """
+    base_url = "http://192.168.50.42:6868"
+
+    ch_stmt = (
+        select(Channel)
+        .where(Channel.enabled == True, Channel.locked == True)
+        .order_by(Channel.name)
+    )
+    ch_result = await db.execute(ch_stmt)
+    channels = ch_result.scalars().all()
+
+    lines = ["#EXTM3U"]
+    for channel in channels:
+        group = _m3u_group_for_channel(channel)
+
+        video_stmt = (
+            select(Video)
+            .where(
+                Video.channel_id == channel.id,
+                Video.source_url.isnot(None),
+                Video.source_url != "",
+                Video.resolution_status != "failed",
+                not_(
+                    and_(
+                        Video.resolution_status == "pending",
+                        Video.source_url.contains("vimeo.com"),
+                    )
+                ),
+            )
+            .order_by(Video.created_at.desc())
+        )
+        video_result = await db.execute(video_stmt)
+        videos = list(video_result.scalars().all())
+        random.shuffle(videos)
+
+        for v in videos:
+            duration = v.duration_seconds or -1
+            title = (v.title or "Untitled").replace(",", " ")
+            logo = v.thumbnail_url or ""
+            stream_url = f"{base_url}/channel/stream/{v.id}"
+            lines.append(
+                f'#EXTINF:{duration} tvg-name="{title}" tvg-logo="{logo}" '
+                f'group-title="{group}",{title}'
+            )
+            lines.append(stream_url)
+
+    content_str = "\n".join(lines)
+    return Response(
+        content=content_str,
+        media_type="application/x-mpegurl",
+        headers={"Content-Disposition": 'inline; filename="watchdawg_private.m3u"'},
+    )
+
+
+async def _find_local_file_for_video(
+    db: AsyncSession, video: Video
+) -> Optional[str]:
+    """
+    Disk-first lookup (Session 61): return the path (relative to the
+    downloads root, ready for /library/stream/{path}) of a local copy of
+    this video if one exists on the NAS. Returns None if no usable file
+    is found.
+
+    Two places a local copy can live:
+
+    1. A linked Favorite record with local_file_path set — written by the
+       Save button and by the Reddit auto-download pipeline (Session 60).
+       The stored path is absolute inside the container
+       (e.g. /watchdawg/Private/Reddit/SubName/Title.mp4).
+
+    2. The bulk channel downloader's predictable path (Session 42):
+       {downloads_path}/{Public|Private}/{channel_id}_{safe_name}/{video_id}.mp4
+       The bulk downloader never touches the Video record, so this path
+       check is the ONLY way to know the file exists. The Session 42
+       docstring promised "the resolver automatically prefers local files
+       over yt-dlp resolution" — that check was never actually implemented
+       anywhere until this helper. Both the Public and Private folders are
+       checked (current lock state first) so files survive a later lock
+       toggle on their channel.
+
+    Safety:
+    - Candidate paths are resolved with realpath and must stay inside the
+      downloads root, mirroring the /library/stream traversal guard.
+    - Files smaller than 1 MB are ignored as likely yt-dlp partials — the
+      same guard the bulk downloader's own skip check uses.
+
+    Lock discipline is NOT enforced here — this only changes where the
+    bytes come from for a play request that already passed the catalog
+    lock split (Xtream credentials / M3U channel split), exactly like the
+    existing local_folder and /library/stream behaviour.
+    """
+    import os
+    from app.config import settings as _cfg
+
+    downloads_root = os.path.realpath(_cfg.downloads_path)
+
+    def _relative_if_valid(abs_path: Optional[str]) -> Optional[str]:
+        """Validate a candidate file and return its downloads-root-relative path."""
+        if not abs_path:
+            return None
+        try:
+            real = os.path.realpath(abs_path)
+            if not real.startswith(downloads_root + os.sep):
+                return None  # outside the downloads tree — never serve
+            if not os.path.isfile(real):
+                return None
+            if os.path.getsize(real) < 1_000_000:
+                return None  # likely a yt-dlp partial — skip
+            return os.path.relpath(real, downloads_root)
+        except OSError:
+            return None
+
+    # 1. Favorite record with a stored local file path
+    fav_stmt = select(Favorite).where(
+        Favorite.video_id == video.id,
+        Favorite.local_file_path.isnot(None),
+    )
+    fav_result = await db.execute(fav_stmt)
+    for fav in fav_result.scalars().all():
+        rel = _relative_if_valid(fav.local_file_path)
+        if rel is not None:
+            return rel
+
+    # 2. Bulk channel downloader path: {video_id}.mp4 in the channel folder
+    if video.channel_id is not None:
+        ch_stmt = select(Channel).where(Channel.id == video.channel_id)
+        ch_result = await db.execute(ch_stmt)
+        channel = ch_result.scalar_one_or_none()
+        if channel is not None:
+            safe_name = re.sub(r'[^\w\-]', '_', channel.name)[:50]
+            # Current lock state's folder first, then the other — files
+            # downloaded before a lock toggle live in the old folder.
+            first = "Private" if channel.locked else "Public"
+            second = "Public" if channel.locked else "Private"
+            for folder_type in (first, second):
+                candidate = os.path.join(
+                    _cfg.downloads_path,
+                    folder_type,
+                    f"{channel.id}_{safe_name}",
+                    f"{video.id}.mp4",
+                )
+                rel = _relative_if_valid(candidate)
+                if rel is not None:
+                    return rel
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Progressive YouTube pipe (Session 62)
+# ---------------------------------------------------------------------------
+# Replaces the "download the whole video, then serve it" step of the Session 57
+# remux-on-play path with a live pipe: the resolver has ALREADY produced the
+# direct CDN URLs for the video-only and audio-only streams, so we feed both
+# straight into ffmpeg (-c copy, no transcode) and forward ffmpeg's output to
+# the client as it is produced. Startup latency stops scaling with video
+# length (~resolve time + a couple of seconds, regardless of duration), no
+# temp file is written, and yt-dlp is NOT run a second time — which also
+# halves the number of cookie-bearing YouTube extractions per play.
+#
+# Container: fragmented MP4 ("-movflags frag_keyframe+empty_moov+
+# default_base_moof"). A normal MP4 puts its index (moov atom) at the END of
+# the file, which is why it cannot be piped; fragmented MP4 interleaves
+# self-contained fragments and is built exactly for streaming. Content type
+# stays video/mp4, same as the Session 57 FileResponse.
+#
+# Known trade-off (accepted in the Session 62 plan): a piped stream is not
+# seekable the way a finished file is — skipping around on a cold first play
+# will restart the stream. The future 6-hour temp cache (queue) is the fix
+# that gives instant start AND seek; this design leaves that door open.
+#
+# Safety net: if ffmpeg produces no output within _YT_PIPE_FIRST_BYTE_TIMEOUT
+# seconds (e.g. the googlevideo CDN rejects ffmpeg's request style, or the
+# container's ffmpeg lacks https support — both unknowns until hardware
+# verification), the helper returns None and the caller falls through to the
+# UNCHANGED Session 57 full-download remux. Worst case is the old behavior,
+# never a broken player.
+
+_YT_PIPE_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
+)
+
+# Seconds to wait for ffmpeg's FIRST output chunk before declaring the pipe
+# path dead and falling back to the full-download remux. The CDN URLs are
+# already resolved at this point, so ffmpeg only has to open two HTTPS
+# connections and read a few packets — healthy startup is 1-3s.
+_YT_PIPE_FIRST_BYTE_TIMEOUT = 20.0
+
+_YT_PIPE_CHUNK_SIZE = 64 * 1024
+
+
+async def _try_progressive_youtube_pipe(video_id: int, video_url: str, audio_url: str):
+    """
+    Attempt to serve a split YouTube stream as a live progressive pipe.
+
+    Launches ffmpeg with the two resolved CDN URLs as inputs, -c copy, and
+    fragmented-MP4 output on stdout. Waits up to _YT_PIPE_FIRST_BYTE_TIMEOUT
+    for the first chunk:
+
+    - First chunk arrives  -> returns a StreamingResponse that forwards
+      ffmpeg's output to the client for the life of the playback. If the
+      client disconnects (stop / channel change), ffmpeg is killed
+      immediately — no orphaned processes, and nothing ever touches disk.
+    - No output in time / ffmpeg dies early -> kills ffmpeg, logs its stderr,
+      and returns None so the caller can fall back to the Session 57 path.
+    """
+    import asyncio as _asyncio
+    from fastapi.responses import StreamingResponse
+
+    # Per-input options (must precede EACH -i they apply to): a browser
+    # user-agent, plus auto-reconnect so a momentary CDN hiccup mid-movie
+    # resumes instead of ending the stream.
+    input_flags = [
+        "-user_agent", _YT_PIPE_USER_AGENT,
+        "-reconnect", "1",
+        "-reconnect_streamed", "1",
+        "-reconnect_delay_max", "5",
+    ]
+    cmd = (
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin"]
+        + input_flags + ["-i", video_url]
+        + input_flags + ["-i", audio_url]
+        + [
+            "-map", "0:v:0",
+            "-map", "1:a:0",
+            "-c", "copy",
+            "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+            "-f", "mp4",
+            "pipe:1",
+        ]
+    )
+
+    logger.info(
+        f"STREAM PIPE | video {video_id} — starting progressive ffmpeg pipe "
+        f"(video+audio CDN inputs, -c copy, fragmented MP4)"
+    )
+
+    try:
+        proc = await _asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=_asyncio.subprocess.PIPE,
+            stderr=_asyncio.subprocess.PIPE,
+        )
+    except Exception as exc:
+        logger.error(f"STREAM PIPE | video {video_id} — could not launch ffmpeg: {exc}")
+        return None
+
+    # Gate on the first chunk. If ffmpeg can't produce output quickly, this
+    # path doesn't work for this video (or at all) — fall back.
+    try:
+        first_chunk = await _asyncio.wait_for(
+            proc.stdout.read(_YT_PIPE_CHUNK_SIZE),
+            timeout=_YT_PIPE_FIRST_BYTE_TIMEOUT,
+        )
+    except _asyncio.TimeoutError:
+        first_chunk = b""
+
+    if not first_chunk:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        err_text = ""
+        try:
+            _, stderr_data = await _asyncio.wait_for(proc.communicate(), timeout=5)
+            err_text = (stderr_data or b"").decode(errors="replace")[:500]
+        except Exception:
+            pass
+        logger.warning(
+            f"STREAM PIPE | video {video_id} — no output within "
+            f"{_YT_PIPE_FIRST_BYTE_TIMEOUT:.0f}s, falling back to full-download "
+            f"remux. ffmpeg said: {err_text or '(nothing)'}"
+        )
+        return None
+
+    logger.info(
+        f"STREAM PIPE | video {video_id} — first bytes ready, streaming to client"
+    )
+
+    # Drain stderr in the background for the rest of the stream. Without this,
+    # a chatty ffmpeg (reconnect notices on a long movie) could fill the 64 KB
+    # stderr pipe buffer and deadlock the process. Keeps only the tail for the
+    # exit log.
+    stderr_tail = bytearray()
+
+    async def _drain_stderr():
+        try:
+            while True:
+                data = await proc.stderr.read(4096)
+                if not data:
+                    break
+                stderr_tail.extend(data)
+                if len(stderr_tail) > 2048:
+                    del stderr_tail[:-2048]
+        except Exception:
+            pass
+
+    drain_task = _asyncio.create_task(_drain_stderr())
+
+    async def _pipe_body():
+        try:
+            yield first_chunk
+            while True:
+                chunk = await proc.stdout.read(_YT_PIPE_CHUNK_SIZE)
+                if not chunk:
+                    break
+                yield chunk
+            rc = await proc.wait()
+            if rc == 0:
+                logger.info(f"STREAM PIPE | video {video_id} — stream complete")
+            else:
+                tail = stderr_tail.decode(errors="replace")[-300:]
+                logger.warning(
+                    f"STREAM PIPE | video {video_id} — ffmpeg exited {rc} "
+                    f"mid-stream. Tail: {tail or '(nothing)'}"
+                )
+        finally:
+            # Runs on normal completion AND on client disconnect (stop button,
+            # channel change) — StreamingResponse closes the generator, which
+            # triggers this block. Kill ffmpeg if it is still running.
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                logger.info(
+                    f"STREAM PIPE | video {video_id} — client disconnected, "
+                    f"ffmpeg terminated"
+                )
+            drain_task.cancel()
+
+    return StreamingResponse(
+        _pipe_body(),
+        media_type="video/mp4",
+        headers={
+            "Content-Disposition": f'inline; filename="watchdawg_{video_id}.mp4"',
+            # Be honest with the client: a live pipe cannot honor byte-range
+            # requests. TiviMate will play linearly; seeking restarts.
+            "Accept-Ranges": "none",
+        },
+    )
+
+
+@router.get("/stream/{video_id}/muxed")
+async def stream_video_muxed(
+    video_id: int,
+    db: AsyncSession = Depends(get_db_session),
+):
+    """
+    Universal single-stream endpoint (Session 71).
+
+    Guarantees a single playable stream for any client, including simpler
+    players like NostalgiaTV that cannot handle split HLS master manifests.
+
+    Routing:
+    - Split HLS (Vimeo): ffmpeg copy-mux of video+audio HLS into one
+      MPEG-TS pipe. No transcode — just container remux. Instant start.
+    - Everything else (combined HLS, combined MP4, YouTube split, local
+      files): 302-redirect to /channel/stream/{video_id}, which already
+      handles these formats correctly.
+
+    Used by /channel/{id}/shuffle so pasted URLs "just work" in any client.
+    """
+    from app.services.resolver import ResolverService
+    import asyncio as _asyncio
+    import urllib.parse
+    from fastapi.responses import RedirectResponse, StreamingResponse
+
+    base_url = "http://192.168.50.42:6868"
+
+    # Verify the video exists
+    stmt = select(Video).where(Video.id == video_id)
+    result = await db.execute(stmt)
+    video = result.scalar_one_or_none()
+    if video is None:
+        raise HTTPException(status_code=404, detail=f"Video {video_id} not found")
+    if not video.source_url:
+        raise HTTPException(status_code=404, detail=f"Video {video_id} has no source URL")
+
+    # Disk-first: local files don't need muxing
+    local_rel = await _find_local_file_for_video(db, video)
+    if local_rel is not None:
+        local_url = f"{base_url}/library/stream/{urllib.parse.quote(local_rel, safe='/')}"
+        logger.info(f"MUXED REDIRECT | video {video_id} — disk-first → {local_rel[:80]}")
+        return RedirectResponse(url=local_url, status_code=302)
+
+    # Resolve the video
+    resolver = ResolverService(db)
+    resolution = await resolver.resolve_video_for_tv(video_id)
+    if resolution is None or not resolution.get("stream_url"):
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not resolve video {video_id}",
+        )
+
+    cdn_url = resolution["stream_url"]
+    audio_url = resolution.get("audio_url")
+
+    # Only intervene for split HLS — everything else the existing endpoint
+    # already handles correctly (combined HLS, YouTube pipe, DASH, etc.)
+    if not (audio_url and _is_hls_stream(cdn_url)):
+        logger.info(
+            f"MUXED REDIRECT | video {video_id} — not split HLS, "
+            f"deferring to /channel/stream/"
+        )
+        return RedirectResponse(
+            url=f"{base_url}/channel/stream/{video_id}",
+            status_code=302,
+        )
+
+    # ------------------------------------------------------------------
+    # Split HLS: extract raw CDN URLs from proxy wrappers, then ffmpeg
+    # copy-mux both HLS inputs into a single MPEG-TS pipe.
+    # ------------------------------------------------------------------
+    def _unwrap_proxy(proxy_url: str) -> str:
+        """Extract the raw CDN URL from a proxy-wrapped URL."""
+        if "/proxy/stream" in proxy_url and "url=" in proxy_url:
+            parsed = urllib.parse.urlparse(proxy_url)
+            params = urllib.parse.parse_qs(parsed.query)
+            raw = params.get("url", [""])[0]
+            if raw:
+                return raw
+        return proxy_url
+
+    raw_video = _unwrap_proxy(cdn_url)
+    raw_audio = _unwrap_proxy(audio_url)
+
+    logger.info(
+        f"MUXED STREAM | video {video_id} — split HLS → ffmpeg mux "
+        f"(video: {raw_video[:80]})"
+    )
+
+    # Per-input options: Vimeo CDN requires Referer header for both the
+    # m3u8 manifest and every segment fetch. ffmpeg propagates -headers
+    # to all HTTP requests for each input (manifest + segments).
+    input_flags = [
+        "-headers", "Referer: https://vimeo.com\r\n",
+        "-reconnect", "1",
+        "-reconnect_streamed", "1",
+        "-reconnect_delay_max", "5",
+    ]
+    cmd = (
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin"]
+        + input_flags + ["-i", raw_video]
+        + input_flags + ["-i", raw_audio]
+        + [
+            "-map", "0:v:0",
+            "-map", "1:a:0",
+            "-c", "copy",
+            "-f", "mpegts",
+            "pipe:1",
+        ]
+    )
+
+    try:
+        proc = await _asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=_asyncio.subprocess.PIPE,
+            stderr=_asyncio.subprocess.PIPE,
+        )
+    except Exception as exc:
+        logger.error(f"MUXED STREAM | video {video_id} — could not launch ffmpeg: {exc}")
+        raise HTTPException(status_code=502, detail="Could not start muxed stream")
+
+    # Gate on the first chunk — if ffmpeg can't produce output quickly,
+    # fall back to the standard endpoint.
+    try:
+        first_chunk = await _asyncio.wait_for(
+            proc.stdout.read(_YT_PIPE_CHUNK_SIZE),
+            timeout=_YT_PIPE_FIRST_BYTE_TIMEOUT,
+        )
+    except _asyncio.TimeoutError:
+        first_chunk = b""
+
+    if not first_chunk:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        err_text = ""
+        try:
+            _, stderr_data = await _asyncio.wait_for(proc.communicate(), timeout=5)
+            err_text = (stderr_data or b"").decode(errors="replace")[:500]
+        except Exception:
+            pass
+        logger.warning(
+            f"MUXED STREAM | video {video_id} — ffmpeg produced no output "
+            f"within {_YT_PIPE_FIRST_BYTE_TIMEOUT:.0f}s. Stderr: {err_text or '(nothing)'}"
+        )
+        # Fall back to the standard stream endpoint
+        return RedirectResponse(
+            url=f"{base_url}/channel/stream/{video_id}",
+            status_code=302,
+        )
+
+    logger.info(
+        f"MUXED STREAM | video {video_id} — first bytes ready, streaming"
+    )
+
+    # Drain stderr in the background to prevent pipe-buffer deadlock
+    stderr_tail = bytearray()
+
+    async def _drain_stderr():
+        try:
+            while True:
+                data = await proc.stderr.read(4096)
+                if not data:
+                    break
+                stderr_tail.extend(data)
+                if len(stderr_tail) > 2048:
+                    del stderr_tail[:-2048]
+        except Exception:
+            pass
+
+    drain_task = _asyncio.create_task(_drain_stderr())
+
+    async def _muxed_body():
+        try:
+            yield first_chunk
+            while True:
+                chunk = await proc.stdout.read(_YT_PIPE_CHUNK_SIZE)
+                if not chunk:
+                    break
+                yield chunk
+            rc = await proc.wait()
+            if rc == 0:
+                logger.info(f"MUXED STREAM | video {video_id} — stream complete")
+            else:
+                tail = stderr_tail.decode(errors="replace")[-300:]
+                logger.warning(
+                    f"MUXED STREAM | video {video_id} — ffmpeg exited {rc} "
+                    f"mid-stream. Tail: {tail or '(nothing)'}"
+                )
+        finally:
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                logger.info(
+                    f"MUXED STREAM | video {video_id} — client disconnected, "
+                    f"ffmpeg terminated"
+                )
+            drain_task.cancel()
+
+    return StreamingResponse(
+        _muxed_body(),
+        media_type="video/mp2t",
+        headers={
+            "Accept-Ranges": "none",
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+        },
+    )
+
+
 @router.get("/stream/{video_id}", response_class=Response)
 async def stream_video_redirect(
     video_id: int,
@@ -1388,15 +2171,30 @@ async def stream_video_redirect(
     On-demand resolve-and-redirect for IPTV clients (TiviMate).
 
     Routing logic:
-    - HLS stream (m3u8 URL): always route through /proxy/stream.
-      HLS manifests already contain both audio and video tracks — the DASH
-      manifest approach is only needed for truly split MP4 files.
-    - Split MP4 stream (audio_url present, non-HLS): route to DASH manifest
-      so ExoPlayer merges both tracks.
+    - Split HLS stream (audio_url present AND video stream is HLS): some
+      Vimeo videos have no combined rendition — yt-dlp returns separate
+      video-only and audio-only HLS streams. Generic IPTV players can't
+      sync two tracks themselves, so route to /channel/stream/{id}/muxed
+      for a server-side ffmpeg remux into one continuous stream.
+    - Combined HLS stream (no separate audio_url): route through /proxy/stream.
+      The manifest already contains both audio and video tracks.
+    - Split MP4 stream (audio_url present, non-HLS, e.g. YouTube): progressive
+      ffmpeg pipe of the two resolved CDN streams (Session 62), falling back
+      to the Session 57 full-download remux if the pipe produces no output;
+      non-YouTube split MP4 routes to the DASH manifest so ExoPlayer merges
+      both tracks.
     - Combined stream: route through /proxy/stream.
 
-    Timeout: 25s hard limit on yt-dlp. Falls back to stale cached URL if
-    available rather than returning a 502.
+    Uses resolve_video_for_tv() rather than the standard resolver so a
+    separately-resolved audio_url is actually available for this routing
+    decision — the standard resolver/cache only ever persists one URL.
+
+    Timeout: 40s hard limit on yt-dlp (raised from 25s — YouTube extraction
+    with JS-challenge solving routinely takes 10-30+ s, so 25s clipped real
+    successes). This is only the safety net for cache MISSES: the scheduler's
+    TV warm pass pre-resolves YouTube in the background, so normal playback
+    is an instant cache hit and never waits here at all. Falls back to stale
+    cached URL if available rather than returning a 502.
     """
     from app.services.resolver import ResolverService
     import asyncio as _asyncio
@@ -1413,6 +2211,39 @@ async def stream_video_redirect(
         raise HTTPException(status_code=404, detail=f"Video {video_id} not found")
     if not video.source_url:
         raise HTTPException(status_code=404, detail=f"Video {video_id} has no source URL")
+
+    # ------------------------------------------------------------------
+    # Disk-first playback (Session 61): if a local copy of this video is
+    # already on the NAS — a Reddit auto-download, a Save-button download,
+    # or a bulk channel download — serve it straight from disk via
+    # /library/stream/. No yt-dlp, no cookies, no internet, instant start.
+    # Checked BEFORE the failed-status 404 on purpose: a file on disk is
+    # playable regardless of what happened to its online source since.
+    # Falls through to the normal resolver path only when no file exists.
+    # ------------------------------------------------------------------
+    local_rel = await _find_local_file_for_video(db, video)
+    if local_rel is not None:
+        from fastapi.responses import RedirectResponse
+        local_url = f"{base_url}/library/stream/{urllib.parse.quote(local_rel, safe='/')}"
+        logger.info(
+            f"STREAM REDIRECT | video {video_id} — disk-first → {local_rel[:80]}"
+        )
+        return RedirectResponse(url=local_url, status_code=302)
+
+    # "downloaded" videos exist ONLY as local files (Session 60 Reddit
+    # auto-downloads — their source_url points at a hostile CDN that yt-dlp
+    # was used to defeat at download time). If the file is missing, 404
+    # cleanly instead of burning a doomed resolver call.
+    if video.resolution_status == "downloaded":
+        logger.warning(
+            f"STREAM REDIRECT | video {video_id} — status 'downloaded' but "
+            f"no local file found on disk — 404"
+        )
+        raise HTTPException(
+            status_code=404,
+            detail=f"Downloaded file for video {video_id} not found on disk",
+        )
+
     if video.resolution_status == "failed":
         logger.warning(f"STREAM REDIRECT | video {video_id} permanently failed — 404")
         raise HTTPException(status_code=404, detail=f"Video {video_id} is permanently unavailable")
@@ -1436,11 +2267,11 @@ async def stream_video_redirect(
     resolution = None
     try:
         resolution = await _asyncio.wait_for(
-            resolver.resolve_video(video_id, force=False),
-            timeout=25.0,
+            resolver.resolve_video_for_tv(video_id),
+            timeout=40.0,
         )
     except _asyncio.TimeoutError:
-        logger.warning(f"STREAM REDIRECT | video {video_id} — yt-dlp timed out after 25s")
+        logger.warning(f"STREAM REDIRECT | video {video_id} — yt-dlp timed out after 40s")
 
     # Stale-cache fallback
     if resolution is None and video.resolved_stream_url:
@@ -1454,10 +2285,19 @@ async def stream_video_redirect(
     cdn_url = resolution["stream_url"]
     audio_url = resolution.get("audio_url")
 
-    # HLS streams (Vimeo): always proxy directly — the combined Vimeo HLS
-    # manifest already contains both audio and video tracks. TiviMate plays
-    # it correctly through the proxy (which injects Vimeo Referer headers).
-    # This is the same path the Android app uses when selecting HLS — it works.
+    # Split HLS: Vimeo serves separate video-only and audio-only HLS sub-playlists
+    # with no combined rendition. Build a synthetic HLS master manifest that
+    # declares both renditions so TiviMate can sync them natively — no ffmpeg.
+    if audio_url and _is_hls_stream(cdn_url):
+        master_url = f"{base_url}/channel/stream/{video_id}/master.m3u8"
+        logger.info(f"STREAM REDIRECT | video {video_id} — split HLS → master manifest")
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse(url=master_url, status_code=302)
+
+    # Combined HLS streams (Vimeo): proxy directly — the manifest already
+    # contains both audio and video tracks. TiviMate plays it correctly
+    # through the proxy (which injects Vimeo Referer headers). This is the
+    # same path the Android app uses when selecting HLS — it works.
     # Never use master playlist or DASH for HLS; those only work for split MP4.
     if _is_hls_stream(cdn_url):
         proxy_url = f"{proxy_base}?url={urllib.parse.quote(cdn_url, safe='')}"
@@ -1465,8 +2305,113 @@ async def stream_video_redirect(
         from fastapi.responses import RedirectResponse
         return RedirectResponse(url=proxy_url, status_code=302)
 
-    # Split MP4 (non-HLS, e.g. YouTube): DASH manifest merges both tracks.
+    # Split MP4 (non-HLS, e.g. YouTube): route by source.
+    #
+    # YouTube: DASH manifests are unplayable by OwnTV/ExoPlayer and TiviMate.
+    #
+    # PRIMARY (Session 62): progressive pipe — feed the two resolved CDN URLs
+    # straight into ffmpeg (-c copy) and stream fragmented MP4 to the client
+    # as it is produced. Startup latency stops scaling with video length, no
+    # temp file, no second yt-dlp extraction.
+    #
+    # FALLBACK (Session 57, unchanged): if the pipe produces no output within
+    # its startup window, run yt-dlp to download both streams, remux into a
+    # combined MP4 via ffmpeg (-c copy), then stream the finished file.
+    #
+    # Non-YouTube split MP4: keep the existing DASH manifest path (untested
+    # but preserved for safety).
     if audio_url and not _is_hls_stream(audio_url):
+        is_youtube = (
+            "youtube.com" in (video.source_url or "")
+            or "youtu.be" in (video.source_url or "")
+        )
+
+        if is_youtube:
+            # ---- Progressive pipe first (Session 62) ----
+            pipe_response = await _try_progressive_youtube_pipe(
+                video_id, cdn_url, audio_url
+            )
+            if pipe_response is not None:
+                return pipe_response
+
+            # ---- Fallback: Session 57 full-download remux (unchanged) ----
+            import os
+            from fastapi.responses import FileResponse
+            from starlette.background import BackgroundTask
+
+            tmp_path = f"/tmp/remux_{video_id}_{int(datetime.datetime.utcnow().timestamp())}.mp4"
+            logger.info(
+                f"STREAM REMUX | video {video_id} — "
+                f"starting yt-dlp download + ffmpeg merge for YouTube split stream"
+            )
+
+            try:
+                proc = await _asyncio.create_subprocess_exec(
+                    "yt-dlp",
+                    "--cookies", "/config/cookies.txt",
+                    "-f", "bestvideo[vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo+bestaudio",
+                    "--merge-output-format", "mp4",
+                    "--no-part",
+                    "-o", tmp_path,
+                    video.source_url,
+                    stdout=_asyncio.subprocess.PIPE,
+                    stderr=_asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await _asyncio.wait_for(
+                    proc.communicate(), timeout=300
+                )
+
+                if proc.returncode != 0 or not os.path.exists(tmp_path):
+                    error_output = (stderr or b"").decode()[:500]
+                    logger.error(
+                        f"STREAM REMUX | video {video_id} — yt-dlp failed "
+                        f"(exit={proc.returncode}): {error_output}"
+                    )
+                    # Clean up any partial file
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+                    raise HTTPException(
+                        status_code=502,
+                        detail=f"YouTube remux failed for video {video_id}",
+                    )
+
+                file_size = os.path.getsize(tmp_path)
+                logger.info(
+                    f"STREAM REMUX | video {video_id} — merge complete "
+                    f"({file_size / 1024 / 1024:.1f} MB), streaming to client"
+                )
+
+                def _cleanup_remux():
+                    try:
+                        os.unlink(tmp_path)
+                        logger.debug(f"STREAM REMUX | video {video_id} — temp file cleaned up")
+                    except OSError:
+                        pass
+
+                return FileResponse(
+                    path=tmp_path,
+                    media_type="video/mp4",
+                    filename=f"watchdawg_{video_id}.mp4",
+                    background=BackgroundTask(_cleanup_remux),
+                )
+
+            except _asyncio.TimeoutError:
+                logger.error(
+                    f"STREAM REMUX | video {video_id} — "
+                    f"yt-dlp timed out after 300s"
+                )
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise HTTPException(
+                    status_code=504,
+                    detail=f"YouTube remux timed out for video {video_id}",
+                )
+
+        # Non-YouTube split MP4: DASH manifest (existing behavior)
         manifest_url = f"{base_url}/resolve/{video_id}/manifest.mpd"
         logger.info(f"STREAM REDIRECT | video {video_id} — split MP4 → DASH manifest")
         from fastapi.responses import RedirectResponse
@@ -1477,6 +2422,164 @@ async def stream_video_redirect(
     logger.info(f"STREAM REDIRECT | video {video_id} — combined → proxy → {cdn_url[:80]}")
     from fastapi.responses import RedirectResponse
     return RedirectResponse(url=proxy_url, status_code=302)
+
+
+@router.get("/stream/{video_id}/master.m3u8")
+async def stream_video_master_manifest(
+    video_id: int,
+    db: AsyncSession = Depends(get_db_session),
+):
+    """
+    Generate a synthetic HLS master manifest for split video+audio streams.
+
+    Some Vimeo videos have no combined rendition — yt-dlp returns separate
+    video-only and audio-only HLS sub-playlists. A generic IPTV player like
+    TiviMate cannot play two separate sub-playlists simultaneously, but it
+    CAN play a standard HLS master manifest that declares both renditions via
+    #EXT-X-MEDIA and #EXT-X-STREAM-INF tags. The player fetches both
+    sub-playlists in parallel and syncs them natively — no ffmpeg needed.
+
+    Both sub-playlist URLs are already proxied through /proxy/stream by
+    resolve_video_for_tv(), so Vimeo CDN Referer injection is handled there.
+
+    For combined streams (no separate audio_url), returns a minimal single-
+    rendition master manifest that still works correctly — TiviMate treats
+    it as a normal HLS stream.
+    """
+    from app.services.resolver import ResolverService
+    import asyncio as _asyncio
+    from fastapi.responses import PlainTextResponse
+
+    resolver = ResolverService(db)
+    resolution = await resolver.resolve_video_for_tv(video_id)
+
+    if resolution is None or not resolution.get("stream_url"):
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not resolve video {video_id} for HLS master manifest",
+        )
+
+    video_url = resolution["stream_url"]
+    audio_url = resolution.get("audio_url")
+
+    # The resolver wraps Vimeo CDN URLs through localhost for internal use —
+    # replace localhost with the real PlexServer IP so TiviMate (running on
+    # a different device) can actually reach the proxy endpoints.
+    base_url = "http://192.168.50.42:6868"
+    if video_url:
+        video_url = video_url.replace("http://localhost:6868", base_url)
+    if audio_url:
+        audio_url = audio_url.replace("http://localhost:6868", base_url)
+
+    if audio_url:
+        # Split stream: declare audio rendition + video stream referencing it.
+        # CODECS omitted intentionally — TiviMate's parser rejects mismatched
+        # codec strings; letting it sniff from the sub-playlists is more robust.
+        manifest = (
+            "#EXTM3U\n"
+            f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Audio",'
+            f'DEFAULT=YES,AUTOSELECT=YES,URI="{audio_url}"\n'
+            f'#EXT-X-STREAM-INF:BANDWIDTH=4000000,AUDIO="audio"\n'
+            f"{video_url}\n"
+        )
+        logger.info(
+            f"MASTER MANIFEST | video {video_id} — split HLS "
+            f"(video+audio declared)"
+        )
+    else:
+        # Combined stream: single-rendition master, no audio group needed
+        manifest = (
+            "#EXTM3U\n"
+            "#EXT-X-STREAM-INF:BANDWIDTH=4000000\n"
+            f"{video_url}\n"
+        )
+        logger.info(
+            f"MASTER MANIFEST | video {video_id} — combined HLS "
+            f"(single rendition)"
+        )
+
+    return PlainTextResponse(
+        content=manifest,
+        media_type="application/vnd.apple.mpegurl",
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+    )
+
+
+@router.get("/{channel_id}/shuffle")
+async def shuffle_channel_stream(
+    channel_id: int,
+    db: AsyncSession = Depends(get_db_session),
+):
+    """
+    Shuffled TV channel endpoint (Session 71).
+
+    Each request pops the next video from a shuffled queue for this source
+    and 302-redirects to /channel/stream/{video_id}. When the queue is
+    exhausted, all eligible videos are reloaded from the DB and reshuffled
+    — full rotation before any repeats.
+
+    Usage: paste http://192.168.50.42:6868/channel/{id}/shuffle into
+    NostalgiaTV or SurfTV as a custom live channel URL. The client
+    re-fetches the URL after each video ends, getting a different video
+    each time — one URL = one shuffled channel.
+
+    Eligible videos: same filter as the M3U exports — source_url present,
+    not failed, and not pending Vimeo.
+    """
+    from fastapi.responses import RedirectResponse
+
+    base_url = "http://192.168.50.42:6868"
+
+    # Verify the channel exists
+    ch_result = await db.execute(select(Channel).where(Channel.id == channel_id))
+    channel = ch_result.scalar_one_or_none()
+    if channel is None:
+        raise HTTPException(status_code=404, detail="Channel not found")
+
+    # Reload the queue if empty or missing
+    if not _shuffle_queues.get(channel_id):
+        video_stmt = (
+            select(Video.id)
+            .where(
+                Video.channel_id == channel_id,
+                Video.source_url.isnot(None),
+                Video.source_url != "",
+                Video.resolution_status != "failed",
+                not_(
+                    and_(
+                        Video.resolution_status == "pending",
+                        Video.source_url.contains("vimeo.com"),
+                    )
+                ),
+            )
+        )
+        video_result = await db.execute(video_stmt)
+        video_ids = [row[0] for row in video_result.fetchall()]
+
+        if not video_ids:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No eligible videos in source #{channel_id}",
+            )
+
+        random.shuffle(video_ids)
+        _shuffle_queues[channel_id] = video_ids
+        logger.info(
+            f"SHUFFLE | source #{channel_id} ({channel.name}) — "
+            f"loaded {len(video_ids)} videos into queue"
+        )
+
+    # Pop next video and redirect
+    next_video_id = _shuffle_queues[channel_id].pop(0)
+    remaining = len(_shuffle_queues[channel_id])
+    logger.info(
+        f"SHUFFLE | source #{channel_id} — serving video {next_video_id} "
+        f"({remaining} remaining in queue)"
+    )
+    return RedirectResponse(
+        url=f"{base_url}/channel/stream/{next_video_id}/muxed",
+        status_code=302,
+    )
 
 
 @router.get("/{channel_id}/live.m3u", response_class=Response)

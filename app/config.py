@@ -14,6 +14,15 @@ Pre-Milestone D change:
   Host folder renamed from /media/colby/NAS1/WatchDawg to
   /media/colby/NAS1/WD_Downloads for clarity.
   Subfolders Public/ and Private/ are created on first download.
+
+Session 60 addition:
+- vimeo_cookies_path: Path to the Vimeo account session cookie file
+  (MozillaCookieJar format) — mandatory for all Vimeo extraction since
+  Vimeo disabled anonymous API access on 2026-07-20. (Session 68)
+- reddit_cookies_path: Path to the Reddit session cookie file
+  (MozillaCookieJar format) used by the Reddit provider. Mounted
+  read-only into the container via docker-compose.yml, same pattern
+  as the YouTube cookies file.
 """
 
 from pydantic_settings import BaseSettings
@@ -45,10 +54,31 @@ class Settings(BaseSettings):
 
     # --- yt-dlp ---
     ytdlp_cookies_path: str = Field(default="/config/cookies.txt")
+    # Path to Vimeo account session cookies (MozillaCookieJar format),
+    # exported from a logged-in vimeo.com browser tab. (Session 68)
+    #
+    # REQUIRED for all Vimeo extraction since 2026-07-20: Vimeo disabled
+    # anonymous API access (yt-dlp issue #17271 / PR #17272), so every
+    # Vimeo resolve fails with "The web client only works when logged-in"
+    # unless account cookies are provided.
+    #
+    # The filename deliberately matches the browser cookie-export addon's
+    # naming convention (vimeo.com_cookies.txt) so the refresh routine is:
+    # export from a logged-in vimeo.com tab (must include HttpOnly/session
+    # cookies — the addon's default), then copy the file straight to
+    # ~/watchdawg-backend/config/ on the host, overwriting. No rename, no
+    # restart — the resolver reads the file on every extraction.
+    vimeo_cookies_path: str = Field(default="/config/vimeo.com_cookies.txt")
 
     # --- Reddit ---
     reddit_subreddits: str = Field(default="SexyMusicVideos")
     scrape_interval_minutes: int = Field(default=30)
+    # Path to Reddit session cookies (MozillaCookieJar format), exported
+    # from a logged-in browser. Required for Reddit scraping to work —
+    # Reddit 403-blocks all unauthenticated JSON access. The provider
+    # re-reads this file on every scrape run, so re-exporting fresh
+    # cookies to the host file takes effect without a restart.
+    reddit_cookies_path: str = Field(default="/config/reddit_cookies.txt")
 
     # --- Downloads ---
     # Root download directory inside the container.

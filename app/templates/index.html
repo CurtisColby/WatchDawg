@@ -52,6 +52,16 @@ a{color:var(--info)}
 .status-row{display:flex;align-items:center;gap:8px;margin-top:6px}
 .dot{width:9px;height:9px;border-radius:50%;background:var(--faint);flex:none}
 .dot.good{background:var(--good)} .dot.bad{background:var(--bad)} .dot.warn{background:var(--warn)}
+.dot.spin{background:var(--accent2);animation:dotpulse 1s ease-in-out infinite}
+@keyframes dotpulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.35;transform:scale(.7)}}
+.jobrow{display:flex;align-items:center;gap:10px;padding:9px 4px;border-bottom:1px solid var(--line)}
+.jobrow:last-child{border-bottom:none}
+.jobrow .jname{font-weight:700;min-width:190px}
+.jobrow .jinfo{flex:1;min-width:0}
+.jobrow .jresult{color:var(--dim);font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.jobrow .jerr{color:var(--bad);font-size:12.5px}
+.jobrow .jnext{color:var(--dim);font-size:12px;white-space:nowrap;text-align:right;min-width:110px}
+code.cfg{background:rgba(0,0,0,.32);padding:2px 7px;border-radius:5px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;user-select:all;word-break:break-all}
 
 /* ---------- Main ---------- */
 #main{flex:1;padding:26px 32px 80px;max-width:1250px}
@@ -225,7 +235,7 @@ h2{font-size:16px;margin:26px 0 12px;color:var(--accent2)}
 
   <div class="subtabs">
     <button class="btn active" id="dtab-jobs" data-tip="One downloader per channel — pick a quality, press Download All, and watch it work file by file.">⬇️ Channel Downloaders</button>
-    <button class="btn" id="dtab-files" data-tip="Everything already on disk, grouped by folder. Play files right here in the browser, or delete ones you don't want.">📁 Files on Disk</button>
+    <button class="btn" id="dtab-files" data-tip="Everything already on disk, browsed folder by folder — open a folder to see its files as a thumbnail gallery, play them in the browser, or delete ones you don't want.">📁 Files on Disk</button>
   </div>
 
   <div id="dl-jobs"><div class="empty">Loading channels…</div></div>
@@ -234,7 +244,7 @@ h2{font-size:16px;margin:26px 0 12px;color:var(--accent2)}
     <div class="row" style="margin-bottom:10px">
       <div class="muted" id="lib-summary"></div>
       <div class="spacer"></div>
-      <button class="btn" id="gen-thumbs" data-tip="Create preview thumbnails for downloaded files that don't have one yet (20 at a time). Run it a few times for a big library.">🖼️ Generate Thumbnails</button>
+      <button class="btn" id="gen-thumbs" data-tip="Create preview thumbnails for downloaded files that don't have one yet (200 at a time). Run it a few times for a big library.">🖼️ Generate Thumbnails</button>
       <button class="btn" id="lib-refresh" data-tip="Re-scan the download folders on the NAS.">🔄 Refresh</button>
     </div>
     <div class="card" id="lib-list"><div class="empty">Loading library…</div></div>
@@ -256,17 +266,17 @@ h2{font-size:16px;margin:26px 0 12px;color:var(--accent2)}
       <div class="row">
         <select id="f-channel" data-tip="Show videos from just one source."></select>
         <select id="f-category" data-tip="Show videos from sources in one category."></select>
-        <select id="f-status" data-tip="Resolved = ready to stream. Pending = not resolved yet. Failed = last resolve attempt errored (you can reset these in Settings).">
+        <select id="f-status" data-tip="Resolved = ready to stream. Pending = not resolved yet. Problems = anything whose last resolve attempt recorded an error — review these and 🚫 the ones you don't want.">
           <option value="">Any status</option>
           <option value="resolved">Resolved</option>
           <option value="pending">Pending</option>
-          <option value="failed">Failed</option>
+          <option value="problems">⚠️ Problems</option>
         </select>
         <input class="grow" id="f-search" placeholder="🔍 Search titles…" data-tip="Filters the videos currently loaded on this page by title or artist.">
         <button class="btn" id="f-apply" data-tip="Reload the catalog with the filters chosen on the left.">Apply</button>
       </div>
       <div class="row" style="margin-top:10px">
-        <button class="btn small" id="c-resolve-batch" data-tip="Resolve up to 25 pending videos so they're ready to stream. Resolving looks up the actual video stream behind each link.">⚡ Resolve 25 Pending</button>
+        <button class="btn small" id="c-resolve-batch" data-tip="Resolve up to 25 pending videos so they're ready to stream. YouTube is skipped on purpose — it resolves on demand when you press play, which keeps the cookie alive.">⚡ Resolve 25 Pending</button>
         <button class="btn small" id="c-resolve-stop" data-tip="Politely stop a running batch resolve after the current video finishes.">🛑 Stop Resolving</button>
         <button class="btn small" id="c-upgrade" data-tip="Re-check videos stored below 720p and upgrade them if a better quality is now available. Never downgrades.">📈 Upgrade Quality</button>
         <div class="spacer"></div>
@@ -287,7 +297,7 @@ h2{font-size:16px;margin:26px 0 12px;color:var(--accent2)}
 <!-- ================= SETTINGS ================= -->
 <section class="page" id="page-settings">
   <h1>Settings &amp; Health</h1>
-  <div class="sub">PIN privacy lock, server status, cleanup tools, Plex connection, and live server logs.</div>
+  <div class="sub">PIN privacy lock, TV connection details, YouTube cookie status, server health, cleanup tools, Plex connection, and live server logs.</div>
 
   <div class="card">
     <h2 style="margin-top:0">🔒 PIN Lock</h2>
@@ -300,6 +310,59 @@ h2{font-size:16px;margin:26px 0 12px;color:var(--accent2)}
   </div>
 
   <div class="card">
+    <h2 style="margin-top:0">📺 Connect Your TV (TiviMate)</h2>
+    <div class="muted" style="margin-bottom:10px">Add WatchDawg to TiviMate (or any Xtream-capable player) as an <b>Xtream Codes API</b> source. Add it twice — once with each login — to get both catalogs and both TV guides.</div>
+    <div style="line-height:1.9">
+      <div data-tip="The address of this server — TiviMate must be on the same network.">Server URL: <code class="cfg">http://192.168.50.42:6868</code></div>
+      <div data-tip="The everyday catalog: unlocked sources plus the WatchDawg TV live channels.">Public login: <code class="cfg">public</code> / <code class="cfg">watchdawg</code></div>
+      <div data-tip="The PIN-gated catalog: locked sources plus the Adult TV live channels. The password is your WATCHDAWG_PIN from the server's .env file — it isn't printed here so anyone on your network who opens this page can't read it.">Private login: <code class="cfg">private</code> / <i>your WATCHDAWG_PIN</i></div>
+    </div>
+    <div class="muted" style="margin-top:10px">The TV guide (EPG) loads automatically once a source is added — no separate EPG URL needed. For players that want a plain playlist instead of Xtream, the M3U URLs are:</div>
+    <div style="line-height:1.9;margin-top:6px">
+      <div data-tip="Every enabled source's videos as one playlist.">All sources: <code class="cfg">http://192.168.50.42:6868/channel/all/live.m3u</code></div>
+      <div data-tip="Unlocked sources only — safe for family profiles on NostalgiaTV or any M3U player.">Public only: <code class="cfg">http://192.168.50.42:6868/channel/public/live.m3u</code></div>
+      <div data-tip="Locked sources only — no authentication, anyone with the URL can access it.">Private only: <code class="cfg">http://192.168.50.42:6868/channel/private/live.m3u</code></div>
+      <div data-tip="Just one source's videos. Find a source's id number on the Sources page.">One source: <code class="cfg">http://192.168.50.42:6868/channel/{id}/live.m3u</code></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2 style="margin-top:0">🍪 YouTube Cookies</h2>
+    <div class="row" style="margin-bottom:10px" data-tip="Live status, updated automatically. Green = the last YouTube lookup worked. Red = YouTube is rejecting requests and the cookies below need refreshing.">
+      <span class="dot" id="cookie-dot"></span><span id="cookie-status-txt" class="muted">Checking…</span>
+    </div>
+    <div class="row" style="margin-bottom:12px;gap:10px;align-items:center">
+      <button class="btn small" id="yt-pause-btn" data-tip="Stop the backend from making any YouTube requests for 70 minutes. Use this when YouTube has rate-limited you to let the ban expire without making it worse.">⏸ Pause YouTube (1 hr)</button>
+      <span id="yt-pause-status" class="muted" style="font-size:13px"></span>
+    </div>
+    <div class="row" id="cookie-stale-row" style="display:none;margin-bottom:12px;gap:10px;align-items:center;flex-wrap:wrap" data-tip="Set automatically the moment YouTube rejects a request because the cookies expired. While active, YouTube videos are left alone (kept pending, not marked failed) so the fail log doesn't fill up. Clears itself once a refreshed cookie works, or use this button after refreshing.">
+      <span class="muted" id="cookie-stale-txt" style="font-size:13px">⚠️ YouTube resolves auto-paused — cookies are stale. Refresh cookies.txt below, then this clears itself on the next successful lookup.</span>
+      <button class="btn small danger" id="cookie-stale-resume-btn">▶ Resume YouTube resolves</button>
+    </div>
+    <div class="muted" style="margin-bottom:6px"><b>Why:</b> YouTube expires exported browser cookies every few weeks. When that happens, YouTube videos get stuck resolving or won't play, and the status above turns red. Refreshing takes two minutes:</div>
+    <ol class="muted" style="margin:0 0 8px 18px;line-height:1.8">
+      <li>On a computer where you're <b>logged into YouTube</b>, go to <b>youtube.com</b> and export cookies with a cookie-export browser extension (Netscape format — e.g. “Get cookies.txt LOCALLY”). Export while on the YouTube tab.</li>
+      <li>Copy the file onto the server:<br><code class="cfg">sudo cp ~/Downloads/www.youtube.com_cookies.txt ~/watchdawg-backend/config/cookies.txt</code></li>
+      <li>Done — <b>no restart needed</b>. The status turns green on the next successful YouTube lookup (within one scheduler tick, or right away if you play a YouTube video).</li>
+    </ol>
+    <div class="muted">To verify by hand from the server:<br><code class="cfg">docker exec watchdawg-backend yt-dlp --cookies /config/cookies.txt --simulate --print title "https://www.youtube.com/watch?v=jNQXAC9IVRw"</code><br>— it should print a video title, not a “Sign in to confirm you're not a bot” error.</div>
+  </div>
+
+  <div class="card">
+    <h2 style="margin-top:0">🎬 Vimeo Cookies</h2>
+    <div class="row" style="margin-bottom:10px" data-tip="Live status, updated automatically. Green = Vimeo is accepting the account cookies. Red = Vimeo is rejecting requests (cookies expired) or the cookie file is missing — refresh using the steps below.">
+      <span class="dot" id="vimeo-cookie-dot"></span><span id="vimeo-cookie-status-txt" class="muted">Checking…</span>
+    </div>
+    <div class="muted" style="margin-bottom:6px"><b>Why:</b> Since July 20, 2026, Vimeo requires a <b>logged-in account</b> for every video lookup — anonymous access is gone for good. When the exported cookies expire, all Vimeo resolves fail, the status above turns red, and scheduled Vimeo resolves auto-pause (videos stay pending, nothing is lost). Refreshing takes two minutes:</div>
+    <ol class="muted" style="margin:0 0 8px 18px;line-height:1.8">
+      <li>On a computer where you're <b>logged into Vimeo</b>, go to <b>vimeo.com</b> and export cookies with your cookie-export browser extension (Netscape format — e.g. “Get cookies.txt LOCALLY”, same as YouTube). Export while on the Vimeo tab.</li>
+      <li>Copy the file onto the server (the filename already matches — no rename):<br><code class="cfg">cp ~/Downloads/vimeo.com_cookies.txt ~/watchdawg-backend/config/vimeo.com_cookies.txt</code></li>
+      <li>Done — <b>no restart needed</b>. Resolve any Vimeo video (or wait for the next scheduler tick); the first success turns the light green and un-pauses Vimeo automatically.</li>
+    </ol>
+    <div class="muted">To verify by hand from the server:<br><code class="cfg">docker exec watchdawg-backend yt-dlp --cookies /config/vimeo.com_cookies.txt --simulate --print title "https://vimeo.com/129731718"</code><br>— it should print a video title, not a “The web client only works when logged-in” error.</div>
+  </div>
+
+  <div class="card">
     <h2 style="margin-top:0">🩺 Server Health</h2>
     <div class="row">
       <span id="health-detail" class="muted">…</span>
@@ -309,13 +372,27 @@ h2{font-size:16px;margin:26px 0 12px;color:var(--accent2)}
   </div>
 
   <div class="card">
+    <h2 style="margin-top:0">📅 Background Scheduler</h2>
+    <div class="muted" style="margin-bottom:10px">Everything running behind the scenes: what each job last did, whether it's running right now, and when it fires next. Updates every 10 seconds while this page is open.</div>
+    <div class="row" style="margin-bottom:8px">
+      <span class="muted" id="ytbg-state" data-tip="When OFF (recommended), the background resolver never touches YouTube — YouTube videos resolve the moment you press play, which keeps the cookie alive. Turning it ON makes the scheduled pass bulk-resolve YouTube pendings and burns cookie requests fast.">YouTube background resolving: …</span>
+      <button class="btn small" id="ytbg-toggle" style="display:none"></button>
+      <div class="spacer"></div>
+      <button class="btn small" id="sched-refresh" data-tip="Re-read job status from the server right now.">↻ Refresh</button>
+    </div>
+    <div id="sched-jobs"><div class="empty">Loading scheduler status…</div></div>
+  </div>
+
+  <div class="card">
     <h2 style="margin-top:0">🧹 Maintenance</h2>
     <div class="muted" style="margin-bottom:10px">Safe cleanup tools. Each one tells you exactly what it did.</div>
     <div class="row">
-      <button class="btn small" id="m-reset-failed" data-tip="Mark every 'failed' video as pending again so the resolver will retry them. Use after a bad network day.">♻️ Reset Failed Videos</button>
-      <button class="btn small" id="m-backfill" data-tip="Fill in missing thumbnails for videos that don't have one.">🖼️ Backfill Thumbnails</button>
-      <button class="btn small" id="m-purge-dead" data-tip="Remove videos whose source link no longer works (deleted or private videos).">💀 Purge Dead Links</button>
+      <button class="btn small" id="m-backfill" data-tip="Fill in missing thumbnails for scraped videos (Vimeo/YouTube) that don't have one. Uses yt-dlp metadata.">🖼️ Backfill Thumbnails</button>
+      <button class="btn small" id="m-local-thumbs" data-tip="Generate thumbnail images for local video files that don't have one. Extracts a frame from each file using ffmpeg.">📁 Local Thumbnails</button>
+      <button class="btn small" id="m-purge-missing" data-tip="Remove local video records whose files no longer exist on disk. Cleans up entries left behind after deleting or moving files.">🧹 Purge Missing Files</button>
       <button class="btn small" id="m-purge-dupes" data-tip="Remove duplicate copies of the same video that snuck in from multiple scrapes.">👯 Purge Duplicates</button>
+      <button class="btn small danger" id="m-purge-403" data-tip="Remove dead Vimeo videos stuck pending with a 403 error — private, restricted, or deleted videos that block the resolve queue. Only use this when Vimeo is otherwise working: during an active IP block, 403 means Vimeo is blocking YOU, not that the videos are dead. Shows an exact count and asks before deleting. Purged videos are skip-listed and can't come back.">☠️ Purge Vimeo 403s</button>
+      <button class="btn small danger" id="m-verify-404" data-tip="Two-step cleanup for Vimeo videos stuck pending with a 404 error. Step 1 live-checks each one against Vimeo right now with your account cookies (5-10s apart, takes a minute or two) — because Vimeo sometimes 404s videos that are actually alive, nothing is deleted on a stored error alone. Step 2 shows the confirmed-dead count and asks before deleting. Purged videos are skip-listed and can't come back.">🔍 Verify &amp; Purge Vimeo 404s <span id="v404-progress"></span></button>
       <button class="btn small danger" id="m-skip-clear" data-tip="Empty the skip list. Videos you skipped in the past may reappear on the next scrape.">🗑️ Clear Skip List (<span id="skip-count">…</span>)</button>
     </div>
   </div>
@@ -426,21 +503,101 @@ function go(page){
   if (page==="sources")   loadChannels();
   if (page==="downloads"){ loadDownloaders(); }
   if (page==="catalog")  { fillCatalogFilters(); loadFeed(true); }
-  if (page==="settings") { refreshAuth(); refreshHealth(); refreshSkipCount(); refreshPlex(); }
+  if (page==="settings") { refreshAuth(); refreshHealth(); refreshSkipCount(); refreshPlex(); refreshScheduler(); }
 }
 $$(".nav-btn").forEach(b=>b.addEventListener("click", ()=>go(b.dataset.page)));
 
 /* ---------------- health + auth ---------------- */
+function _cookieAgo(iso){
+  if(!iso) return "unknown";
+  const mins = Math.round((Date.now() - new Date(iso).getTime())/60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return mins + " min ago";
+  const h = Math.round(mins/60);
+  if (h < 48) return h + " h ago";
+  return Math.round(h/24) + " days ago";
+}
+function updateCookieStatus(c){
+  // Returns true when cookies are stale (so the sidebar can flag it too).
+  const dot = $("#cookie-dot"), txt = $("#cookie-status-txt");
+  if (!dot || !txt) return false;
+  updateYtPause(c);
+  if (!c || c.state === "unknown"){
+    dot.className = "dot";
+    txt.textContent = "No YouTube activity since the server started — status appears after the next YouTube resolve (usually within one scheduler tick).";
+    return false;
+  }
+  if (c.state === "ok"){
+    dot.className = "dot good";
+    txt.textContent = "Cookies working — last successful YouTube resolve " + _cookieAgo(c.last_success) + ".";
+    return false;
+  }
+  dot.className = "dot bad";
+  const since = c.last_bot_error ? new Date(c.last_bot_error).toLocaleString([], {month:"short", day:"numeric", hour:"numeric", minute:"2-digit"}) : "recently";
+  txt.textContent = "⚠️ YouTube is rejecting requests — refresh your cookies using the steps below. Failing since " + since + " (" + (c.bot_error_count||0) + " failure" + (c.bot_error_count===1?"":"s") + ").";
+  return true;
+}
+function updateVimeoCookieStatus(v){
+  // Session 68 — the Vimeo green/red light. Returns true when attention is needed.
+  const dot = $("#vimeo-cookie-dot"), txt = $("#vimeo-cookie-status-txt");
+  if (!dot || !txt) return false;
+  if (!v || v.state === "unknown"){
+    dot.className = "dot";
+    txt.textContent = "Status appears after the next Vimeo resolve (usually within one scheduler tick).";
+    return false;
+  }
+  if (v.state === "ok"){
+    dot.className = "dot good";
+    txt.textContent = "Cookies present and Vimeo is accepting them.";
+    return false;
+  }
+  dot.className = "dot bad";
+  if (v.state === "missing"){
+    txt.textContent = "⚠️ No Vimeo cookie file found — every Vimeo resolve will fail until one is provided. Follow the steps below.";
+  } else {
+    txt.textContent = "⚠️ Vimeo is rejecting the cookies (login required) — they've expired. Scheduled Vimeo resolves are auto-paused (videos stay pending). Refresh using the steps below; the first successful resolve clears this automatically.";
+  }
+  return true;
+}
+function updateYtPause(c){
+  // Update pause button label + countdown from health data.
+  const btn = $("#yt-pause-btn"), statusTxt = $("#yt-pause-status");
+  if (!btn) return;
+  if (c && c.paused){
+    btn.textContent = "▶ Resume Now";
+    btn.classList.add("danger");
+    statusTxt.textContent = "⏸ Paused — resumes in " + (c.minutes_remaining||1) + " min";
+  } else {
+    btn.textContent = "⏸ Pause YouTube (1 hr)";
+    btn.classList.remove("danger");
+    statusTxt.textContent = "";
+  }
+  // Cookie-stale auto-pause row — shown only while the pause is active.
+  const staleRow = $("#cookie-stale-row");
+  if (staleRow){
+    staleRow.style.display = (c && c.cookie_stale_paused) ? "flex" : "none";
+  }
+}
 async function refreshHealth(){
   try{
     const h = await api("/health", {}, true);
     const ok = h && h.status==="healthy";
+    const cookieStale = updateCookieStatus(h && h.youtube_cookies);
+    updateVimeoCookieStatus(h && h.vimeo_cookies);  // Session 68
+    if (ok && cookieStale){
+      $("#health-dot").className = "dot warn";
+      $("#health-txt").textContent = "YouTube cookies stale";
+      $("#health-detail").textContent = "Backend and database are fine, but YouTube is rejecting requests — refresh your cookies (see the 🍪 YouTube Cookies card above).";
+      return;
+    }
     $("#health-dot").className = "dot " + (ok?"good":"warn");
     $("#health-txt").textContent = ok ? "Server healthy" : "Server degraded";
     $("#health-detail").textContent = ok
       ? "Backend is up and the database is connected."
       : "Backend responded but reported: " + esc((h&&h.status)||"unknown");
   }catch(e){
+    updateCookieStatus(null);
+    updateVimeoCookieStatus(null);  // Session 68
     $("#health-dot").className = "dot bad";
     $("#health-txt").textContent = "Server unreachable";
     $("#health-detail").textContent = "The backend did not respond. Check that the Docker container is running on the PlexServer.";
@@ -502,6 +659,7 @@ function renderChannels(){
     <div class="chan" data-id="${c.id}">
       <div class="chan-head">
         <span class="chan-name">${esc(c.name)}</span>
+        <span class="badge dim" data-tip="Source ID — use in the per-source M3U URL: /channel/${c.id}/live.m3u">#${c.id}</span>
         <span class="badge type" data-tip="Where this source lives — detected automatically from its link.">${esc(c.channel_type)}</span>
         <span class="badge dim" data-tip="How many videos this source currently has in the Catalog.">${c.video_count} videos</span>
         ${c.locked ? `<span class="badge warn" data-tip="Locked: hidden from the TV and this page unless the PIN session is unlocked.">🔒 locked</span>` : ""}
@@ -509,6 +667,7 @@ function renderChannels(){
         <span class="tiny" data-tip="Last time this source was scraped, and how many new videos it found.">Last scrape: ${fmtDate(c.last_scraped_at)}${c.last_scrape_count!=null?` (+${c.last_scrape_count})`:""}</span>
       </div>
       <div class="chan-url">${esc(c.url)}</div>
+      <div class="chan-url" data-tip="Shuffle channel URL — paste into NostalgiaTV or SurfTV as a custom live channel. Each play gets a different video from this source." style="color:var(--accent);cursor:pointer;user-select:all" onclick="navigator.clipboard.writeText(this.textContent).then(()=>toast('Copied shuffle URL','ok'))">http://192.168.50.42:6868/channel/${c.id}/shuffle</div>
       <div class="chan-body">
         <label class="ctl" data-tip="ON = this source appears in feeds and scrapes. OFF = paused everywhere without deleting anything.">
           <span class="switch"><input type="checkbox" ${c.enabled?"checked":""} onchange="toggleEnabled(${c.id}, this.checked)"><span class="slider"></span></span> Enabled
@@ -525,6 +684,7 @@ function renderChannels(){
         </label>
         <div class="spacer"></div>
         <button class="btn small" onclick="scrapeChannel(${c.id}, this)" data-tip="Fetch this source's latest videos right now (up to 2000). Only new videos are added.">🔄 Scrape</button>
+        <button class="btn small" onclick="renameChannel(${c.id})" data-tip="Rename this source's display name. Cosmetic only — the URL and scraping are unaffected. Tip: prefix YouTube sources with 'YOUTUBE — ' so TiviMate shows which ones resolve live on play.">✏️ Rename</button>
         <button class="btn small" onclick="clearVideos(${c.id})" data-tip="Delete all of this source's videos from the Catalog. The source itself stays, and a fresh scrape will re-discover videos.">🧹 Clear Videos</button>
         <button class="btn small danger" onclick="deleteChannel(${c.id})" data-tip="Remove this source. You'll be asked whether to also delete its videos.">🗑️ Delete</button>
       </div>
@@ -568,6 +728,21 @@ window.setCategory = async (id, category)=>{
     const r = await api(`/channel/${id}/category`, {method:"PATCH", body: JSON.stringify({category})});
     toast(`"${r.name}" moved to ${r.category}.`, "ok");
     const c = channels.find(x=>x.id===id); if(c) c.category = r.category;
+  }catch(e){ loadChannels(); }
+};
+window.renameChannel = async (id)=>{
+  const c = channels.find(x=>x.id===id);
+  const current = c ? c.name : "";
+  const name = prompt("New name for this source:", current);
+  if (name === null) return;                 // cancelled
+  const trimmed = name.trim();
+  if (!trimmed) return toast("Name cannot be empty.", "err");
+  if (trimmed === current) return;           // unchanged
+  try{
+    const r = await api(`/channel/${id}/name`, {method:"PATCH", body: JSON.stringify({name: trimmed})});
+    toast(`Renamed "${r.old_name}" → "${r.name}".`, "ok");
+    if(c) c.name = r.name;
+    renderChannels();
   }catch(e){ loadChannels(); }
 };
 window.setTags = async (id, tags, quiet)=>{
@@ -732,46 +907,97 @@ window.stopDownload = async (id)=>{
   }catch(e){}
 };
 
-/* ---- Files on disk (Library) ---- */
+/* ---- Files on disk (Library) — Session 62 two-level gallery ----
+   Level 1: grid of folder cards (cover thumb, name, count, size).
+   Level 2: click a folder → Catalog-style vcard grid of just that folder's
+   files, with Play/Delete on each card and a type-to-filter box.
+   Only the active level is rendered, so thousands of files never hit the
+   DOM at once. Data comes from one /library scan, grouped client-side. */
+let libData = null;      // last /library response
+let libFolder = null;    // currently-open folder key, or null for folder view
+
 async function loadLibrary(){
   $("#lib-list").innerHTML = `<div class="empty">Scanning download folders…</div>`;
-  let data;
-  try{ data = await api("/library", {}, true); }
+  try{ libData = await api("/library", {}, true); }
   catch(e){ $("#lib-list").innerHTML = `<div class="empty">Couldn't scan the library.</div>`; return; }
-  const files = data.files || [];
-  const totalBytes = files.reduce((a,f)=>a+(f.size_bytes||0),0);
-  $("#lib-summary").textContent = `${files.length} files · ${(totalBytes/1073741824).toFixed(1)} GB total` + (token?"" : " (Private/ hidden while locked)");
-  if(!files.length){ $("#lib-list").innerHTML = `<div class="empty">No downloaded files yet. Use a Channel Downloader above, or Save individual videos from the Catalog.</div>`; return; }
-  // group by folder (first two path parts, e.g. Public/12_ChannelName)
+  renderLibrary();
+}
+
+function libGroups(){
   const groups = {};
-  for (const f of files){
+  for (const f of (libData?.files || [])){
     const parts = (f.relative_path||"").split("/");
     const key = parts.length > 1 ? parts.slice(0, parts.length-1).join("/") : "(root)";
     (groups[key] = groups[key] || []).push(f);
   }
-  let html = "";
-  for (const key of Object.keys(groups).sort()){
-    const g = groups[key];
-    const gb = g.reduce((a,f)=>a+(f.size_bytes||0),0)/1073741824;
-    html += `<div class="folder-head">📁 ${esc(key)} <span class="badge dim">${g.length} files · ${gb.toFixed(1)} GB</span></div>`;
-    html += g.map(f=>`
-      <div class="filerow">
-        <div class="fthumb" style="${f.thumbnail_url?`background-image:url('${esc(f.thumbnail_url)}')`:""}"></div>
-        <div class="fmeta">
-          <div class="t">${esc(f.title||f.filename)}</div>
-          <div class="tiny">${esc(f.size_human||"")} · ${f.modified_at?new Date(f.modified_at*1000).toLocaleDateString():""}</div>
-        </div>
-        <button class="btn small" onclick="playFile('${esc(encodeURIComponent(f.stream_url))}','${esc((f.title||f.filename).replace(/'/g,""))}')" data-tip="Play this file right here in the browser, streamed from the NAS.">▶ Play</button>
-        <button class="btn small danger" onclick="deleteFile('${esc(encodeURIComponent(f.relative_path))}')" data-tip="Delete this file from the NAS. It's also added to the skip list so scrapes won't bring it back.">🗑️</button>
-      </div>`).join("");
-  }
-  $("#lib-list").innerHTML = html;
+  return groups;
 }
+
+function renderLibrary(){
+  const files = libData?.files || [];
+  const totalBytes = files.reduce((a,f)=>a+(f.size_bytes||0),0);
+  $("#lib-summary").textContent = `${files.length} files · ${(totalBytes/1073741824).toFixed(1)} GB total` + (token?"" : " (Private/ hidden while locked)");
+  if(!files.length){ $("#lib-list").innerHTML = `<div class="empty">No downloaded files yet. Use a Channel Downloader above, or Save individual videos from the Catalog.</div>`; return; }
+
+  const groups = libGroups();
+  const keys = Object.keys(groups).sort();
+  if (libFolder && !groups[libFolder]) libFolder = null; // folder emptied out — back to folder view
+
+  if (!libFolder){
+    // ---- Level 1: folder cards ----
+    $("#lib-list").innerHTML = `<div class="vgrid">` + keys.map(key=>{
+      const g = groups[key];
+      const gb = g.reduce((a,f)=>a+(f.size_bytes||0),0)/1073741824;
+      const cover = (g.find(f=>f.thumbnail_url)||{}).thumbnail_url;
+      return `
+      <div class="vcard" style="cursor:pointer" onclick="openLibFolder('${esc(encodeURIComponent(key))}')" data-tip="Open this folder to browse, play, or delete its files.">
+        <div class="vthumb" style="${cover?`background-image:url('${esc(cover)}')`:""}"><span class="badge dim stat">${g.length}</span></div>
+        <div class="vbody">
+          <div class="vtitle">📁 ${esc(key)}</div>
+          <div class="tiny">${g.length} files · ${gb.toFixed(1)} GB</div>
+        </div>
+      </div>`;
+    }).join("") + `</div>`;
+    return;
+  }
+
+  // ---- Level 2: one folder, gallery grid ----
+  const g = groups[libFolder];
+  const gb = g.reduce((a,f)=>a+(f.size_bytes||0),0)/1073741824;
+  $("#lib-list").innerHTML = `
+    <div class="folder-head" style="margin-top:0">
+      <button class="btn small" onclick="closeLibFolder()" data-tip="Back to the folder overview.">← All folders</button>
+      📁 ${esc(libFolder)} <span class="badge dim">${g.length} files · ${gb.toFixed(1)} GB</span>
+      <input id="lib-filter" placeholder="Filter files…" style="margin-left:auto;width:200px" oninput="libFilterApply(this.value)" data-tip="Type to narrow the cards below by title or filename.">
+    </div>
+    <div class="vgrid" id="lib-grid">` + g.map(f=>{
+      const name = f.title || f.filename;
+      return `
+      <div class="vcard" data-t="${esc(name.toLowerCase())}">
+        <div class="vthumb" style="${f.thumbnail_url?`background-image:url('${esc(f.thumbnail_url)}')`:""}"></div>
+        <div class="vbody">
+          <div class="vtitle">${esc(name)}</div>
+          <div class="tiny">${esc(f.size_human||"")} · ${f.modified_at?new Date(f.modified_at*1000).toLocaleDateString():""}</div>
+          <div style="display:flex;gap:6px;margin-top:auto">
+            <button class="btn small" onclick="playFile('${esc(encodeURIComponent(f.stream_url))}','${esc(name.replace(/'/g,""))}')" data-tip="Play this file right here in the browser, streamed from the NAS.">▶ Play</button>
+            <button class="btn small danger" onclick="deleteFile('${esc(encodeURIComponent(f.relative_path))}')" data-tip="Delete this file from the NAS. It's also added to the skip list so scrapes won't bring it back.">🗑️</button>
+          </div>
+        </div>
+      </div>`;
+    }).join("") + `</div>`;
+}
+
+window.openLibFolder = (encKey)=>{ libFolder = decodeURIComponent(encKey); renderLibrary(); };
+window.closeLibFolder = ()=>{ libFolder = null; renderLibrary(); };
+window.libFilterApply = (q)=>{
+  q = (q||"").toLowerCase();
+  $$("#lib-grid .vcard").forEach(c=>{ c.style.display = (!q || (c.dataset.t||"").includes(q)) ? "" : "none"; });
+};
 $("#lib-refresh").onclick = loadLibrary;
 $("#gen-thumbs").onclick = async function(){
   this.disabled = true;
   try{
-    const r = await api("/library/generate-thumbnails?limit=20", {method:"POST"});
+    const r = await api("/library/generate-thumbnails?limit=200", {method:"POST"});
     toast(r.message || "Thumbnail pass finished.", "ok"); loadLibrary();
   }catch(e){}
   this.disabled = false;
@@ -790,7 +1016,18 @@ window.deleteFile = async (encPath)=>{
   if(!ok) return;
   try{
     await api(`/library/file?relative_path=${encodeURIComponent(rel)}`, {method:"DELETE"});
-    toast("File deleted and skip-listed.", "ok"); loadLibrary();
+    toast("File deleted and skip-listed.", "ok");
+    // Session 62: update in place — drop the file from the in-memory list and
+    // re-render, so you stay inside the folder you're curating (filter text
+    // preserved) instead of being bounced back by a full rescan.
+    if (libData && libData.files){
+      libData.files = libData.files.filter(f=>f.relative_path !== rel);
+      const q = $("#lib-filter") ? $("#lib-filter").value : "";
+      renderLibrary();
+      if (q && $("#lib-filter")){ $("#lib-filter").value = q; libFilterApply(q); }
+    } else {
+      loadLibrary();
+    }
   }catch(e){}
 };
 
@@ -815,7 +1052,9 @@ async function loadFeed(reset){
   const p = new URLSearchParams({limit: 60, offset: feedOffset});
   if ($("#f-channel").value)  p.set("channel_id", $("#f-channel").value);
   if ($("#f-category").value) p.set("category", $("#f-category").value);
-  if ($("#f-status").value)   p.set("status", $("#f-status").value);
+  const stv = $("#f-status").value;
+  if (stv === "problems") p.set("problems", "true");
+  else if (stv)           p.set("status", stv);
   try{
     const data = await api("/feed?" + p.toString(), {}, true);
     feedVideos = reset ? (data.videos||[]) : feedVideos.concat(data.videos||[]);
@@ -834,13 +1073,15 @@ function renderFeed(){
   if (!vids.length){ $("#feed-grid").innerHTML = `<div class="empty">No videos match. Try scraping your sources, or loosen the filters.</div>`; return; }
   $("#feed-grid").innerHTML = vids.map(v=>{
     const st = v.resolution_status;
+    const srcIcon = v.source_provider==="local_folder" ? `<span class="badge dim stat" style="left:6px;right:auto" data-tip="Local file — use 📁 Local Thumbnails button for these.">📁 local</span>` : "";
     const badge = st==="resolved" ? `<span class="badge good stat" data-tip="Ready to stream — the real video link is resolved and cached.">resolved</span>`
-      : st==="failed" ? `<span class="badge bad stat" data-tip="The last attempt to resolve this video's stream failed: ${esc(v.resolution_error||"unknown error")}">failed</span>`
+      : st==="failed" ? `<span class="badge bad stat" data-tip="Legacy failed status. Last error: ${esc(v.resolution_error||"unknown error")}. Try ⚡ to retry, or 🚫 to remove it for good.">failed</span>`
+      : v.resolution_error ? `<span class="badge warn stat" data-tip="Still pending, but the last attempt errored: ${esc(v.resolution_error)}. It retries automatically — or ⚡ to retry now, 🚫 to remove for good.">problem</span>`
       : `<span class="badge dim stat" data-tip="Not resolved yet — the stream link gets looked up on demand or via batch resolve.">pending</span>`;
-    const thumb = v.thumbnail_url ? `background-image:url('${esc(v.thumbnail_url)}')` : "";
+    const thumb = v.thumbnail_url && v.thumbnail_url !== "unavailable" ? `background-image:url('${esc(v.thumbnail_url)}')` : "";
     return `
     <div class="vcard">
-      <div class="vthumb" style="${thumb}">${badge}</div>
+      <div class="vthumb" style="${thumb}">${badge}${srcIcon}</div>
       <div class="vbody">
         <div class="vtitle" title="${esc(v.title)}">${esc(v.title||"Untitled")}</div>
         <div class="tiny">${esc(v.artist||"")}</div>
@@ -869,12 +1110,21 @@ window.resolveVideo = async (id, btn)=>{
     const r = await api(`/resolve/${id}?force=true`, {}, false);
     if (r && r.stream_url){
       toast("Resolved — ready to stream.", "ok");
-      const v = feedVideos.find(x=>x.id===id); if(v) v.resolution_status = "resolved";
+      const v = feedVideos.find(x=>x.id===id); if(v){ v.resolution_status = "resolved"; v.resolution_error = null; }
       renderFeed();
     } else {
       toast("Resolve finished, but no stream link came back.", "err");
     }
-  }catch(e){}
+  }catch(e){
+    // 410 Gone = the source is permanently dead and the backend auto-deleted
+    // the record (the toast from api() already said so). Remove the card
+    // immediately instead of leaving a ghost that errors on every click.
+    if (e && e.status === 410){
+      feedVideos = feedVideos.filter(v=>v.id!==id);
+      renderFeed();
+    }
+    // 503 = transient; api() already showed the "stays in catalog" message.
+  }
   btn.disabled = false;
 };
 window.favVideo = async (id)=>{
@@ -955,17 +1205,199 @@ window.removeFav = async (id)=>{
 
 /* ---------------- SETTINGS page ---------------- */
 $("#health-refresh").onclick = refreshHealth;
+
+/* ---------- Background Scheduler dashboard (Session 63) ---------- */
+function agoText(iso){
+  if (!iso) return "never";
+  const s = Math.max(0, (Date.now() - new Date(iso).getTime())/1000);
+  if (s < 90) return Math.round(s) + "s ago";
+  if (s < 5400) return Math.round(s/60) + " min ago";
+  return Math.round(s/3600) + " h ago";
+}
+function inText(iso){
+  if (!iso) return "—";
+  const s = (new Date(iso).getTime() - Date.now())/1000;
+  if (s <= 5) return "any moment";
+  if (s < 90) return "in " + Math.round(s) + "s";
+  if (s < 5400) return "in " + Math.round(s/60) + " min";
+  return "in " + (s/3600).toFixed(1) + " h";
+}
+async function refreshScheduler(){
+  try{
+    const d = await api("/health/scheduler", {}, true);
+    const jobs = d.jobs || [];
+    if (!jobs.length){
+      $("#sched-jobs").innerHTML = `<div class="empty">Scheduler isn't running.</div>`;
+      return;
+    }
+    $("#sched-jobs").innerHTML = jobs.map(j=>{
+      const dot = j.running ? `<span class="dot spin" data-tip="Running right now."></span>`
+        : j.last_error ? `<span class="dot bad" data-tip="Last run errored."></span>`
+        : `<span class="dot good" data-tip="Idle — last run OK."></span>`;
+      const last = j.last_end
+        ? `${agoText(j.last_end)}${j.last_duration_seconds!=null ? " · took " + j.last_duration_seconds + "s" : ""}`
+        : (j.running ? "running…" : "not yet run");
+      const result = j.last_error
+        ? `<div class="jerr">⚠ ${esc(j.last_error)}</div>`
+        : `<div class="jresult">${esc(j.last_result || "—")}</div>`;
+      return `<div class="jobrow">
+        ${dot}
+        <div class="jname">${esc(j.name)}</div>
+        <div class="jinfo">
+          <div class="jresult" style="color:var(--text)">${esc(last)}</div>
+          ${result}
+        </div>
+        <div class="jnext">next: ${inText(j.next_run)}</div>
+        <button class="btn small" onclick="runJobNow('${j.id}', this)" data-tip="Run this job right now. Its regular schedule continues unchanged.">▶ Run Now</button>
+      </div>`;
+    }).join("");
+  }catch(e){
+    $("#sched-jobs").innerHTML = `<div class="empty">Couldn't reach the scheduler status endpoint.</div>`;
+  }
+  refreshYtBg();
+}
+window.runJobNow = async (jobId, btn)=>{
+  btn.disabled = true;
+  try{
+    const r = await api(`/health/scheduler/run/${jobId}`, {method:"POST"});
+    toast(r.message || "Job triggered.", "ok");
+    setTimeout(refreshScheduler, 1200);
+  }catch(e){}
+  btn.disabled = false;
+};
+async function refreshYtBg(){
+  try{
+    const s = await api("/resolve/youtube-background", {}, true);
+    const on = !!s.youtube_background_resolve_enabled;
+    $("#ytbg-state").textContent = "YouTube background resolving: " + (on ? "ON (burns cookie requests)" : "OFF — resolves on play (recommended)");
+    const b = $("#ytbg-toggle");
+    b.style.display = "";
+    b.textContent = on ? "Turn Off" : "Turn On";
+    b.onclick = async ()=>{
+      b.disabled = true;
+      try{
+        const r = await api(`/resolve/youtube-background?enabled=${!on}`, {method:"POST"});
+        toast(r.message || "Switch updated.", "ok");
+      }catch(e){}
+      b.disabled = false;
+      refreshYtBg();
+    };
+  }catch(e){ $("#ytbg-state").textContent = "YouTube background resolving: unknown"; }
+}
+$("#sched-refresh").onclick = refreshScheduler;
+setInterval(()=>{
+  const pg = $("#page-settings");
+  if (pg && pg.classList.contains("show")) refreshScheduler();
+}, 10000);
+$("#yt-pause-btn").onclick = async function(){
+  const isPaused = this.textContent.trim().startsWith("▶");
+  this.disabled = true;
+  try {
+    if (isPaused) {
+      // Cancel the pause
+      const r = await api("/resolve/youtube-pause", {method:"DELETE"});
+      toast("YouTube extractions resumed.", "ok");
+      updateYtPause(r);
+    } else {
+      // Activate the pause
+      const r = await api("/resolve/youtube-pause", {method:"POST"});
+      toast("YouTube paused for 70 minutes — the backend won't touch YouTube until the timer expires.", "ok");
+      updateYtPause(r);
+    }
+  } catch(e) {
+    toast("Could not update YouTube pause state.", "bad");
+  }
+  this.disabled = false;
+};
+const cookieStaleResumeBtn = $("#cookie-stale-resume-btn");
+if (cookieStaleResumeBtn){
+  cookieStaleResumeBtn.onclick = async function(){
+    this.disabled = true;
+    try {
+      await api("/resolve/cookie-stale", {method:"DELETE"});
+      toast("Cookie-stale pause cleared — YouTube resolves resumed.", "ok");
+      await refreshHealth();
+    } catch(e) {
+      toast("Could not clear the cookie-stale pause.", "bad");
+    }
+    this.disabled = false;
+  };
+}
 async function refreshSkipCount(){
   try{ const r = await api("/skip/count", {}, true); $("#skip-count").textContent = r.skip_list_count != null ? r.skip_list_count : "?"; }catch(e){ $("#skip-count").textContent = "?"; }
 }
-$("#m-reset-failed").onclick = async function(){ this.disabled=true; try{ const r=await api("/resolve/reset-failed",{method:"POST"}); toast(r.message||"Failed videos reset to pending.","ok"); }catch(e){} this.disabled=false; };
 $("#m-backfill").onclick   = async function(){ this.disabled=true; try{ const r=await api("/resolve/backfill-thumbnails",{method:"POST"}); toast(r.message||"Thumbnail backfill finished.","ok"); }catch(e){} this.disabled=false; };
-$("#m-purge-dead").onclick = async function(){
-  const ok = await confirmBox("Purge dead links?", "This checks for videos whose source no longer exists and removes them from the Catalog.", "Purge", true);
+$("#m-local-thumbs").onclick = async function(){ this.disabled=true; try{ const r=await api("/library/generate-thumbnails?limit=200",{method:"POST"}); toast(r.message||"Local thumbnail generation finished.","ok"); }catch(e){} this.disabled=false; };
+$("#m-purge-missing").onclick = async function(){
+  const ok = await confirmBox("Purge missing files?", "This scans all local video records and removes any whose files no longer exist on disk. Downloaded/moved files won't come back.", "Purge", true);
   if(!ok) return; this.disabled=true;
-  try{ const r=await api("/resolve/purge-dead",{method:"POST"}); toast(r.message||"Dead links purged.","ok"); }catch(e){} this.disabled=false;
+  try{ const r=await api("/library/purge-missing-files",{method:"POST"}); toast(r.message||"Missing files purged.","ok"); }catch(e){} this.disabled=false;
 };
 $("#m-purge-dupes").onclick = async function(){ this.disabled=true; try{ const r=await api("/resolve/purge-duplicates",{method:"POST"}); toast(r.message||"Duplicates purged.","ok"); }catch(e){} this.disabled=false; };
+
+$("#m-purge-403").onclick = async function(){
+  this.disabled = true;
+  try{
+    // Step 1: dry-run count — nothing is touched.
+    const preview = await api("/resolve/purge-vimeo-403?dry_run=true", {method:"POST"});
+    if (!preview.count){
+      toast("No dead Vimeo 403 videos found — the resolve queue is clean.", "ok");
+      return;
+    }
+    // Step 2: confirm with the exact count before anything is destroyed.
+    const ok = await confirmBox(
+      `Purge ${preview.count} dead Vimeo video${preview.count===1?"":"s"}?`,
+      `These are stuck pending with a 403 error (private, restricted, or deleted on Vimeo) and are blocking the resolve queue. They'll be skip-listed so they can't be re-imported. Don't do this during an active Vimeo IP block — 403 then means Vimeo is blocking you, not that the videos are dead. This can't be undone.`,
+      "Purge Vimeo 403s", true);
+    if(!ok) return;
+    // Step 3: the real purge.
+    const r = await api("/resolve/purge-vimeo-403", {method:"POST"});
+    toast(r.message || "Purged.", "ok");
+  }catch(e){}
+  finally{ this.disabled = false; }
+};
+// Session 68 — Vimeo-404 verify-then-purge (two-button flow: verify live, review, purge).
+$("#m-verify-404").onclick = async function(){
+  const btn = this, prog = $("#v404-progress");
+  btn.disabled = true;
+  try{
+    // Step 1: start (or join) the background live-verification job.
+    let s = await api("/resolve/vimeo-404-verify", {method:"POST"});
+    if (s.state === "verifying" || s.status === "started" || s.status === "already_running"){
+      toast("Live-checking each stuck Vimeo video against Vimeo right now — this takes a minute or two.", "ok");
+    }
+    // Step 2: poll until the job settles.
+    while (true){
+      await new Promise(r => setTimeout(r, 3000));
+      s = await api("/resolve/vimeo-404-status", {});
+      if (s.state === "verifying"){
+        prog.textContent = s.total ? ` (${s.progress}/${s.total})` : " (…)";
+        continue;
+      }
+      break;
+    }
+    prog.textContent = "";
+    if (s.state === "error"){
+      toast(s.error || "Verification failed — nothing was judged or deleted.", "err");
+      return;
+    }
+    if (!s.confirmed_dead){
+      const extra = s.healthy ? ` ${s.healthy} had stale errors but are alive — left alone.` : "";
+      toast(`No confirmed-dead Vimeo videos.${extra}`, "ok");
+      return;
+    }
+    // Step 3: review + confirm with exact counts before anything is destroyed.
+    const ok = await confirmBox(
+      `Purge ${s.confirmed_dead} confirmed-dead Vimeo video${s.confirmed_dead===1?"":"s"}?`,
+      `Each of these was just re-checked live against Vimeo with your account cookies and got a fresh 404 — they no longer exist there. ${s.healthy?`${s.healthy} other video${s.healthy===1?" was":"s were"} found alive and will NOT be touched. `:""}${s.unverified?`${s.unverified} couldn't be verified and will NOT be touched. `:""}Purged videos are skip-listed so they can't be re-imported. This can't be undone.`,
+      "Purge Confirmed Dead", true);
+    if(!ok) return;
+    // Step 4: the real purge (server re-guards freshness).
+    const r = await api("/resolve/vimeo-404-purge", {method:"POST"});
+    toast(`Removed ${r.total_removed||0} dead Vimeo video${(r.total_removed||0)===1?"":"s"}. Run Resolve 25 Pending to keep the queue moving.`, "ok");
+  }catch(e){}
+  finally{ btn.disabled = false; prog.textContent = ""; }
+};
 $("#m-skip-clear").onclick = async ()=>{
   const ok = await confirmBox("Clear the skip list?", "Every video you've ever skipped may reappear on the next scrape. This can't be undone.", "Clear Skip List", true);
   if(!ok) return;

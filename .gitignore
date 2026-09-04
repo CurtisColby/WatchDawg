@@ -41,3 +41,13 @@ docker-compose.override.yml
 Thumbs.db
 cookies.txt
 app/routers/xtream.py
+
+# Backup files
+*.bak
+*.bak2
+*.bak3
+*.bak-*
+*.pre-*
+*.old
+config/*_cookies.txt
+config/reddit_cookies.txt

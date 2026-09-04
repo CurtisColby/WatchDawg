@@ -17,10 +17,16 @@ Endpoints:
 - GET    /library/stream/{filename:path}    — Stream a local file (range-capable).
 - GET    /library/thumb/{filename:path}     — Serve a generated thumbnail jpg.
 - POST   /library/generate-thumbnails       — ffmpeg frame-grab for unmatched files.
+- POST   /library/purge-missing-files       — Remove local_folder records whose files
+                                              are gone from disk (Session 63: now also
+                                              cleans linked Favorite/WatchHistory/
+                                              Watchlist rows and refuses to run if the
+                                              downloads mount looks absent).
 - DELETE /library/file                      — Delete file + add to skip list.
 """
 
 import asyncio
+import datetime
 import logging
 import os
 import subprocess
@@ -33,7 +39,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db_session
-from app.models import Favorite, Video, SkipListEntry
+from app.models import Favorite, Video, SkipListEntry, WatchHistory, Watchlist
 from app.config import settings
 from app.encryption import encrypt_value
 from app.hashing import hmac_hash
@@ -46,6 +52,17 @@ router = APIRouter(prefix="/library", tags=["library"])
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".m4v", ".avi", ".mov"}
 THUMB_SUFFIX = ".watchdawg_thumb.jpg"
 FFMPEG_GRAB_SECOND = 5
+
+# Session 64: permanent-failure marker sidecar. Written next to a video file
+# only after BOTH thumbnail attempts fail (the -ss seek grab AND the frame-0
+# retry). Both generate-thumbnails passes skip any file that has one, killing
+# the retry-forever loop where the same unreadable file was re-attempted every
+# scheduled tick. The marker contains the ffmpeg error text + timestamp, so
+# diagnosing a stubborn file is `cat file.mp4.watchdawg_thumbfail.txt`.
+# Deleting the marker re-enables retry — no endpoint, no code, just rm.
+# The .txt extension keeps markers invisible to the library scan (which
+# filters by VIDEO_EXTENSIONS), same as the .jpg thumbnail sidecars.
+THUMBFAIL_SUFFIX = ".watchdawg_thumbfail.txt"
 
 
 def _human_size(size_bytes: int) -> str:
@@ -70,10 +87,45 @@ def _thumb_path_for(video_path: str) -> str:
     return video_path + THUMB_SUFFIX
 
 
-def _generate_thumb_sync(video_path: str, thumb_path: str) -> bool:
-    cmd = [
-        "ffmpeg",
-        "-ss", str(FFMPEG_GRAB_SECOND),
+def _thumbfail_path_for(video_path: str) -> str:
+    return video_path + THUMBFAIL_SUFFIX
+
+
+def _has_thumbfail_marker(video_path: str) -> bool:
+    """True if this file has already permanently failed thumbnail generation."""
+    return os.path.isfile(_thumbfail_path_for(video_path))
+
+
+def _write_thumbfail_marker(video_path: str, error_text: str) -> None:
+    """
+    Record a permanent thumbnail failure so the file is never retried.
+    Best-effort: a marker write failure (read-only mount, etc.) is logged
+    and swallowed — worst case the file just gets retried next tick,
+    which is exactly the old behaviour.
+    """
+    try:
+        with open(_thumbfail_path_for(video_path), "w", encoding="utf-8") as f:
+            f.write(
+                f"WatchDawg thumbnail generation permanently failed.\n"
+                f"Timestamp (UTC): {datetime.datetime.utcnow().isoformat()}\n"
+                f"Both attempts failed (seek to {FFMPEG_GRAB_SECOND}s, then frame 0).\n"
+                f"Delete this file to allow a retry.\n\n"
+                f"--- last ffmpeg error ---\n{error_text}\n"
+            )
+        logger.warning(f"Thumbfail marker written: {_thumbfail_path_for(video_path)}")
+    except Exception as e:
+        logger.warning(f"Could not write thumbfail marker for {video_path}: {e}")
+
+
+def _run_ffmpeg_grab(video_path: str, thumb_path: str, seek_second: Optional[int]) -> tuple[bool, str]:
+    """
+    Single ffmpeg frame-grab attempt. seek_second=None grabs frame 0 (no -ss).
+    Returns (success, error_text).
+    """
+    cmd = ["ffmpeg"]
+    if seek_second is not None:
+        cmd += ["-ss", str(seek_second)]
+    cmd += [
         "-i", video_path,
         "-frames:v", "1",
         "-q:v", "4",
@@ -83,19 +135,51 @@ def _generate_thumb_sync(video_path: str, thumb_path: str) -> bool:
     ]
     try:
         result = subprocess.run(cmd, capture_output=True, timeout=30)
-        if result.returncode == 0 and os.path.isfile(thumb_path):
-            return True
-        logger.warning(
-            f"ffmpeg failed for {video_path}: "
-            f"{result.stderr.decode(errors='replace')[:200]}"
-        )
-        return False
+        if result.returncode == 0 and os.path.isfile(thumb_path) and os.path.getsize(thumb_path) > 0:
+            return True, ""
+        return False, result.stderr.decode(errors="replace")[-500:]
     except subprocess.TimeoutExpired:
-        logger.warning(f"ffmpeg timed out for {video_path}")
-        return False
+        return False, "ffmpeg timed out (30s)"
     except Exception as e:
-        logger.warning(f"ffmpeg error for {video_path}: {e}")
-        return False
+        return False, f"ffmpeg error: {e}"
+
+
+def _generate_thumb_sync(video_path: str, thumb_path: str) -> bool:
+    """
+    Generate a thumbnail with a two-attempt strategy (Session 64):
+
+    1. Seek to FFMPEG_GRAB_SECOND and grab a frame — mid-clip frames make
+       better thumbnails than frame 0 for normal-length videos.
+    2. If that fails, retry at frame 0 (no seek). Root cause of the old
+       retry-forever loop: many Reddit clips are SHORTER than the seek
+       point, so -ss seeked past EOF, ffmpeg encoded zero frames and
+       errored, and the same healthy files failed every scheduled tick.
+       Frame 0 always exists, so this attempt succeeds for every readable
+       file regardless of duration.
+    3. If BOTH fail the file is genuinely unreadable — write a thumbfail
+       marker sidecar so neither pass ever retries it, and clean up any
+       zero-byte partial output.
+    """
+    ok, _ = _run_ffmpeg_grab(video_path, thumb_path, FFMPEG_GRAB_SECOND)
+    if ok:
+        return True
+
+    ok, err = _run_ffmpeg_grab(video_path, thumb_path, None)
+    if ok:
+        logger.info(f"Thumbnail grabbed at frame 0 (clip shorter than {FFMPEG_GRAB_SECOND}s?): {video_path}")
+        return True
+
+    # Both attempts failed — remove any empty partial file ffmpeg left behind
+    # (a zero-byte .jpg would make both passes think a thumbnail exists).
+    try:
+        if os.path.isfile(thumb_path) and os.path.getsize(thumb_path) == 0:
+            os.remove(thumb_path)
+    except Exception:
+        pass
+
+    logger.warning(f"ffmpeg failed for {video_path} (both attempts): {err[:200]}")
+    _write_thumbfail_marker(video_path, err)
+    return False
 
 
 @router.get("")
@@ -189,12 +273,26 @@ async def list_library(
             path_parts = relative_path.split(os.sep)
             subfolder = path_parts[0] if len(path_parts) > 1 else ""
 
+            # Session 62: locally-generated sidecar thumbnails are preferred
+            # for ALL files — matched and unmatched. Previously the sidecar
+            # check only ran for files WITHOUT a DB record, so Reddit
+            # auto-downloads (which always have one) could never display a
+            # generated thumbnail: they were stuck with whatever Reddit
+            # provided at scrape time — often nothing. Disk sidecar first
+            # (local, always loads), DB-provided URL as the fallback.
+            thumb_path = _thumb_path_for(full_path)
+            if os.path.isfile(thumb_path):
+                thumb_rel = os.path.relpath(thumb_path, downloads_dir)
+                sidecar_url = f"/library/thumb/{urllib.parse.quote(thumb_rel, safe='/')}"
+            else:
+                sidecar_url = None
+
             match = known_files.get(full_path)
             if match:
                 fav, video = match
                 title = video.title
                 artist = video.artist
-                thumbnail_url = video.thumbnail_url
+                thumbnail_url = sidecar_url or video.thumbnail_url
                 favorite_id = fav.id
                 video_id = video.id
                 # Session 42: include channel genre_tags for pill filtering
@@ -208,12 +306,7 @@ async def list_library(
                 video_id = None
                 genre_tags = ""
                 channel_name = ""
-                thumb_path = _thumb_path_for(full_path)
-                if os.path.isfile(thumb_path):
-                    thumb_rel = os.path.relpath(thumb_path, downloads_dir)
-                    thumbnail_url = f"/library/thumb/{urllib.parse.quote(thumb_rel, safe='/')}"
-                else:
-                    thumbnail_url = None
+                thumbnail_url = sidecar_url
 
             # Session 42: apply genre filter if provided
             if genre and genre_tags:
@@ -310,45 +403,222 @@ async def list_library_genres(
 @router.post("/generate-thumbnails")
 async def generate_thumbnails(
     limit: int = Query(20, ge=1, le=200, description="Max files to process per run"),
+    db: AsyncSession = Depends(get_db_session),
 ):
-    """Generate thumbnail images for library files that have no thumbnail."""
+    """Generate thumbnail images for library files that have no thumbnail.
+
+    Two passes, sharing one per-run limit:
+
+    Pass 1 (DB-driven, unchanged): Video records with
+    source_provider='local_folder' and no thumbnail_url — runs ffmpeg
+    frame-grab and writes the /library/thumb/... URL back to the record so
+    the Catalog page can display it immediately.
+
+    Pass 2 (Session 62, filesystem walk): any video file in the download
+    folders that lacks a sidecar thumbnail — Reddit auto-downloads, bulk
+    channel downloads, Save-button downloads. No DB write-back needed: the
+    Files on Disk listing prefers sidecar thumbnails for every file
+    (Session 62 listing fix), so generated thumbnails appear on the next
+    page load.
+    """
+    from sqlalchemy import or_
+
     downloads_dir = settings.downloads_path
-    if not os.path.isdir(downloads_dir):
-        return {"status": "error", "detail": "Library directory not found"}
 
-    candidates = []
-    for dirpath, _dirnames, filenames in os.walk(downloads_dir):
-        for filename in filenames:
-            if filename.endswith(THUMB_SUFFIX):
-                continue
-            _, ext = os.path.splitext(filename)
-            if ext.lower() not in VIDEO_EXTENSIONS:
-                continue
-            full_path = os.path.join(dirpath, filename)
-            thumb_path = _thumb_path_for(full_path)
-            if not os.path.isfile(thumb_path):
-                candidates.append((full_path, thumb_path))
-            if len(candidates) >= limit:
+    # Find local_folder videos missing thumbnails — DB is the source of truth.
+    stmt = (
+        select(Video)
+        .where(
+            Video.source_provider == "local_folder",
+            or_(Video.thumbnail_url.is_(None), Video.thumbnail_url == ""),
+        )
+        .order_by(Video.id.asc())
+        .limit(limit)
+    )
+    result = await db.execute(stmt)
+    videos = result.scalars().all()
+
+    summary = {"total": len(videos), "generated": 0, "failed": 0, "skipped": 0}
+
+    for video in videos:
+        video_path = video.source_url  # absolute path e.g. /watchdawg/Private/Folder/file.mp4
+        if not video_path or not os.path.isfile(video_path):
+            summary["skipped"] += 1
+            logger.warning(f"Local thumb: file not found for video {video.id}: {video_path}")
+            continue
+
+        # Session 64: permanently-failed files are never retried. Delete the
+        # .watchdawg_thumbfail.txt marker next to the file to force a retry.
+        if _has_thumbfail_marker(video_path):
+            summary["skipped"] += 1
+            continue
+
+        thumb_path = _thumb_path_for(video_path)
+
+        # If sidecar already exists on disk, just update the DB record.
+        if os.path.isfile(thumb_path):
+            thumb_rel = os.path.relpath(thumb_path, downloads_dir)
+            video.thumbnail_url = f"/library/thumb/{urllib.parse.quote(thumb_rel, safe='/')}"
+            summary["generated"] += 1
+            continue
+
+        success = await asyncio.to_thread(_generate_thumb_sync, video_path, thumb_path)
+        if success:
+            thumb_rel = os.path.relpath(thumb_path, downloads_dir)
+            video.thumbnail_url = f"/library/thumb/{urllib.parse.quote(thumb_rel, safe='/')}"
+            summary["generated"] += 1
+            logger.info(f"Generated thumbnail: video {video.id} -> {thumb_path}")
+        else:
+            summary["failed"] += 1
+        await asyncio.sleep(0.1)
+
+    await db.commit()
+
+    # ------------------------------------------------------------------
+    # Pass 2 (Session 62): walk the download folders and generate sidecar
+    # thumbnails for ANY video file that lacks one. This is what covers
+    # Reddit auto-downloads and bulk channel downloads — their DB records
+    # are keyed by post/source, not file path, so the DB-driven pass above
+    # never sees them. Shares the same per-run limit budget with pass 1.
+    # ------------------------------------------------------------------
+    remaining = limit - summary["total"]
+    walk_candidates = []
+    if remaining > 0 and os.path.isdir(downloads_dir):
+        for dirpath, _dirnames, filenames in os.walk(downloads_dir):
+            for filename in sorted(filenames):
+                if filename.endswith(THUMB_SUFFIX) or filename.endswith(THUMBFAIL_SUFFIX):
+                    continue
+                _, ext = os.path.splitext(filename)
+                if ext.lower() not in VIDEO_EXTENSIONS:
+                    continue
+                full_path = os.path.join(dirpath, filename)
+                # Session 64: skip permanently-failed files (thumbfail marker).
+                if _has_thumbfail_marker(full_path):
+                    continue
+                walk_thumb = _thumb_path_for(full_path)
+                if not os.path.isfile(walk_thumb):
+                    walk_candidates.append((full_path, walk_thumb))
+                if len(walk_candidates) >= remaining:
+                    break
+            if len(walk_candidates) >= remaining:
                 break
-        if len(candidates) >= limit:
-            break
 
-    summary = {"total": len(candidates), "generated": 0, "failed": 0}
-
-    for video_path, thumb_path in candidates:
+    summary["total"] += len(walk_candidates)
+    for video_path, thumb_path in walk_candidates:
         success = await asyncio.to_thread(_generate_thumb_sync, video_path, thumb_path)
         if success:
             summary["generated"] += 1
-            logger.info(f"Generated thumbnail: {thumb_path}")
+            logger.info(f"Generated sidecar thumbnail: {thumb_path}")
         else:
             summary["failed"] += 1
         await asyncio.sleep(0.1)
 
     logger.info(
         f"Thumbnail generation complete: {summary['generated']} generated, "
-        f"{summary['failed']} failed out of {summary['total']}"
+        f"{summary['failed']} failed, {summary['skipped']} skipped "
+        f"out of {summary['total']} "
+        f"(pass 2 folder walk: {len(walk_candidates)} candidates)"
     )
     return {"status": "complete", "summary": summary}
+
+
+async def _delete_video_children(db: AsyncSession, video_id: int) -> None:
+    """
+    Delete Favorite / WatchHistory / Watchlist rows linked to a video before
+    the video row itself is deleted. (Session 63)
+
+    Why explicit deletes: WatchHistory and Watchlist declare ondelete=CASCADE,
+    but SQLite only honors CASCADE when PRAGMA foreign_keys=ON — which this
+    app never sets — so at runtime those clauses do nothing. Favorite has no
+    CASCADE at all. Raw db.delete(video) therefore strands child rows, and
+    because SQLite reuses rowids, an orphaned watch_history row could later
+    attach to a completely unrelated new video. Every delete path must clean
+    children explicitly.
+    """
+    for model in (Favorite, WatchHistory, Watchlist):
+        result = await db.execute(select(model).where(model.video_id == video_id))
+        for row in result.scalars().all():
+            await db.delete(row)
+
+
+@router.post("/purge-missing-files")
+async def purge_missing_files(
+    db: AsyncSession = Depends(get_db_session),
+):
+    """Delete local_folder video records whose files no longer exist on disk.
+
+    Scans all local_folder videos, checks if the source_url path exists,
+    and deletes the DB record (plus any sidecar thumbnail and linked
+    Favorite/WatchHistory/Watchlist rows) for missing files. Prevents dead
+    records from clogging the thumbnail queue and catalog.
+
+    Safety guard (Session 63): if EVERY local file appears missing, the most
+    likely explanation is that the downloads volume isn't mounted (or the
+    path moved) — not that the entire library was deliberately deleted. In
+    that case the purge ABORTS without touching anything and says so, rather
+    than mass-deleting every local record over a missing mount.
+    """
+    stmt = select(Video).where(Video.source_provider == "local_folder")
+    result = await db.execute(stmt)
+    local_videos = result.scalars().all()
+
+    summary = {"checked": len(local_videos), "deleted": 0, "kept": 0}
+
+    # Phase 1 — scan only. Classify before deleting anything so the
+    # empty-mount guard can inspect the whole picture first.
+    missing: list = []
+    for video in local_videos:
+        if video.source_url and os.path.isfile(video.source_url):
+            summary["kept"] += 1
+        else:
+            missing.append(video)
+
+    # Empty-mount guard: everything missing (and there was something to
+    # check) almost certainly means the volume is absent, not the files.
+    if local_videos and len(missing) == len(local_videos):
+        logger.warning(
+            f"Purge missing files ABORTED: all {len(local_videos)} local "
+            f"records appear missing — downloads volume is probably not "
+            f"mounted. Nothing was deleted."
+        )
+        return {
+            "status": "aborted",
+            "summary": summary,
+            "message": (
+                f"Aborted: all {len(local_videos)} local files appear missing, "
+                f"which usually means the downloads folder isn't mounted. "
+                f"Nothing was deleted. If you really did remove every local "
+                f"file, delete the source channel instead."
+            ),
+        }
+
+    # Phase 2 — act on the genuinely missing records.
+    for video in missing:
+        # File is gone — clean up sidecar thumbnail if it exists
+        if video.source_url:
+            thumb_path = _thumb_path_for(video.source_url)
+            if os.path.isfile(thumb_path):
+                try:
+                    os.remove(thumb_path)
+                except OSError:
+                    pass
+
+        logger.info(f"Purging missing local file: video {video.id} ({video.source_url})")
+        await _delete_video_children(db, video.id)
+        await db.delete(video)
+        summary["deleted"] += 1
+
+    await db.commit()
+
+    logger.info(
+        f"Purge missing files complete: {summary['deleted']} deleted, "
+        f"{summary['kept']} kept out of {summary['checked']} checked"
+    )
+    return {
+        "status": "complete",
+        "summary": summary,
+        "message": f"Removed {summary['deleted']} local videos whose files no longer exist on disk.",
+    }
 
 
 @router.get("/thumb/{filename:path}")
@@ -373,7 +643,9 @@ async def delete_library_file(
     1. Validates path stays within downloads_path (no path traversal).
     2. Looks up the associated Video record via the Favorite link.
     3. Adds the video's source_post_id to the skip list.
-    4. Deletes the Favorite and Video DB records.
+    4. Deletes the Favorite, WatchHistory, Watchlist, and Video DB records
+       (children explicitly — SQLite never enforces CASCADE here, see
+       _delete_video_children).
     5. Deletes the actual file and any sidecar thumbnail from disk.
     """
     downloads_dir = settings.downloads_path
@@ -422,6 +694,7 @@ async def delete_library_file(
                 logger.info(f"Added {video.source_post_id} to skip list")
 
             await db.delete(favorite)
+            await _delete_video_children(db, video.id)
             await db.delete(video)
             video_deleted = True
             favorite_cleaned = True
@@ -442,6 +715,15 @@ async def delete_library_file(
         try:
             os.remove(thumb_path)
             logger.info(f"Deleted sidecar thumbnail: {thumb_path}")
+        except OSError:
+            pass
+
+    # Session 64: the thumbfail marker follows the file's lifecycle too.
+    fail_path = _thumbfail_path_for(real_path)
+    if os.path.isfile(fail_path):
+        try:
+            os.remove(fail_path)
+            logger.info(f"Deleted thumbfail marker: {fail_path}")
         except OSError:
             pass
 

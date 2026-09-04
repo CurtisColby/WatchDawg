@@ -142,6 +142,10 @@ async def get_feed(
     category: Optional[str] = Query(None, description="Filter by channel category (movies/tv/music/nature/adult/vimeo/general/live_tv)"),
     genre_tag: Optional[str] = Query(None, description="Filter by genre tag (e.g. 'Nature', 'Documentary'). Omit to return all genres."),
     status: Optional[str] = Query(None, description="Filter by resolution status"),
+    problems: bool = Query(False, description="Only videos with a recorded resolution error "
+                                              "(the web UI's Problem Videos view). Includes "
+                                              "pending videos whose last attempt errored and "
+                                              "legacy 'failed' rows."),
     limit: int = Query(100, ge=1, le=5000, description="Max results to return"),
     offset: int = Query(0, ge=0, description="Pagination offset"),
     x_watchdawg_token: Optional[str] = Header(None),
@@ -239,6 +243,11 @@ async def get_feed(
         stmt = stmt.where(Video.channel_id == channel_id)
     if status:
         stmt = stmt.where(Video.resolution_status == status)
+    if problems:
+        # Problem Videos view (Session 63): anything with a recorded resolve
+        # error. Transient failures keep status 'pending' but carry error
+        # text; legacy pre-Session-59 rows carry status 'failed'. Both match.
+        stmt = stmt.where(Video.resolution_error.isnot(None))
 
     stmt = stmt.offset(offset).limit(limit)
     rows = await db.execute(stmt)
@@ -256,6 +265,8 @@ async def get_feed(
         count_stmt = count_stmt.where(Video.channel_id == channel_id)
     if status:
         count_stmt = count_stmt.where(Video.resolution_status == status)
+    if problems:
+        count_stmt = count_stmt.where(Video.resolution_error.isnot(None))
     total = (await db.execute(count_stmt)).scalar()
 
     return {
